@@ -14,6 +14,7 @@ fail() {
 command -v docker >/dev/null 2>&1 || fail "docker is required"
 command -v python3 >/dev/null 2>&1 || fail "python3 is required"
 
+docker buildx build --platform linux/amd64 --load -t "$image" .
 docker image inspect "$image" >/dev/null 2>&1 || fail "image not found: $image"
 [[ -f "$compose_file" ]] || fail "Compose model not found: $compose_file"
 
