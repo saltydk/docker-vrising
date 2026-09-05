@@ -19,6 +19,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -389,6 +390,150 @@ func TestArchiveCacheRetriesTransientTransportError(t *testing.T) {
 	defer archive.Close()
 	if requests != 3 {
 		t.Fatalf("requests = %d, want 3", requests)
+	}
+}
+
+func TestArchiveCacheDoesNotRetryPermissionNetOpError(t *testing.T) {
+	requests := 0
+	client := httpDoerFunc(func(*http.Request) (*http.Response, error) {
+		requests++
+		return nil, &net.OpError{Op: "open", Net: "tcp", Err: syscall.EACCES}
+	})
+	pkg := resolvedArchivePackage("http://example.invalid/archive.zip", []byte("x"))
+
+	if _, err := (&ArchiveCache{Dir: tempCacheDir(t), Client: client, Backoff: noBackoff}).Fetch(
+		t.Context(), pkg, LockedPackage{},
+	); err == nil {
+		t.Fatal("Fetch() accepted permission-denied net.OpError")
+	}
+	if requests != 1 {
+		t.Fatalf("requests = %d, want 1 for permanent net.OpError", requests)
+	}
+}
+
+func TestArchiveCacheDoesNotRetryPermanentBodyReadError(t *testing.T) {
+	requests := 0
+	client := httpDoerFunc(func(request *http.Request) (*http.Response, error) {
+		requests++
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			Status:        "200 OK",
+			Header:        http.Header{"Content-Length": []string{"1"}},
+			Body:          io.NopCloser(errorReader{err: errors.New("permanent body read error")}),
+			ContentLength: 1,
+			Request:       request,
+		}, nil
+	})
+	pkg := resolvedArchivePackage("http://example.invalid/archive.zip", []byte("x"))
+
+	if _, err := (&ArchiveCache{Dir: tempCacheDir(t), Client: client, Backoff: noBackoff}).Fetch(
+		t.Context(), pkg, LockedPackage{},
+	); err == nil {
+		t.Fatal("Fetch() accepted permanent body read error")
+	}
+	if requests != 1 {
+		t.Fatalf("requests = %d, want 1 for permanent body read error", requests)
+	}
+}
+
+func TestArchiveCacheDoesNotRetryBodyLongerThanContentLength(t *testing.T) {
+	requests := 0
+	client := httpDoerFunc(func(request *http.Request) (*http.Response, error) {
+		requests++
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			Status:        "200 OK",
+			Header:        http.Header{"Content-Length": []string{"1"}},
+			Body:          io.NopCloser(strings.NewReader("xx")),
+			ContentLength: 1,
+			Request:       request,
+		}, nil
+	})
+	pkg := resolvedArchivePackage("http://example.invalid/archive.zip", nil)
+
+	if _, err := (&ArchiveCache{Dir: tempCacheDir(t), Client: client, Backoff: noBackoff}).Fetch(
+		t.Context(), pkg, LockedPackage{},
+	); err == nil {
+		t.Fatal("Fetch() accepted body longer than Content-Length")
+	}
+	if requests != 1 {
+		t.Fatalf("requests = %d, want 1 for excess body bytes", requests)
+	}
+}
+
+func TestArchiveCacheRetriesPerAttemptTimeoutThenSucceeds(t *testing.T) {
+	body := packageZIP(t, archiveTestRef, nil, zipEntry{name: "ExamplePlugin.dll", body: "plugin"})
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if requests.Add(1) == 1 {
+			<-request.Context().Done()
+			return
+		}
+		_, _ = w.Write(body)
+	}))
+	defer server.Close()
+
+	archive, err := (&ArchiveCache{
+		Dir:     tempCacheDir(t),
+		Client:  server.Client(),
+		Timeout: 25 * time.Millisecond,
+		Backoff: noBackoff,
+	}).Fetch(t.Context(), resolvedArchivePackage(server.URL, body), LockedPackage{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer archive.Close()
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("requests = %d, want 2 after one attempt timeout", got)
+	}
+}
+
+func TestArchiveCachePerAttemptTimeoutExhaustsThreeAttempts(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		<-request.Context().Done()
+	}))
+	defer server.Close()
+	pkg := resolvedArchivePackage(server.URL, []byte("x"))
+
+	_, err := (&ArchiveCache{
+		Dir:     tempCacheDir(t),
+		Client:  server.Client(),
+		Timeout: 25 * time.Millisecond,
+		Backoff: noBackoff,
+	}).Fetch(t.Context(), pkg, LockedPackage{})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Fetch() error = %v, want attempt deadline", err)
+	}
+	if got := requests.Load(); got != 3 {
+		t.Fatalf("requests = %d, want 3 exhausted attempt timeouts", got)
+	}
+}
+
+func TestArchiveCacheParentCancellationStopsAfterOneAttempt(t *testing.T) {
+	parent, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+		requests.Add(1)
+		cancel()
+		<-request.Context().Done()
+	}))
+	defer server.Close()
+	pkg := resolvedArchivePackage(server.URL, []byte("x"))
+
+	_, err := (&ArchiveCache{
+		Dir:     tempCacheDir(t),
+		Client:  server.Client(),
+		Timeout: time.Second,
+		Backoff: noBackoff,
+	}).Fetch(parent, pkg, LockedPackage{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Fetch() error = %v, want parent cancellation", err)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("requests = %d, want 1 after parent cancellation", got)
 	}
 }
 
@@ -1009,6 +1154,14 @@ func (f httpDoerFunc) Do(request *http.Request) (*http.Response, error) {
 
 func noBackoff(context.Context, time.Duration) error {
 	return nil
+}
+
+type errorReader struct {
+	err error
+}
+
+func (r errorReader) Read([]byte) (int, error) {
+	return 0, r.err
 }
 
 type testManifest struct {

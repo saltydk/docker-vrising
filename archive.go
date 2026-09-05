@@ -408,7 +408,7 @@ func (c *ArchiveCache) download(ctx context.Context, target *os.File, pkg Resolv
 		}
 		response, err := client.Do(request)
 		if err != nil {
-			requestErr := classifyArchiveRequestError(requestContext, err)
+			requestErr := classifyArchiveTransferError(ctx, requestContext, "download archive", err)
 			cancel()
 			if !isTransientArchiveDownload(requestErr) {
 				return 0, "", requestErr
@@ -424,7 +424,7 @@ func (c *ArchiveCache) download(ctx context.Context, target *os.File, pkg Resolv
 			cancel()
 			return 0, "", fmt.Errorf("archive response status %s", response.Status)
 		} else {
-			actualSize, digest, readErr := readArchiveResponse(requestContext, response, target, pkg.FileSize)
+			actualSize, digest, readErr := readArchiveResponse(ctx, requestContext, response, target, pkg.FileSize)
 			cancel()
 			if readErr == nil {
 				return actualSize, digest, nil
@@ -445,32 +445,50 @@ func (c *ArchiveCache) download(ctx context.Context, target *os.File, pkg Resolv
 	return 0, "", lastErr
 }
 
-func classifyArchiveRequestError(ctx context.Context, err error) error {
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return fmt.Errorf("download archive: %w", ctxErr)
+func classifyArchiveTransferError(parent, attempt context.Context, operation string, err error) error {
+	if parentErr := parent.Err(); parentErr != nil {
+		return fmt.Errorf("%s: %w", operation, parentErr)
 	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return fmt.Errorf("download archive: %w", err)
+	if attemptErr := attempt.Err(); attemptErr != nil {
+		classified := fmt.Errorf("%s: %w", operation, attemptErr)
+		if errors.Is(attemptErr, context.DeadlineExceeded) {
+			return transientArchiveDownload(classified)
+		}
+		return classified
 	}
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-		return transientArchiveDownload(fmt.Errorf("download archive: %w", err))
+	classified := fmt.Errorf("%s: %w", operation, err)
+	if errors.Is(err, context.Canceled) {
+		return classified
+	}
+	if errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, io.EOF) ||
+		isTransientArchiveNetworkError(err) {
+		return transientArchiveDownload(classified)
+	}
+	return classified
+}
+
+func isTransientArchiveNetworkError(err error) bool {
+	for _, permanent := range []error{
+		unix.EACCES, unix.EPERM, unix.ENOENT, unix.ENOTDIR,
+		unix.EMFILE, unix.ENFILE, unix.ENOMEM,
+	} {
+		if errors.Is(err, permanent) {
+			return false
+		}
 	}
 	var dnsError *net.DNSError
 	if errors.As(err, &dnsError) {
-		if dnsError.IsTimeout || dnsError.IsTemporary {
-			return transientArchiveDownload(fmt.Errorf("download archive: %w", err))
-		}
-		return fmt.Errorf("download archive: %w", err)
+		return dnsError.IsTimeout || dnsError.IsTemporary
 	}
-	var operationError *net.OpError
-	if errors.As(err, &operationError) {
-		return transientArchiveDownload(fmt.Errorf("download archive: %w", err))
+	for _, transient := range []error{unix.ECONNRESET, unix.ECONNREFUSED, unix.ECONNABORTED} {
+		if errors.Is(err, transient) {
+			return true
+		}
 	}
 	var networkError net.Error
-	if errors.As(err, &networkError) && (networkError.Timeout() || networkError.Temporary()) {
-		return transientArchiveDownload(fmt.Errorf("download archive: %w", err))
-	}
-	return fmt.Errorf("download archive: %w", err)
+	return errors.As(err, &networkError) && (networkError.Timeout() || networkError.Temporary())
 }
 
 func transientArchiveDownload(err error) error {
@@ -492,7 +510,7 @@ func resetTemporaryFile(file *os.File) error {
 	return nil
 }
 
-func readArchiveResponse(ctx context.Context, response *http.Response, target *os.File, metadataSize int64) (int64, string, error) {
+func readArchiveResponse(parent, attempt context.Context, response *http.Response, target *os.File, metadataSize int64) (int64, string, error) {
 	defer response.Body.Close()
 
 	hasContentLength := response.Header.Get("Content-Length") != "" || response.ContentLength > 0
@@ -545,13 +563,11 @@ func readArchiveResponse(ctx context.Context, response *http.Response, target *o
 		if errors.Is(readErr, io.EOF) {
 			break
 		}
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return 0, "", fmt.Errorf("read archive response: %w", ctxErr)
-		}
+		failure := error(readErr)
 		if hasContentLength && actualSize != contentLength {
-			return 0, "", transientArchiveDownload(fmt.Errorf("archive actual size %d does not match Content-Length size %d: %w", actualSize, contentLength, readErr))
+			failure = fmt.Errorf("archive actual size %d does not match Content-Length size %d: %w", actualSize, contentLength, readErr)
 		}
-		return 0, "", transientArchiveDownload(fmt.Errorf("read archive response: %w", readErr))
+		return 0, "", classifyArchiveTransferError(parent, attempt, "read archive response", failure)
 	}
 	if actualSize > limit {
 		if metadataSize == 0 {
@@ -566,6 +582,10 @@ func readArchiveResponse(ctx context.Context, response *http.Response, target *o
 		return 0, "", fmt.Errorf("archive actual size %d does not match metadata size %d", actualSize, metadataSize)
 	}
 	if hasContentLength && actualSize != contentLength {
+		if actualSize < contentLength {
+			failure := fmt.Errorf("archive actual size %d does not match Content-Length size %d: %w", actualSize, contentLength, io.ErrUnexpectedEOF)
+			return 0, "", classifyArchiveTransferError(parent, attempt, "read archive response", failure)
+		}
 		return 0, "", fmt.Errorf("archive actual size %d does not match Content-Length size %d", actualSize, contentLength)
 	}
 	return actualSize, hex.EncodeToString(hash.Sum(nil)), nil
