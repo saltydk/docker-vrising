@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -558,6 +559,50 @@ func TestSupervisorReturnsServerExitStatus(t *testing.T) {
 	}
 }
 
+func TestSupervisorWineExitAccountsForXvfbCompletion(t *testing.T) {
+	t.Run("both children complete", func(t *testing.T) {
+		xvfbProcess := newFakeManagedProcess(101)
+		wineProcess := newFakeManagedProcess(202)
+		xvfb := newRunningProcess(xvfbProcess)
+		wine := newRunningProcess(wineProcess)
+		xvfbProcess.finish(42, nil)
+		wineProcess.finish(0, nil)
+		<-xvfb.done
+		<-wine.done
+
+		err := wineExitError(wine, xvfb)
+		if err == nil || !strings.Contains(err.Error(), "Xvfb exited unexpectedly with status 42") {
+			t.Fatalf("wineExitError() error = %v, want explicit Xvfb status", err)
+		}
+		_, wineWaits, _ := wineProcess.snapshot()
+		_, xvfbWaits, _ := xvfbProcess.snapshot()
+		if wineWaits != 1 || xvfbWaits != 1 {
+			t.Fatalf("Wait calls: Wine=%d Xvfb=%d, want 1 each", wineWaits, xvfbWaits)
+		}
+	})
+
+	t.Run("Xvfb remains alive", func(t *testing.T) {
+		xvfbProcess := newFakeManagedProcess(101)
+		wineProcess := newFakeManagedProcess(202)
+		xvfb := newRunningProcess(xvfbProcess)
+		wine := newRunningProcess(wineProcess)
+		wineProcess.finish(0, nil)
+		<-wine.done
+		result := make(chan error, 1)
+		go func() { result <- wineExitError(wine, xvfb) }()
+		select {
+		case err := <-result:
+			if err != nil {
+				t.Fatalf("wineExitError() error = %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("wineExitError blocked on live Xvfb")
+		}
+		xvfbProcess.finish(0, nil)
+		<-xvfb.done
+	})
+}
+
 func TestSupervisorReportsUnexpectedXvfbExitStatus(t *testing.T) {
 	request, store := testLaunchRequest(t, false)
 	factory := newFakeProcessFactory()
@@ -663,10 +708,14 @@ func TestSupervisorDoesNotCommitReadinessWhenChildrenCompleteTogether(t *testing
 	}
 }
 
-func TestParseProcStartTicksRejectsZombie(t *testing.T) {
-	stat := []byte("202 (VRisingServer) Z 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 4242")
-	if _, err := parseProcStartTicks(stat); err == nil || !strings.Contains(err.Error(), "zombie") {
-		t.Fatalf("parseProcStartTicks() error = %v, want zombie rejection", err)
+func TestParseProcStartTicksRejectsDeadStates(t *testing.T) {
+	for _, state := range []string{"Z", "X", "x"} {
+		t.Run(state, func(t *testing.T) {
+			stat := []byte("202 (VRisingServer) " + state + " 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 4242")
+			if _, err := parseProcStartTicks(stat); !errors.Is(err, fs.ErrNotExist) {
+				t.Fatalf("parseProcStartTicks() error = %v, want dead process rejection", err)
+			}
+		})
 	}
 }
 

@@ -40,17 +40,24 @@ func (p procFSInspector) Identity(pid int) (ProcessIdentity, error) {
 	if len(fields) <= startTimeIndexAfterCommand {
 		return ProcessIdentity{}, fmt.Errorf("malformed process stat")
 	}
-	if len(fields[0]) != 1 {
-		return ProcessIdentity{}, fmt.Errorf("malformed process state")
-	}
-	if fields[0] == "Z" || fields[0] == "X" || fields[0] == "x" {
-		return ProcessIdentity{}, fmt.Errorf("process is not running: %w", fs.ErrNotExist)
+	if err := validateRunningProcessState(fields[0]); err != nil {
+		return ProcessIdentity{}, err
 	}
 	startTicks, err := strconv.ParseUint(fields[startTimeIndexAfterCommand], 10, 64)
 	if err != nil || startTicks == 0 {
 		return ProcessIdentity{}, fmt.Errorf("malformed process start ticks")
 	}
 	return ProcessIdentity{PID: pid, StartTicks: startTicks}, nil
+}
+
+func validateRunningProcessState(state string) error {
+	if len(state) != 1 {
+		return fmt.Errorf("malformed process state")
+	}
+	if state == "Z" || state == "X" || state == "x" {
+		return fmt.Errorf("process is not running: %w", fs.ErrNotExist)
+	}
+	return nil
 }
 
 func CheckHealth(state State, proc ProcInspector) error {

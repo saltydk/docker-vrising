@@ -288,7 +288,7 @@ func (s *Supervisor) Run(ctx context.Context, request LaunchRequest) (result Run
 		case <-wine.done:
 			cancelRun()
 			result.ExitCode = wine.result.exitCode
-			return result, processExitError("Wine", wine.result)
+			return result, wineExitError(wine, xvfb)
 		case readinessErr := <-readinessResults:
 			readinessDone = nil
 			if readinessErr != nil {
@@ -535,6 +535,16 @@ func processExitError(name string, result processWaitResult) error {
 	return fmt.Errorf("wait for %s: %w", name, result.err)
 }
 
+func wineExitError(wine, xvfb *runningProcess) error {
+	wineErr := processExitError("Wine", wine.result)
+	select {
+	case <-xvfb.done:
+		return errors.Join(wineErr, unexpectedProcessExitError("Xvfb", xvfb.result))
+	default:
+		return wineErr
+	}
+}
+
 func unexpectedProcessExitError(name string, result processWaitResult) error {
 	if result.err != nil {
 		return fmt.Errorf("%s exited unexpectedly: %w", name, result.err)
@@ -703,8 +713,8 @@ func parseProcStartTicks(content []byte) (uint64, error) {
 	if len(fields) <= startTimeIndexAfterCommand {
 		return 0, fmt.Errorf("process stat has %d fields after command, need at least %d", len(fields), startTimeIndexAfterCommand+1)
 	}
-	if fields[0] == "Z" {
-		return 0, fmt.Errorf("process is a zombie")
+	if err := validateRunningProcessState(fields[0]); err != nil {
+		return 0, err
 	}
 	startTicks, err := strconv.ParseUint(fields[startTimeIndexAfterCommand], 10, 64)
 	if err != nil {
