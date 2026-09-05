@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -106,6 +107,39 @@ func TestReadinessFinalBarrierRejectsCrossFileFatalAfterReadyEvidence(t *testing
 	}
 	if output.Err() != nil {
 		t.Fatalf("fatal injection error = %v", output.Err())
+	}
+}
+
+func TestReadinessRequiresTwoFreshQuietRoundsAfterBenignOutput(t *testing.T) {
+	root := t.TempDir()
+	serverLog := filepath.Join(root, "server.log")
+	writeLog(t, serverLog, "prior run\n")
+	observed := newReadinessOutput()
+	injectedAt := make(chan time.Time, 1)
+	output := &injectingReadinessOutput{
+		Writer: observed,
+		match:  "[Server] Startup Completed",
+		inject: func() error {
+			injectedAt <- time.Now()
+			return appendLogError(serverLog, "benign confirmation output\n")
+		},
+	}
+	const pollEvery = 30 * time.Millisecond
+	monitor := ReadinessMonitor{ServerLog: serverLog, Output: output, PollEvery: pollEvery}
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	result := waitForReadiness(monitor, ctx, ExpectedReadiness{})
+	appendUntilObserved(t, serverLog, observed.server, result)
+	appendLog(t, serverLog, readLogFixture(t, "server-ready.log"))
+	started := <-injectedAt
+	if err := <-result; err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed < 2*pollEvery-10*time.Millisecond {
+		t.Fatalf("quiet confirmation elapsed = %v, want at least two fresh poll intervals", elapsed)
+	}
+	if output.Err() != nil {
+		t.Fatalf("benign injection error = %v", output.Err())
 	}
 }
 
@@ -314,9 +348,6 @@ func TestReadinessCapsEachFollowerDrainAtOneMiB(t *testing.T) {
 	}
 	defer follower.close()
 	writeLog(t, serverLog, strings.Repeat("bounded line\n", 200000))
-	if lines, err := follower.readAvailable(); err != nil || len(lines) != 0 {
-		t.Fatalf("first handoff observation = %d lines, %v", len(lines), err)
-	}
 	lines, err := follower.readAvailable()
 	if err != nil {
 		t.Fatal(err)
@@ -509,6 +540,87 @@ func TestReadinessDrainsAppendDuringRotationHandoff(t *testing.T) {
 	}
 }
 
+func TestReadinessRetainsIntermediateReplacementWithFatal(t *testing.T) {
+	root := t.TempDir()
+	serverLog := filepath.Join(root, "server.log")
+	writeLog(t, serverLog, "generation A\n")
+	output := newReadinessOutput()
+	var replaceOnce sync.Once
+	var replaceErr error
+	monitor := ReadinessMonitor{
+		ServerLog: serverLog,
+		Output:    output,
+		PollEvery: 2 * time.Millisecond,
+		testHooks: &readinessTestHooks{replacementDetected: func(source string) {
+			replaceOnce.Do(func() {
+				replaceErr = os.Rename(serverLog, filepath.Join(root, "generation-B.log"))
+				if replaceErr == nil {
+					replaceErr = os.WriteFile(serverLog, []byte("generation C\n"), 0o600)
+				}
+			})
+		}},
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	result := waitForReadiness(monitor, ctx, ExpectedReadiness{})
+	appendUntilObserved(t, serverLog, output.server, result)
+	appendLog(t, serverLog, readLogFixture(t, "server-ready.log"))
+	waitForOutput(t, output, "[Server] Startup Completed", result)
+	if err := os.Rename(serverLog, filepath.Join(root, "generation-A.log")); err != nil {
+		t.Fatal(err)
+	}
+	writeLog(t, serverLog, "[Fatal : BepInEx] generation B failed\n")
+
+	err := <-result
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "fatal") {
+		t.Fatalf("Wait() error = %v, want fatal retained from generation B; output = %q", err, output.String())
+	}
+	if replaceErr != nil {
+		t.Fatalf("B-to-C replacement error = %v", replaceErr)
+	}
+}
+
+func TestReadinessRejectsMoreThanSixteenPendingGenerations(t *testing.T) {
+	root := t.TempDir()
+	serverLog := filepath.Join(root, "server.log")
+	writeLog(t, serverLog, "baseline\n")
+	output := newReadinessOutput()
+	generation := 0
+	var replacementErr error
+	monitor := ReadinessMonitor{
+		ServerLog: serverLog,
+		Output:    output,
+		PollEvery: time.Millisecond,
+		testHooks: &readinessTestHooks{replacementDetected: func(string) {
+			if replacementErr != nil || generation >= 16 {
+				return
+			}
+			replacementErr = os.Rename(serverLog, filepath.Join(root, fmt.Sprintf("queued-%02d.log", generation)))
+			generation++
+			if replacementErr == nil {
+				replacementErr = os.WriteFile(serverLog, []byte(fmt.Sprintf("generation %d\n", generation)), 0o600)
+			}
+		}},
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	result := waitForReadiness(monitor, ctx, ExpectedReadiness{})
+	appendUntilObserved(t, serverLog, output.server, result)
+	output.discard.Store(true)
+	if err := os.Rename(serverLog, filepath.Join(root, "baseline.log")); err != nil {
+		t.Fatal(err)
+	}
+	writeLog(t, serverLog, strings.Repeat("generation zero backlog\n", 800000))
+
+	err := <-result
+	if err == nil || !strings.Contains(err.Error(), "pending log generations") {
+		t.Fatalf("Wait() error = %v, want pending-generation bound", err)
+	}
+	if replacementErr != nil {
+		t.Fatalf("replacement error = %v", replacementErr)
+	}
+}
+
 func TestReadinessRetainsOldDescriptorThroughStableGracePoll(t *testing.T) {
 	root := t.TempDir()
 	serverLog := filepath.Join(root, "server.log")
@@ -559,6 +671,58 @@ func TestReadinessRetainsOldDescriptorThroughStableGracePoll(t *testing.T) {
 	}
 }
 
+func TestReadinessReplacementGraceStartsAtDetectionAfterSlowRead(t *testing.T) {
+	root := t.TempDir()
+	serverLog := filepath.Join(root, "server.log")
+	oldLog := serverLog + ".old"
+	writeLog(t, serverLog, "baseline\n")
+	output := newReadinessOutput()
+	const pollEvery = 60 * time.Millisecond
+	var armed atomic.Bool
+	var slowOnce sync.Once
+	detected := make(chan time.Time, 1)
+	adopted := make(chan time.Time, 1)
+	var detectOnce sync.Once
+	var adoptOnce sync.Once
+	monitor := ReadinessMonitor{
+		ServerLog: serverLog,
+		Output:    output,
+		PollEvery: pollEvery,
+		testHooks: &readinessTestHooks{
+			afterReadChunk: func(string) {
+				if armed.Load() {
+					slowOnce.Do(func() {
+						timer := time.NewTimer(pollEvery + 20*time.Millisecond)
+						defer timer.Stop()
+						<-timer.C
+					})
+				}
+			},
+			replacementDetected: func(string) { detectOnce.Do(func() { detected <- time.Now() }) },
+			generationAdopted:   func(string) { adoptOnce.Do(func() { adopted <- time.Now() }) },
+		},
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	result := waitForReadiness(monitor, ctx, ExpectedReadiness{})
+	appendUntilObserved(t, serverLog, output.server, result)
+	armed.Store(true)
+	if err := os.Rename(serverLog, oldLog); err != nil {
+		t.Fatal(err)
+	}
+	appendLog(t, oldLog, "slow old descriptor tail\n")
+	writeLog(t, serverLog, readLogFixture(t, "server-ready.log"))
+	started := <-detected
+	finished := <-adopted
+	if elapsed := finished.Sub(started); elapsed < pollEvery-10*time.Millisecond {
+		t.Fatalf("replacement grace = %v, want detection-relative PollEvery", elapsed)
+	}
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Wait() error after test cancellation = %v", err)
+	}
+}
+
 func TestReadinessDetectsCurrentGenerationTruncateAndRegrowPastPreviousOffset(t *testing.T) {
 	root := t.TempDir()
 	serverLog := filepath.Join(root, "server.log")
@@ -572,11 +736,11 @@ func TestReadinessDetectsCurrentGenerationTruncateAndRegrowPastPreviousOffset(t 
 		t.Fatal(err)
 	}
 	writeLog(t, serverLog, strings.Repeat("y", 30)+"\n")
-	if lines, err := follower.readAvailable(); err != nil || len(lines) != 0 {
-		t.Fatalf("first current generation observation = %q, %v", lines, err)
-	}
 	if lines, err := follower.readAvailable(); err != nil || len(lines) != 1 || lines[0] != strings.Repeat("y", 30) {
 		t.Fatalf("current generation = %q, %v", lines, err)
+	}
+	if lines, err := follower.readAvailable(); err != nil || len(lines) != 0 {
+		t.Fatalf("current generation adoption = %q, %v", lines, err)
 	}
 	appendLog(t, serverLog, "follower probe\n")
 	if lines, err := follower.readAvailable(); err != nil || len(lines) != 1 || lines[0] != "follower probe" {
@@ -603,11 +767,11 @@ func TestReadinessTreatsTruncateBetweenReadAndAnchorAsTransition(t *testing.T) {
 	}
 	defer follower.close()
 	writeLog(t, serverLog, "current generation\n")
-	if lines, err := follower.readAvailable(); err != nil || len(lines) != 0 {
-		t.Fatalf("first handoff observation = %q, %v", lines, err)
-	}
 	if lines, err := follower.readAvailable(); err != nil || len(lines) != 1 || lines[0] != "current generation" {
-		t.Fatal(err)
+		t.Fatalf("current generation = %q, %v", lines, err)
+	}
+	if lines, err := follower.readAvailable(); err != nil || len(lines) != 0 {
+		t.Fatalf("current generation adoption = %q, %v", lines, err)
 	}
 
 	ready := readLogFixture(t, "server-ready.log")
@@ -619,15 +783,12 @@ func TestReadinessTreatsTruncateBetweenReadAndAnchorAsTransition(t *testing.T) {
 		})
 	}}
 	appendLog(t, serverLog, "line read before truncate\n")
-	if _, err := follower.readAvailable(); err != nil {
+	lines, err := follower.readAvailable()
+	if err != nil {
 		t.Fatalf("read across concurrent truncate: %v", err)
 	}
 	if truncateErr != nil {
 		t.Fatalf("truncate error = %v", truncateErr)
-	}
-	lines, err := follower.readAvailable()
-	if err != nil {
-		t.Fatalf("read after truncate transition: %v", err)
 	}
 	if len(lines) != 1 || lines[0] != strings.TrimSuffix(ready, "\n") {
 		t.Fatalf("lines after truncate transition = %q", lines)
@@ -703,13 +864,62 @@ func TestReadinessInvalidatesBaselinedEvidenceTruncatedDuringRead(t *testing.T) 
 	}
 }
 
+func TestReadinessInvalidatesBaselinedEvidenceTruncatedImmediatelyAfterMarker(t *testing.T) {
+	root := t.TempDir()
+	serverLog := filepath.Join(root, "server.log")
+	writeLog(t, serverLog, "prior run\n")
+	observed := newReadinessOutput()
+	markerWritten := make(chan struct{})
+	var truncateErr error
+	output := &injectingReadinessOutput{
+		Writer: observed,
+		match:  "[Server] Startup Completed",
+		inject: func() error {
+			truncateErr = os.WriteFile(serverLog, []byte("truncated immediately after marker\n"), 0o600)
+			close(markerWritten)
+			return nil
+		},
+	}
+	monitor := ReadinessMonitor{ServerLog: serverLog, Output: output, PollEvery: 2 * time.Millisecond}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	result := waitForReadiness(monitor, ctx, ExpectedReadiness{})
+	appendUntilObserved(t, serverLog, observed.server, result)
+	appendLog(t, serverLog, readLogFixture(t, "server-ready.log"))
+	<-markerWritten
+	select {
+	case err := <-result:
+		t.Fatalf("Wait() retained marker from immediately truncated baseline: %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+	if truncateErr != nil {
+		t.Fatalf("truncate error = %v", truncateErr)
+	}
+	if err := os.Rename(serverLog, serverLog+".baseline"); err != nil {
+		t.Fatal(err)
+	}
+	writeLog(t, serverLog, readLogFixture(t, "server-ready.log"))
+	if err := <-result; err != nil {
+		t.Fatalf("Wait() error for replacement inode = %v", err)
+	}
+}
+
 func TestReadinessNeverSwitchesBackToBaselinedInode(t *testing.T) {
 	root := t.TempDir()
 	serverLog := filepath.Join(root, "server.log")
 	baselineLog := filepath.Join(root, "baseline.log")
 	writeLog(t, serverLog, "baseline\n")
 	output := newReadinessOutput()
-	monitor := ReadinessMonitor{ServerLog: serverLog, Output: output, PollEvery: 2 * time.Millisecond}
+	adopted := make(chan struct{})
+	var adoptOnce sync.Once
+	monitor := ReadinessMonitor{
+		ServerLog: serverLog,
+		Output:    output,
+		PollEvery: 2 * time.Millisecond,
+		testHooks: &readinessTestHooks{generationAdopted: func(string) {
+			adoptOnce.Do(func() { close(adopted) })
+		}},
+	}
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
 	result := waitForReadiness(monitor, ctx, ExpectedReadiness{})
@@ -720,6 +930,13 @@ func TestReadinessNeverSwitchesBackToBaselinedInode(t *testing.T) {
 	}
 	writeLog(t, serverLog, "current generation probe\n")
 	waitForOutput(t, output, "current generation probe", result)
+	select {
+	case <-adopted:
+	case err := <-result:
+		t.Fatalf("Wait() returned before current generation adoption: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("current generation was not adopted")
+	}
 	if err := os.Remove(serverLog); err != nil {
 		t.Fatal(err)
 	}
@@ -738,6 +955,61 @@ func TestReadinessNeverSwitchesBackToBaselinedInode(t *testing.T) {
 	writeLog(t, serverLog, readLogFixture(t, "server-ready.log"))
 	if err := <-result; err != nil {
 		t.Fatalf("Wait() error for later current inode = %v", err)
+	}
+}
+
+func TestReadinessSeenInodeReappearanceIsNotAQuietEvent(t *testing.T) {
+	root := t.TempDir()
+	serverLog := filepath.Join(root, "server.log")
+	baselineLog := filepath.Join(root, "baseline.log")
+	writeLog(t, serverLog, "generation A\n")
+	output := newReadinessOutput()
+	adopted := make(chan struct{}, 2)
+	monitor := ReadinessMonitor{
+		ServerLog: serverLog,
+		Output:    output,
+		PollEvery: 2 * time.Millisecond,
+		testHooks: &readinessTestHooks{generationAdopted: func(string) { adopted <- struct{}{} }},
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	result := waitForReadiness(monitor, ctx, ExpectedReadiness{})
+	appendUntilObserved(t, serverLog, output.server, result)
+	if err := os.Rename(serverLog, baselineLog); err != nil {
+		t.Fatal(err)
+	}
+	writeLog(t, serverLog, readLogFixture(t, "server-ready.log"))
+	select {
+	case <-adopted:
+	case err := <-result:
+		t.Fatalf("Wait() returned before generation B adoption: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("generation B was not adopted")
+	}
+	if err := os.Remove(serverLog); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(baselineLog, serverLog); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		t.Fatalf("Wait() counted seen-inode reappearance as quiet: %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+	if err := os.Rename(serverLog, baselineLog); err != nil {
+		t.Fatal(err)
+	}
+	writeLog(t, serverLog, "generation C\n")
+	select {
+	case <-adopted:
+	case err := <-result:
+		t.Fatalf("Wait() returned before generation C adoption: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("generation C was not adopted")
+	}
+	if err := <-result; err != nil {
+		t.Fatalf("Wait() error = %v", err)
 	}
 }
 
@@ -973,6 +1245,7 @@ type readinessOutput struct {
 	bepinex     chan struct{}
 	serverOnce  sync.Once
 	bepinexOnce sync.Once
+	discard     atomic.Bool
 }
 
 type injectingReadinessOutput struct {
@@ -1013,6 +1286,9 @@ func (o *readinessOutput) Write(p []byte) (int, error) {
 	}
 	if bytes.Contains(p, []byte("[bepinex] ")) {
 		o.bepinexOnce.Do(func() { close(o.bepinex) })
+	}
+	if o.discard.Load() {
+		return len(p), nil
 	}
 	return o.buffer.Write(p)
 }

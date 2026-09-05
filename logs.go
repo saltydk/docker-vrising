@@ -19,6 +19,7 @@ const defaultLogPollInterval = 100 * time.Millisecond
 const logContinuityBytes = 64
 const logReadChunkBytes = 64 << 10
 const maxReadinessInputBytes = 1 << 20
+const maxPendingLogGenerations = 16
 
 type ExpectedReadiness struct {
 	KindredVersion string
@@ -48,30 +49,36 @@ type readinessEvidence struct {
 }
 
 type logBatch struct {
-	round   uint64
-	source  string
-	lines   []string
-	more    bool
-	pending bool
-	reset   bool
-	err     error
+	round    uint64
+	source   string
+	lines    []string
+	more     bool
+	pending  bool
+	reset    bool
+	activity bool
+	err      error
 }
 
 type logFollower struct {
-	path              string
-	source            string
-	file              *os.File
-	identity          os.FileInfo
-	currentGeneration bool
-	seen              map[logInode]struct{}
-	offset            int64
-	remainder         []byte
-	anchor            []byte
-	drain             chan uint64
-	pending           *logInode
-	testHooks         *readinessTestHooks
-	more              bool
-	resetEvidence     bool
+	path                string
+	source              string
+	file                *os.File
+	identity            os.FileInfo
+	currentGeneration   bool
+	seen                map[logInode]struct{}
+	offset              int64
+	remainder           []byte
+	anchor              []byte
+	drain               chan uint64
+	pendingGenerations  []*logFollower
+	pollEvery           time.Duration
+	observation         uint64
+	detectedObservation uint64
+	notBefore           time.Time
+	testHooks           *readinessTestHooks
+	more                bool
+	resetEvidence       bool
+	activity            bool
 }
 
 type logInode struct {
@@ -106,6 +113,7 @@ func (m ReadinessMonitor) Wait(ctx context.Context, expected ExpectedReadiness) 
 		return fmt.Errorf("initialize server log follower: %w", err)
 	}
 	server.testHooks = m.testHooks
+	server.pollEvery = pollEvery
 	followers = append(followers, server)
 	if expected.RequireMods {
 		bepInEx, err := newLogFollower(m.BepInExLog, "bepinex")
@@ -114,6 +122,7 @@ func (m ReadinessMonitor) Wait(ctx context.Context, expected ExpectedReadiness) 
 			return fmt.Errorf("initialize BepInEx log follower: %w", err)
 		}
 		bepInEx.testHooks = m.testHooks
+		bepInEx.pollEvery = pollEvery
 		followers = append(followers, bepInEx)
 	}
 
@@ -133,33 +142,40 @@ func (m ReadinessMonitor) Wait(ctx context.Context, expected ExpectedReadiness) 
 		watchers.Wait()
 	}()
 
-	ticker := time.NewTicker(pollEvery)
-	defer ticker.Stop()
 	var evidence readinessEvidence
 	var round uint64
-	confirming := false
+	quietRounds := 0
 	for {
 		round++
-		ready, more, pending, err := observeReadinessRound(ctx, followers, events, round, output, &evidence, expected)
+		ready, more, pending, activity, err := observeReadinessRound(ctx, followers, events, round, output, &evidence, expected)
 		if err != nil {
 			return err
 		}
-		if ready && !more && !pending {
-			if confirming {
-				return nil
-			}
-			confirming = true
+		if ready && !more && !pending && !activity {
+			quietRounds++
 		} else {
-			confirming = false
+			quietRounds = 0
+		}
+		if quietRounds == 2 {
+			return nil
 		}
 		if more && !pending {
 			continue
 		}
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("readiness: %w", ctx.Err())
-		case <-ticker.C:
+		if err := waitReadinessPoll(ctx, pollEvery); err != nil {
+			return err
 		}
+	}
+}
+
+func waitReadinessPoll(ctx context.Context, pollEvery time.Duration) error {
+	timer := time.NewTimer(pollEvery)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return fmt.Errorf("readiness: %w", ctx.Err())
+	case <-timer.C:
+		return nil
 	}
 }
 
@@ -171,12 +187,12 @@ func observeReadinessRound(
 	output io.Writer,
 	evidence *readinessEvidence,
 	expected ExpectedReadiness,
-) (bool, bool, bool, error) {
+) (bool, bool, bool, bool, error) {
 	for _, follower := range followers {
 		select {
 		case follower.drain <- round:
 		case <-ctx.Done():
-			return false, false, false, fmt.Errorf("readiness: %w", ctx.Err())
+			return false, false, false, false, fmt.Errorf("readiness: %w", ctx.Err())
 		}
 	}
 	batches := make([]logBatch, 0, len(followers))
@@ -184,30 +200,30 @@ func observeReadinessRound(
 		select {
 		case batch := <-events:
 			if batch.round != round {
-				return false, false, false, fmt.Errorf("log follower acknowledged an unexpected observation round")
+				return false, false, false, false, fmt.Errorf("log follower acknowledged an unexpected observation round")
 			}
 			batches = append(batches, batch)
 		case <-ctx.Done():
-			return false, false, false, fmt.Errorf("readiness: %w", ctx.Err())
+			return false, false, false, false, fmt.Errorf("readiness: %w", ctx.Err())
 		}
 	}
 	for _, batch := range batches {
 		if batch.err != nil {
-			return false, false, false, fmt.Errorf("follow %s log: %w", batch.source, batch.err)
+			return false, false, false, false, fmt.Errorf("follow %s log: %w", batch.source, batch.err)
 		}
 		if batch.reset {
 			evidence.reset(batch.source)
 		}
 		for _, line := range batch.lines {
 			if _, err := fmt.Fprintf(output, "[%s] %s\n", batch.source, line); err != nil {
-				return false, false, false, fmt.Errorf("write %s log output: %w", batch.source, err)
+				return false, false, false, false, fmt.Errorf("write %s log output: %w", batch.source, err)
 			}
 		}
 	}
 	for _, batch := range batches {
 		for _, line := range batch.lines {
 			if fatalReadinessLine(line) {
-				return false, false, false, fmt.Errorf("fatal startup output: %s", shortLogReason(line))
+				return false, false, false, false, fmt.Errorf("fatal startup output: %s", shortLogReason(line))
 			}
 		}
 	}
@@ -218,11 +234,13 @@ func observeReadinessRound(
 	}
 	more := false
 	pending := false
+	activity := false
 	for _, batch := range batches {
 		more = more || batch.more
 		pending = pending || batch.pending
+		activity = activity || batch.activity
 	}
-	return evidence.complete(expected.RequireMods), more, pending, nil
+	return evidence.complete(expected.RequireMods), more, pending, activity, nil
 }
 
 func newLogFollower(path, source string) (*logFollower, error) {
@@ -263,7 +281,7 @@ func (f *logFollower) watch(ctx context.Context, events chan<- logBatch) {
 		case round := <-f.drain:
 			lines, err := f.readAvailableContext(ctx)
 			select {
-			case events <- logBatch{round: round, source: f.source, lines: lines, more: f.more, pending: f.pending != nil, reset: f.resetEvidence, err: err}:
+			case events <- logBatch{round: round, source: f.source, lines: lines, more: f.more, pending: len(f.pendingGenerations) != 0, reset: f.resetEvidence, activity: f.activity, err: err}:
 				if err != nil {
 					return
 				}
@@ -279,14 +297,69 @@ func (f *logFollower) readAvailable() ([]string, error) {
 }
 
 func (f *logFollower) readAvailableContext(ctx context.Context) ([]string, error) {
+	f.observation++
 	f.more = false
 	f.resetEvidence = false
+	f.activity = false
 	remaining := maxReadinessInputBytes
 	var lines []string
+	current, err := f.readCurrent(ctx, &remaining)
+	if err != nil {
+		return nil, err
+	}
+	lines = append(lines, current...)
+	if f.resetEvidence {
+		lines = nil
+	}
+
+	replacement, info, err := openLogPath(f.path)
+	if errors.Is(err, os.ErrNotExist) {
+		replacement = nil
+		info = nil
+	}
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	if replacement != nil && (f.file == nil || !os.SameFile(f.identity, info)) {
+		inode, identityErr := inodeOf(info)
+		if identityErr != nil {
+			replacement.Close()
+			return nil, identityErr
+		}
+		if _, alreadySeen := f.seen[inode]; alreadySeen {
+			replacement.Close()
+			f.activity = true
+		} else {
+			if len(f.pendingGenerations) >= maxPendingLogGenerations {
+				replacement.Close()
+				return nil, fmt.Errorf("more than %d pending log generations", maxPendingLogGenerations)
+			}
+			detectedAt := time.Now()
+			queued := &logFollower{
+				source:              f.source,
+				file:                replacement,
+				identity:            info,
+				currentGeneration:   true,
+				offset:              0,
+				testHooks:           f.testHooks,
+				detectedObservation: f.observation,
+				notBefore:           detectedAt.Add(f.pollEvery),
+			}
+			f.seen[inode] = struct{}{}
+			f.pendingGenerations = append(f.pendingGenerations, queued)
+			f.activity = true
+			if f.testHooks != nil && f.testHooks.replacementDetected != nil {
+				f.testHooks.replacementDetected(f.source)
+			}
+		}
+	} else if replacement != nil {
+		replacement.Close()
+	}
+
 	if f.file != nil {
-		current, err := f.readCurrent(ctx, &remaining)
-		if err != nil {
-			return nil, err
+		current, readErr := f.readCurrent(ctx, &remaining)
+		if readErr != nil {
+			return nil, readErr
 		}
 		lines = append(lines, current...)
 		if f.resetEvidence {
@@ -294,72 +367,46 @@ func (f *logFollower) readAvailableContext(ctx context.Context) ([]string, error
 		}
 	}
 
-	replacement, info, err := openLogPath(f.path)
-	if errors.Is(err, os.ErrNotExist) {
-		f.pending = nil
-		return lines, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	if f.file != nil && os.SameFile(f.identity, info) {
-		replacement.Close()
-		f.pending = nil
-		return lines, nil
-	}
-	inode, err := inodeOf(info)
-	if err != nil {
-		replacement.Close()
-		return nil, err
-	}
-	if _, alreadySeen := f.seen[inode]; alreadySeen {
-		replacement.Close()
-		f.pending = nil
-		return lines, nil
-	}
-	if f.testHooks != nil && f.testHooks.replacementDetected != nil {
-		f.testHooks.replacementDetected(f.source)
-	}
-	if f.file != nil {
-		current, err := f.readCurrent(ctx, &remaining)
-		if err != nil {
-			replacement.Close()
-			return nil, err
+	for _, queued := range f.pendingGenerations {
+		queued.more = false
+		queued.activity = false
+		current, readErr := queued.readCurrent(ctx, &remaining)
+		if readErr != nil {
+			return nil, readErr
 		}
 		lines = append(lines, current...)
-		if f.resetEvidence {
-			lines = nil
+		f.activity = f.activity || queued.activity
+	}
+
+	if len(f.pendingGenerations) != 0 {
+		head := f.pendingGenerations[0]
+		activeMore := false
+		if f.file != nil {
+			activeMore = f.more
+		}
+		if !activeMore && !head.more && f.observation > head.detectedObservation && !time.Now().Before(head.notBefore) {
+			f.closeActive()
+			f.file = head.file
+			head.file = nil
+			f.identity = head.identity
+			f.currentGeneration = true
+			f.offset = head.offset
+			f.remainder = head.remainder
+			f.anchor = head.anchor
+			f.pendingGenerations = f.pendingGenerations[1:]
+			f.activity = true
+			if f.testHooks != nil && f.testHooks.generationAdopted != nil {
+				f.testHooks.generationAdopted(f.source)
+			}
 		}
 	}
-	if f.more {
-		if f.pending == nil || *f.pending != inode {
-			f.pending = &inode
-		}
-		replacement.Close()
-		return lines, nil
+
+	more := f.more
+	for _, queued := range f.pendingGenerations {
+		more = more || queued.more
 	}
-	if f.pending == nil || *f.pending != inode {
-		f.pending = &inode
-		replacement.Close()
-		return lines, nil
-	}
-	f.close()
-	f.file = replacement
-	f.identity = info
-	f.currentGeneration = true
-	f.seen[inode] = struct{}{}
-	f.offset = 0
-	f.remainder = nil
-	f.anchor = nil
-	f.pending = nil
-	if f.testHooks != nil && f.testHooks.generationAdopted != nil {
-		f.testHooks.generationAdopted(f.source)
-	}
-	current, err := f.readCurrent(ctx, &remaining)
-	if err != nil {
-		return nil, err
-	}
-	return append(lines, current...), nil
+	f.more = more
+	return lines, nil
 }
 
 func openLogPath(path string) (*os.File, os.FileInfo, error) {
@@ -386,6 +433,10 @@ func openLogPath(path string) (*os.File, os.FileInfo, error) {
 }
 
 func (f *logFollower) readCurrent(ctx context.Context, remaining *int) ([]string, error) {
+	if f.file == nil {
+		f.more = false
+		return nil, nil
+	}
 	info, err := f.file.Stat()
 	if err != nil {
 		return nil, err
@@ -395,13 +446,8 @@ func (f *logFollower) readCurrent(ctx context.Context, remaining *int) ([]string
 		return nil, err
 	}
 	if !continuous {
-		if !f.currentGeneration {
-			f.close()
-			return nil, nil
-		}
-		f.offset = 0
-		f.remainder = nil
-		f.anchor = nil
+		f.handleReadTransition()
+		return nil, nil
 	}
 	if info.Size() == f.offset || *remaining == 0 {
 		f.more = info.Size() > f.offset
@@ -420,6 +466,7 @@ func (f *logFollower) readCurrent(ctx context.Context, remaining *int) ([]string
 		priorAnchor := append([]byte(nil), f.anchor...)
 		n, readErr := f.file.ReadAt(chunk, f.offset)
 		if n > 0 {
+			f.activity = true
 			f.offset += int64(n)
 			*remaining -= n
 			if f.testHooks != nil && f.testHooks.readChunk != nil {
@@ -473,9 +520,10 @@ func (f *logFollower) readCurrent(ctx context.Context, remaining *int) ([]string
 }
 
 func (f *logFollower) handleReadTransition() {
+	f.activity = true
 	if !f.currentGeneration {
 		f.resetEvidence = true
-		f.close()
+		f.closeActive()
 		return
 	}
 	f.offset = 0
@@ -520,6 +568,14 @@ func (f *logFollower) refreshAnchor() error {
 }
 
 func (f *logFollower) close() {
+	f.closeActive()
+	for _, queued := range f.pendingGenerations {
+		queued.closeActive()
+	}
+	f.pendingGenerations = nil
+}
+
+func (f *logFollower) closeActive() {
 	if f.file != nil {
 		f.file.Close()
 		f.file = nil
