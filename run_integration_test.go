@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -10,6 +12,118 @@ import (
 
 	"golang.org/x/sys/unix"
 )
+
+func TestApplicationNormalRestartClearsCachedDegradedState(t *testing.T) {
+	root := t.TempDir()
+	serverDir := filepath.Join(root, "server")
+	dataDir := filepath.Join(root, "data")
+	stateDir := filepath.Join(serverDir, ".docker-vrising")
+	for _, dir := range []string{serverDir, dataDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store := &Store{StateDir: stateDir}
+	const oldReason = "cached remote metadata failure"
+	if err := store.Save(State{
+		SchemaVersion: schemaVersion,
+		SteamBuild:    "100",
+		Runtime: RuntimeState{
+			Phase:      "stopped",
+			Degraded:   true,
+			Reason:     oldReason,
+			SteamBuild: "100",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	recorder := &runRecorder{}
+	steam := &recordingSteamLifecycle{
+		recorder:  recorder,
+		installed: SteamBuild{BuildID: "100", DepotManifest: "manifest", Branch: publicBranch},
+		remote:    SteamBuild{BuildID: "100", DepotManifest: "manifest", Branch: publicBranch},
+	}
+	backups := &recordingBackupCreator{recorder: recorder}
+	factory := newFakeProcessFactory()
+	supervisor := testSupervisor(store, factory)
+	var output bytes.Buffer
+	supervisor.Readiness.Output = &output
+	starting := make(chan RuntimeState, 1)
+	supervisor.waitReadiness = func(context.Context, ReadinessMonitor, ExpectedReadiness) error {
+		state, err := store.Load()
+		if err != nil {
+			return err
+		}
+		starting <- state.Runtime
+		return nil
+	}
+	readyPersisted := make(chan struct{})
+	var readyOnce sync.Once
+	store.syncDirectory = func(fd int) error {
+		if err := unix.Fsync(fd); err != nil {
+			return err
+		}
+		state, err := store.Load()
+		if err == nil && state.Runtime.Ready {
+			readyOnce.Do(func() { close(readyPersisted) })
+		}
+		return nil
+	}
+	app := &Application{
+		Config: Config{
+			ServerDir:       serverDir,
+			DataDir:         dataDir,
+			StateDir:        stateDir,
+			UpdateGame:      true,
+			ModsEnabled:     false,
+			StartupTimeout:  time.Minute,
+			ShutdownTimeout: time.Minute,
+			LogDays:         7,
+		},
+		Store:      store,
+		Steam:      steam,
+		Backups:    backups,
+		Supervisor: supervisor,
+		validateMounts: func(Config) error {
+			return nil
+		},
+	}
+	outcome := make(chan error, 1)
+	go func() { outcome <- app.Run(t.Context()) }()
+
+	gotStarting := <-starting
+	if gotStarting.Degraded || gotStarting.Reason != "" || gotStarting.Phase != "starting" {
+		t.Fatalf("normal starting runtime = %#v", gotStarting)
+	}
+	select {
+	case <-readyPersisted:
+	case err := <-outcome:
+		t.Fatalf("Run() returned before ready: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("ready state was not persisted")
+	}
+	ready, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ready.Runtime.Degraded || ready.Runtime.Reason != "" || !ready.Runtime.Ready {
+		t.Fatalf("normal ready runtime = %#v", ready.Runtime)
+	}
+	if output.String() != "" {
+		t.Fatalf("normal restart repeated degraded warning %q", output.String())
+	}
+	factory.wine.finish(0, nil)
+	if err := <-outcome; err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	stopped, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stopped.Runtime.Degraded || stopped.Runtime.Reason != "" || stopped.Runtime.Phase != "stopped" {
+		t.Fatalf("normal stopped runtime = %#v", stopped.Runtime)
+	}
+}
 
 func TestApplicationPromotesWithConcreteSupervisorWhileWineIsAlive(t *testing.T) {
 	manager := newTestModManager(t)
@@ -49,9 +163,9 @@ func TestApplicationPromotesWithConcreteSupervisorWhileWineIsAlive(t *testing.T)
 			BaseEnv:             []string{"PATH=/usr/bin"},
 			GameEnv:             make(map[string]string),
 		},
-		Mods:       manager,
-		Supervisor: supervisor,
-		pruneLogs:  func(string, int, time.Time) error { return nil },
+		Mods:            manager,
+		Supervisor:      supervisor,
+		pruneServerLogs: func(string, int, time.Time) error { return nil },
 	}
 	outcome := make(chan error, 1)
 	go func() {
@@ -137,7 +251,7 @@ func TestApplicationRecoversPendingConcretePromotionBeforeLaunch(t *testing.T) {
 		validateMounts: func(Config) error {
 			return nil
 		},
-		pruneLogs: func(string, int, time.Time) error { return nil },
+		pruneServerLogs: func(string, int, time.Time) error { return nil },
 	}
 
 	if err := app.Run(t.Context()); err != nil {
@@ -188,9 +302,9 @@ func TestApplicationPromotionFailurePreservesConcreteForwardRecovery(t *testing.
 			BaseEnv:             []string{"PATH=/usr/bin"},
 			GameEnv:             make(map[string]string),
 		},
-		Mods:       manager,
-		Supervisor: supervisor,
-		pruneLogs:  func(string, int, time.Time) error { return nil },
+		Mods:            manager,
+		Supervisor:      supervisor,
+		pruneServerLogs: func(string, int, time.Time) error { return nil },
 	}
 
 	err := app.launch(t.Context(), staged, SteamBuild{BuildID: "candidate-build"}, true)
@@ -283,7 +397,7 @@ func concreteKnownGoodApplication(t *testing.T, executable bool) (*ModManager, S
 		validateMounts: func(Config) error {
 			return nil
 		},
-		pruneLogs: func(string, int, time.Time) error { return nil },
+		pruneServerLogs: func(string, int, time.Time) error { return nil },
 	}
 	return manager, staged, steam, app
 }

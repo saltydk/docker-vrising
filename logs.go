@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -720,12 +721,30 @@ func PruneLogs(logDir string, days int, now time.Time) error {
 	return pruneLogsWithHooks(logDir, days, now, pruneTestHooks{})
 }
 
+func PruneServerLogs(dataDir string, days int, now time.Time) error {
+	if err := pruneLogsMatching(dataDir, days, now, ownedLegacyServerLogName); err != nil {
+		return fmt.Errorf("prune legacy server logs: %w", err)
+	}
+	if err := pruneLogsMatching(filepath.Join(dataDir, "logs"), days, now, ownedCurrentServerLogName); err != nil {
+		return fmt.Errorf("prune current server logs: %w", err)
+	}
+	return nil
+}
+
 type pruneTestHooks struct {
 	beforeReopen  func(string)
 	syncDirectory func(int) error
 }
 
 func pruneLogsWithHooks(logDir string, days int, now time.Time, hooks pruneTestHooks) error {
+	return pruneLogsMatchingWithHooks(logDir, days, now, ownedServerLogName, hooks)
+}
+
+func pruneLogsMatching(logDir string, days int, now time.Time, ownedName func(string) bool) error {
+	return pruneLogsMatchingWithHooks(logDir, days, now, ownedName, pruneTestHooks{})
+}
+
+func pruneLogsMatchingWithHooks(logDir string, days int, now time.Time, ownedName func(string) bool, hooks pruneTestHooks) error {
 	if days < 1 || days > maxLogDays {
 		return fmt.Errorf("log retention must be between 1 and %d days", maxLogDays)
 	}
@@ -749,7 +768,7 @@ func pruneLogsWithHooks(logDir string, days int, now time.Time, hooks pruneTestH
 	}
 	for _, entry := range entries {
 		name := entry.Name()
-		if !ownedServerLogName(name) {
+		if !ownedName(name) {
 			continue
 		}
 		fd, opened, err := openPruneLog(root, name)
@@ -806,6 +825,10 @@ func openPruneLog(root int, name string) (int, unix.Stat_t, error) {
 }
 
 func ownedServerLogName(name string) bool {
+	return ownedLegacyServerLogName(name) || ownedCurrentServerLogName(name)
+}
+
+func ownedLegacyServerLogName(name string) bool {
 	for _, layout := range []string{
 		"20060102-1504-VRisingServer.log",
 		"20060102-150405-VRisingServer.log",
@@ -814,6 +837,10 @@ func ownedServerLogName(name string) bool {
 			return true
 		}
 	}
+	return false
+}
+
+func ownedCurrentServerLogName(name string) bool {
 	const prefix = "VRisingServer-"
 	const suffix = ".log"
 	if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, suffix) {

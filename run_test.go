@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 type runRecorder struct {
@@ -120,19 +122,21 @@ func (f *recordingArchiveFetcher) assertClosed(t *testing.T) {
 }
 
 type recordingModLifecycle struct {
-	recorder         *runRecorder
-	validateErr      error
-	stageErr         error
-	applyErr         error
-	promoteErr       error
-	promoteOutcome   PromotionCommitOutcome
-	rollbackCtxErr   error
-	rollbackDeadline bool
-	discardErr       error
-	corruptStageLock bool
-	staged           StagedGeneration
-	stageLock        PackageLock
-	archives         map[PackageRef]*ValidatedArchive
+	recorder          *runRecorder
+	validateErr       error
+	stageErr          error
+	applyErr          error
+	promoteErr        error
+	promoteOutcome    PromotionCommitOutcome
+	rollbackCtxErr    error
+	rollbackDeadline  bool
+	discardErr        error
+	corruptStageLock  bool
+	stageRoot         string
+	breakArchiveClose bool
+	staged            StagedGeneration
+	stageLock         PackageLock
+	archives          map[PackageRef]*ValidatedArchive
 }
 
 func (m *recordingModLifecycle) ValidateActive(_ context.Context, record GenerationRecord, lock PackageLock) (StagedGeneration, error) {
@@ -152,6 +156,23 @@ func (m *recordingModLifecycle) Stage(_ context.Context, lock PackageLock, archi
 	m.staged = StagedGeneration{
 		Record: GenerationRecord{ID: "candidate", LockDigest: lock.Digest, Status: "staged"},
 		Lock:   lock,
+	}
+	if m.stageRoot != "" {
+		m.staged.Dir = filepath.Join(m.stageRoot, "overlay")
+		if err := os.MkdirAll(m.staged.Dir, 0o700); err != nil {
+			return StagedGeneration{}, err
+		}
+	}
+	if m.breakArchiveClose {
+		for _, archive := range archives {
+			archive.mu.Lock()
+			err := unix.Close(int(archive.file.Fd()))
+			archive.mu.Unlock()
+			if err != nil {
+				return StagedGeneration{}, err
+			}
+			break
+		}
 	}
 	if m.corruptStageLock {
 		m.staged.Lock = PackageLock{Digest: "stale-global-lock"}
@@ -192,8 +213,13 @@ func (m *recordingModLifecycle) RecoverPromotion(context.Context) (PromotionComm
 	return PromotionNotCommitted, nil
 }
 
-func (m *recordingModLifecycle) Discard(context.Context, StagedGeneration) error {
+func (m *recordingModLifecycle) Discard(_ context.Context, staged StagedGeneration) error {
 	m.recorder.add("discard")
+	if m.discardErr == nil && staged.Dir != "" {
+		if err := os.RemoveAll(filepath.Dir(staged.Dir)); err != nil {
+			return err
+		}
+	}
 	return m.discardErr
 }
 
@@ -364,7 +390,7 @@ func newRunFixture(t *testing.T) *runFixture {
 			recorder.add("mounts")
 			return nil
 		},
-		pruneLogs: func(string, int, time.Time) error {
+		pruneServerLogs: func(string, int, time.Time) error {
 			recorder.add("prune-logs")
 			return nil
 		},
@@ -583,6 +609,8 @@ func TestRunRemoteOutageUsesKnownGoodBeforeMutation(t *testing.T) {
 
 func TestRunFallbackDiscardsUnreferencedCandidate(t *testing.T) {
 	fixture := newRunFixture(t)
+	stageRoot := filepath.Join(t.TempDir(), "candidate")
+	fixture.mods.stageRoot = stageRoot
 	activeLock := canonicalTestLock(fixture.resolver.graph, "b")
 	fixture.store.state.Active = &GenerationRecord{ID: "active", LockDigest: activeLock.Digest, Status: "active"}
 	fixture.store.state.SteamBuild = fixture.steam.installed.BuildID
@@ -596,6 +624,135 @@ func TestRunFallbackDiscardsUnreferencedCandidate(t *testing.T) {
 
 	assertEventBefore(t, fixture.recorder.events, "stage", "discard")
 	assertEventBefore(t, fixture.recorder.events, "discard", "launch")
+	if _, err := os.Stat(stageRoot); !os.IsNotExist(err) {
+		t.Fatalf("fallback staged generation stat error = %v, want not exist", err)
+	}
+}
+
+func TestRunFallbackStoresCurrentBoundedReason(t *testing.T) {
+	fixture := newRunFixture(t)
+	activeLock := canonicalTestLock(fixture.resolver.graph, "b")
+	fixture.store.state.Active = &GenerationRecord{ID: "active", LockDigest: activeLock.Digest, Status: "active"}
+	fixture.store.state.SteamBuild = fixture.steam.installed.BuildID
+	fixture.store.state.Runtime = RuntimeState{Degraded: true, Reason: "stale failure"}
+	fixture.store.lock = activeLock
+	fixture.store.lockErr = nil
+	fixture.steam.remoteErr = errors.New(strings.Repeat("current remote failure ", 20))
+
+	if err := fixture.app.Run(t.Context()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	reason := fixture.store.state.Runtime.Reason
+	if reason == "stale failure" || !strings.HasPrefix(reason, "query remote Steam build: current remote failure") {
+		t.Fatalf("fallback reason = %q, want current failure", reason)
+	}
+	if len(reason) > 163 {
+		t.Fatalf("fallback reason length = %d, want at most 163", len(reason))
+	}
+}
+
+func TestRunDiscardsUnappliedStagedGenerationOnTerminalExit(t *testing.T) {
+	tests := []struct {
+		name        string
+		wantCode    int
+		expectApply bool
+		setup       func(*runFixture)
+	}{
+		{
+			name:     "remote failure without fallback",
+			wantCode: exitSteam,
+			setup: func(fixture *runFixture) {
+				fixture.steam.remoteErr = errors.New("remote metadata failed")
+			},
+		},
+		{
+			name:     "backup failure without fallback",
+			wantCode: exitBackup,
+			setup: func(fixture *runFixture) {
+				fixture.backups.err = errors.New("backup failed")
+			},
+		},
+		{
+			name:     "post-mutation Steam failure",
+			wantCode: exitSteam,
+			setup: func(fixture *runFixture) {
+				fixture.steam.updateErr = &SteamPostMutationError{Err: errors.New("validation failed")}
+			},
+		},
+		{
+			name:     "archive close failure after Stage",
+			wantCode: exitModUpdate,
+			setup: func(fixture *runFixture) {
+				fixture.mods.breakArchiveClose = true
+			},
+		},
+		{
+			name:     "canceled metadata request",
+			wantCode: exitSteam,
+			setup: func(fixture *runFixture) {
+				fixture.steam.remoteErr = context.Canceled
+			},
+		},
+		{
+			name:     "current build validation failure",
+			wantCode: exitSteam,
+			setup: func(fixture *runFixture) {
+				fixture.steam.remote = fixture.steam.installed
+				fixture.steam.validateErr = errors.New("runtime validation failed")
+			},
+		},
+		{
+			name:        "Apply failure before ownership",
+			wantCode:    exitReadiness,
+			expectApply: true,
+			setup: func(fixture *runFixture) {
+				fixture.mods.applyErr = errors.New("apply failed before journal")
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fixture := newRunFixture(t)
+			stageRoot := filepath.Join(t.TempDir(), "candidate")
+			fixture.mods.stageRoot = stageRoot
+			tt.setup(fixture)
+
+			err := fixture.app.Run(t.Context())
+			assertRunExitCode(t, err, tt.wantCode)
+
+			if _, err := os.Stat(stageRoot); !os.IsNotExist(err) {
+				t.Fatalf("unapplied staged generation stat error = %v, want not exist", err)
+			}
+			if got := countEvent(fixture.recorder.events, "discard"); got != 1 {
+				t.Fatalf("discard count = %d, want 1; events = %q", got, fixture.recorder.events)
+			}
+			if tt.expectApply {
+				if !slices.Contains(fixture.recorder.events, "apply") {
+					t.Fatalf("events = %q, want Apply attempt", fixture.recorder.events)
+				}
+			} else {
+				assertNoEvent(t, fixture.recorder.events, "apply")
+			}
+			fixture.archives.assertClosed(t)
+		})
+	}
+}
+
+func TestRunDoesNotDiscardAppliedCandidateAfterLaunchFailure(t *testing.T) {
+	fixture := newRunFixture(t)
+	stageRoot := filepath.Join(t.TempDir(), "candidate")
+	fixture.mods.stageRoot = stageRoot
+	fixture.supervisor.result = RunResult{}
+	fixture.supervisor.err = errors.New("readiness failed")
+
+	err := fixture.app.Run(t.Context())
+	assertRunExitCode(t, err, exitReadiness)
+
+	if _, err := os.Stat(stageRoot); err != nil {
+		t.Fatalf("applied candidate was discarded: %v", err)
+	}
+	assertNoEvent(t, fixture.recorder.events, "discard")
 }
 
 func TestRunRemoteOutageWithoutKnownGoodUsesSteamExit(t *testing.T) {
@@ -886,12 +1043,12 @@ func TestRunModsDisabledSkipsThunderstore(t *testing.T) {
 	}
 }
 
-func TestRunPrunesCurrentServerLogDirectory(t *testing.T) {
+func TestRunPrunesBothServerLogScopes(t *testing.T) {
 	fixture := newRunFixture(t)
 	fixture.app.Config.ModsEnabled = false
 	fixture.app.Config.UpdateGame = false
 	var gotDir string
-	fixture.app.pruneLogs = func(dir string, _ int, _ time.Time) error {
+	fixture.app.pruneServerLogs = func(dir string, _ int, _ time.Time) error {
 		gotDir = dir
 		return nil
 	}
@@ -900,7 +1057,7 @@ func TestRunPrunesCurrentServerLogDirectory(t *testing.T) {
 		t.Fatalf("Run() error = %v", err)
 	}
 
-	wantDir := filepath.Join(fixture.app.Config.DataDir, "logs")
+	wantDir := fixture.app.Config.DataDir
 	if gotDir != wantDir {
 		t.Fatalf("PruneLogs() directory = %q, want %q", gotDir, wantDir)
 	}

@@ -71,10 +71,10 @@ type Application struct {
 	Supervisor serverSupervisor
 	Proc       ProcInspector
 
-	stateStore     applicationStateStore
-	validateMounts func(Config) error
-	pruneLogs      func(string, int, time.Time) error
-	now            func() time.Time
+	stateStore      applicationStateStore
+	validateMounts  func(Config) error
+	pruneServerLogs func(string, int, time.Time) error
+	now             func() time.Time
 }
 
 type runError struct {
@@ -194,13 +194,36 @@ func (a *Application) Run(ctx context.Context) (returnErr error) {
 
 	selected := active
 	candidate := false
+	var guardedStage *StagedGeneration
+	discardGuardedStage := func() error {
+		if guardedStage == nil {
+			return nil
+		}
+		staged := *guardedStage
+		guardedStage = nil
+		return a.discardStagedGeneration(ctx, staged)
+	}
+	defer func() {
+		if err := discardGuardedStage(); err != nil {
+			returnErr = errors.Join(returnErr, exitFailure(
+				exitModUpdate,
+				fmt.Errorf("discard unapplied staged generation: %w", err),
+			))
+		}
+	}()
 	if a.Config.ModsEnabled {
 		if a.Config.UpdateMods {
 			staged, err := a.stageCandidate(ctx, state, active)
+			if staged.Record.ID != "" {
+				selected = staged
+				guardedStage = &selected
+			}
 			if err != nil {
+				if discardErr := discardGuardedStage(); discardErr != nil {
+					return exitFailure(exitModUpdate, errors.Join(err, discardErr))
+				}
 				return a.fallbackOrFailure(ctx, store, state, installed, installedErr, active, exitModUpdate, err)
 			}
-			selected = staged
 			candidate = true
 		} else {
 			if activeErr != nil {
@@ -219,13 +242,8 @@ func (a *Application) Run(ctx context.Context) (returnErr error) {
 		return err
 	}
 	if fallback {
-		if candidate {
-			cleanupCtx, cancel := a.cleanupContext(ctx)
-			discardErr := a.Mods.Discard(cleanupCtx, selected)
-			cancel()
-			if discardErr != nil {
-				return exitFailure(exitModUpdate, fmt.Errorf("discard unreferenced staged generation: %w", discardErr))
-			}
+		if discardErr := discardGuardedStage(); discardErr != nil {
+			return exitFailure(exitModUpdate, fmt.Errorf("discard unreferenced staged generation: %w", discardErr))
 		}
 		return a.launch(ctx, active, installed, false)
 	}
@@ -237,9 +255,36 @@ func (a *Application) Run(ctx context.Context) (returnErr error) {
 			}
 			return exitFailure(exitModUpdate, fmt.Errorf("reapply active mods: %w", err))
 		}
+		guardedStage = nil
+	}
+	if err := a.clearDegradedRuntime(store); err != nil {
+		if candidate {
+			return a.rollbackCandidate(ctx, err)
+		}
+		return exitFailure(exitPreflight, err)
 	}
 
 	return a.launch(ctx, selected, steamBuild, candidate)
+}
+
+func (a *Application) clearDegradedRuntime(store applicationStateStore) error {
+	state, err := store.Load()
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("load runtime state before normal launch: %w", err)
+	}
+	if !state.Runtime.Degraded && state.Runtime.Reason == "" {
+		return nil
+	}
+	state.Runtime.Degraded = false
+	state.Runtime.Reason = ""
+	state.Runtime.UpdatedAt = a.clock()()
+	if err := store.Save(state); err != nil {
+		return fmt.Errorf("clear degraded runtime before normal launch: %w", err)
+	}
+	return nil
 }
 
 func (a *Application) fencePriorProcess(store applicationStateStore, state State) (State, error) {
@@ -379,14 +424,17 @@ func (a *Application) stageCandidate(ctx context.Context, state State, active St
 
 	staged, stageErr := a.Mods.Stage(ctx, lock, archives)
 	closeErr := closeValidatedArchives(archives)
-	if stageErr != nil || closeErr != nil {
+	if stageErr != nil {
 		return StagedGeneration{}, errors.Join(stageErr, closeErr)
 	}
 	if staged.Record.ID == "" {
-		return StagedGeneration{}, errors.New("stage candidate returned an empty generation ID")
+		return StagedGeneration{}, errors.Join(errors.New("stage candidate returned an empty generation ID"), closeErr)
 	}
 	staged.Record.LockDigest = lock.Digest
 	staged.Lock = lock
+	if closeErr != nil {
+		return staged, closeErr
+	}
 	return staged, nil
 }
 
@@ -494,7 +542,7 @@ func (a *Application) recordFallback(
 	state.Runtime = RuntimeState{
 		Phase:      "degraded",
 		Degraded:   true,
-		Reason:     cause.Error(),
+		Reason:     shortLogReason(cause.Error()),
 		Generation: active.Record.ID,
 		SteamBuild: installed.BuildID,
 		UpdatedAt:  a.clock()(),
@@ -523,11 +571,11 @@ func (a *Application) validateKnownGoodSteam(state State, installed SteamBuild, 
 }
 
 func (a *Application) launch(ctx context.Context, selected StagedGeneration, steam SteamBuild, candidate bool) error {
-	pruneLogs := a.pruneLogs
-	if pruneLogs == nil {
-		pruneLogs = PruneLogs
+	pruneServerLogs := a.pruneServerLogs
+	if pruneServerLogs == nil {
+		pruneServerLogs = PruneServerLogs
 	}
-	if err := pruneLogs(filepath.Join(a.Config.DataDir, "logs"), a.Config.LogDays, a.clock()()); err != nil {
+	if err := pruneServerLogs(a.Config.DataDir, a.Config.LogDays, a.clock()()); err != nil {
 		if candidate {
 			return a.rollbackCandidate(ctx, fmt.Errorf("prune server logs: %w", err))
 		}
@@ -590,6 +638,12 @@ func (a *Application) cleanupContext(parent context.Context) (context.Context, c
 		timeout = 30 * time.Second
 	}
 	return context.WithTimeout(context.WithoutCancel(parent), timeout)
+}
+
+func (a *Application) discardStagedGeneration(parent context.Context, staged StagedGeneration) error {
+	cleanupCtx, cancel := a.cleanupContext(parent)
+	defer cancel()
+	return a.Mods.Discard(cleanupCtx, staged)
 }
 
 func (a *Application) clock() func() time.Time {

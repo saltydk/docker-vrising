@@ -1253,6 +1253,57 @@ func TestPruneLogsMissingDirectoryIsNoop(t *testing.T) {
 	}
 }
 
+func TestPruneServerLogsPrunesLegacyRootAndCurrentSubdirectory(t *testing.T) {
+	dataDir := t.TempDir()
+	logDir := filepath.Join(dataDir, "logs")
+	rootSubdir := filepath.Join(dataDir, "Settings")
+	logSubdir := filepath.Join(logDir, "archive")
+	for _, dir := range []string{logDir, rootSubdir, logSubdir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Date(2026, time.September, 5, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-8 * 24 * time.Hour)
+	legacy := "20260828-1200-VRisingServer.log"
+	current := "VRisingServer-20260828T120000.000000000Z-000001.log"
+
+	for dir, names := range map[string][]string{
+		dataDir:    {legacy, current, "operator.log"},
+		logDir:     {legacy, current, "operator.log"},
+		rootSubdir: {legacy},
+		logSubdir:  {current},
+	} {
+		for _, name := range names {
+			writeDatedLog(t, dir, name, old)
+		}
+	}
+
+	if err := PruneServerLogs(dataDir, 7, now); err != nil {
+		t.Fatalf("PruneServerLogs() error = %v", err)
+	}
+	for _, path := range []string{
+		filepath.Join(dataDir, legacy),
+		filepath.Join(logDir, current),
+	} {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Errorf("expired owned log %q stat error = %v, want not exist", path, err)
+		}
+	}
+	for _, path := range []string{
+		filepath.Join(dataDir, current),
+		filepath.Join(dataDir, "operator.log"),
+		filepath.Join(logDir, legacy),
+		filepath.Join(logDir, "operator.log"),
+		filepath.Join(rootSubdir, legacy),
+		filepath.Join(logSubdir, current),
+	} {
+		if _, err := os.Lstat(path); err != nil {
+			t.Errorf("preserved path %q stat error = %v", path, err)
+		}
+	}
+}
+
 func TestPruneLogsNeverTraversesSubdirectories(t *testing.T) {
 	root := t.TempDir()
 	now := time.Date(2026, time.September, 5, 12, 0, 0, 0, time.UTC)
