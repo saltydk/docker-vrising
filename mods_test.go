@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -617,31 +618,6 @@ func TestRollbackRestoresPreviousGeneration(t *testing.T) {
 	}
 }
 
-func TestRollbackRepairsRecoveryClearedCandidate(t *testing.T) {
-	manager := newTestModManager(t)
-	candidate := stageTestGeneration(t, manager, managedArchiveContents{})
-	if err := manager.Store.Save(State{
-		SchemaVersion: schemaVersion,
-		Candidate:     &candidate.Record,
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := manager.Rollback(t.Context()); err != nil {
-		t.Fatalf("Rollback() error = %v", err)
-	}
-	state, err := manager.Store.Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if state.Candidate != nil {
-		t.Fatalf("candidate after restart repair = %#v, want nil", state.Candidate)
-	}
-	if state.Failed == nil || state.Failed.ID != candidate.Record.ID || state.Failed.Status != "failed" {
-		t.Fatalf("failed generation = %#v, want stranded candidate marked failed", state.Failed)
-	}
-}
-
 func TestRecoverAfterInterruptedApply(t *testing.T) {
 	manager := newTestModManager(t)
 	first := stageTestGeneration(t, manager, managedArchiveContents{
@@ -924,6 +900,57 @@ func TestPromotionRestartCompletesPendingCleanup(t *testing.T) {
 	if state.Promotion != nil || len(state.PendingCleanup) != 0 || state.Active == nil || state.Active.ID != third.Record.ID ||
 		state.Previous == nil || state.Previous.ID != second.Record.ID {
 		t.Fatalf("state after restart cleanup = %#v", state)
+	}
+}
+
+func TestPromotionFinalSchemaValidatesBeforeAnyWrite(t *testing.T) {
+	for _, restart := range []bool{false, true} {
+		for _, invalid := range []string{"late noncanonical artifact", "missing tombstone hash", "permissive namespace", "changed artifact"} {
+			t.Run(fmt.Sprintf("restart=%t/%s", restart, invalid), func(t *testing.T) {
+				manager := newTestModManager(t)
+				first := stageTestGeneration(t, manager, managedArchiveContents{bepInEx: defaultBepInExEntries("first")})
+				applyAndPromote(t, manager, first)
+				second := stageTestGeneration(t, manager, managedArchiveContents{bepInEx: defaultBepInExEntries("second")})
+				if err := manager.Apply(t.Context(), second); err != nil {
+					t.Fatal(err)
+				}
+				state, err := manager.Store.Load()
+				if err != nil {
+					t.Fatal(err)
+				}
+				entry := &state.Transaction.Entries[len(state.Transaction.Entries)-1]
+				switch invalid {
+				case "late noncanonical artifact":
+					entry.QuarantinePath = "operator.displaced"
+				case "missing tombstone hash":
+					entry.TombstoneSHA256 = ""
+				case "permissive namespace":
+					if err := os.Chmod(filepath.Dir(filepath.Join(manager.Store.StateDir, entry.QuarantinePath)), 0o755); err != nil {
+						t.Fatal(err)
+					}
+				case "changed artifact":
+					writeTestFile(t, filepath.Join(manager.Store.StateDir, entry.QuarantinePath), "operator edit")
+				}
+				if restart {
+					state.Promotion = &PromotionJournal{GenerationID: second.Record.ID, Lock: second.Lock}
+				}
+				if err := manager.Store.saveJSON("state.json", state); err != nil {
+					t.Fatal(err)
+				}
+				before := transactionTree(t, manager.ServerDir)
+				if restart {
+					err = manager.Rollback(t.Context())
+				} else {
+					err = manager.Promote(t.Context(), second)
+				}
+				if err == nil {
+					t.Error("promotion accepted invalid transaction")
+				}
+				if after := transactionTree(t, manager.ServerDir); !reflect.DeepEqual(before, after) {
+					t.Error("promotion changed package lock, state, or artifacts before rejecting the complete journal")
+				}
+			})
+		}
 	}
 }
 

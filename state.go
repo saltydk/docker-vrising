@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -69,15 +70,13 @@ type RuntimeState struct {
 }
 
 type JournalEntry struct {
-	RelativePath            string
-	BackupPath              string
-	QuarantinePath          string
-	TombstonePath           string
-	Existed                 bool
-	OriginalSHA256          string
-	InstalledSHA256         string
-	TombstoneSHA256         string
-	LegacyDeletePlaceholder bool
+	RelativePath    string
+	QuarantinePath  string
+	TombstonePath   string
+	Existed         bool
+	OriginalSHA256  string
+	InstalledSHA256 string
+	TombstoneSHA256 string
 }
 
 type TransactionJournal struct {
@@ -169,12 +168,18 @@ func (s *Store) Load() (State, error) {
 	if state.SchemaVersion != schemaVersion {
 		return State{}, fmt.Errorf("state schema version %d is unsupported", state.SchemaVersion)
 	}
+	if err := validateTransactionState(state, s.StateDir); err != nil {
+		return State{}, fmt.Errorf("validate transaction journal: %w", err)
+	}
 	return state, nil
 }
 
 func (s *Store) Save(state State) error {
 	if state.SchemaVersion != schemaVersion {
 		return fmt.Errorf("state schema version %d is unsupported", state.SchemaVersion)
+	}
+	if err := validateTransactionState(state, s.StateDir); err != nil {
+		return fmt.Errorf("validate transaction journal: %w", err)
 	}
 	return s.saveJSON("state.json", state)
 }
@@ -208,90 +213,16 @@ func (s *Store) RecoverInterruptedTransaction() error {
 	if state.Transaction == nil {
 		return nil
 	}
-	if err := validateTransactionState(state, true); err != nil {
-		return fmt.Errorf("validate transaction journal: %w", err)
+	if _, err := s.transactionArtifacts(state); err != nil {
+		return fmt.Errorf("validate transaction artifacts: %w", err)
 	}
-	journalChanged := false
-	for index := range state.Transaction.Entries {
-		entry := &state.Transaction.Entries[index]
-		if entry.OriginalSHA256 == "" && entry.InstalledSHA256 == "" {
-			continue
-		}
-		if entry.QuarantinePath == "" {
-			entry.QuarantinePath, entry.TombstonePath = canonicalTransactionArtifactPaths(state.Candidate.ID, index)
-			journalChanged = true
-		}
-		if entry.TombstoneSHA256 == "" && entry.InstalledSHA256 != "" {
-			entry.TombstoneSHA256 = entry.InstalledSHA256
-			journalChanged = true
-		}
-	}
-	if journalChanged {
-		if err := s.Save(state); err != nil {
-			return fmt.Errorf("persist recovery namespace: %w", err)
-		}
-	}
-	if err := validateTransactionState(state, false); err != nil {
-		return fmt.Errorf("validate normalized transaction journal: %w", err)
-	}
-	for _, entry := range state.Transaction.Entries {
-		if entry.OriginalSHA256 == "" && entry.InstalledSHA256 == "" {
-			continue
-		}
-		for _, relativePath := range []string{entry.QuarantinePath, entry.TombstonePath} {
-			if err := s.ensureProtectedArtifactParent(relativePath); err != nil {
-				return fmt.Errorf("prepare recovery namespace: %w", err)
-			}
-		}
-		if err := s.validateProtectedArtifactParent(entry.QuarantinePath); err != nil {
-			return fmt.Errorf("validate transaction artifact namespace: %w", err)
-		}
-	}
-	if state.Transaction.Config != nil {
-		if err := s.validateProtectedArtifactParent(state.Transaction.Config.QuarantinePath); err != nil {
-			return fmt.Errorf("validate config artifact namespace: %w", err)
-		}
-	}
-	converted, err := s.convertLegacyDeletePlaceholders(&state, filepath.Dir(s.StateDir))
-	if err != nil {
-		return fmt.Errorf("convert legacy stale-delete placeholder: %w", err)
-	}
-	if len(converted) > 0 {
-		if err := s.Save(state); err != nil {
-			return fmt.Errorf("persist legacy stale-delete conversion: %w", err)
-		}
-		if s.recoveryHook != nil {
-			for _, relativePath := range converted {
-				if err := s.recoveryHook("legacy-placeholder-converted", relativePath); err != nil {
-					return err
-				}
-			}
-		}
-	}
-
 	serverDir := filepath.Dir(s.StateDir)
 	for _, entry := range state.Transaction.Entries {
-		if entry.OriginalSHA256 != "" || entry.InstalledSHA256 != "" {
-			if err := s.recoverQuarantinedJournalEntry(serverDir, entry); err != nil {
-				return fmt.Errorf("recover managed file %s: %w", entry.RelativePath, err)
-			}
-			if err := s.syncQuarantinedJournalParents(serverDir, entry); err != nil {
-				return fmt.Errorf("sync recovered managed file %s: %w", entry.RelativePath, err)
-			}
-			continue
+		if err := s.recoverQuarantinedJournalEntry(serverDir, entry); err != nil {
+			return fmt.Errorf("recover managed file %s: %w", entry.RelativePath, err)
 		}
-		if !entry.Existed {
-			if err := s.removeInterruptedTarget(serverDir, entry.RelativePath); err != nil {
-				return fmt.Errorf("remove interrupted managed file %s: %w", entry.RelativePath, err)
-			}
-			continue
-		}
-		data, mode, err := readFileBelow(s.StateDir, entry.BackupPath)
-		if err != nil {
-			return fmt.Errorf("read transaction backup %s: %w", entry.BackupPath, err)
-		}
-		if err := s.restoreInterruptedTarget(serverDir, entry.RelativePath, data, mode); err != nil {
-			return fmt.Errorf("restore interrupted managed file %s: %w", entry.RelativePath, err)
+		if err := s.syncQuarantinedJournalParents(serverDir, entry); err != nil {
+			return fmt.Errorf("sync recovered managed file %s: %w", entry.RelativePath, err)
 		}
 	}
 	if state.Transaction.Config != nil {
@@ -315,13 +246,6 @@ func (s *Store) RecoverInterruptedTransaction() error {
 
 func (s *Store) recoverQuarantinedJournalEntry(serverDir string, entry JournalEntry) error {
 	tombstoneHash := entry.TombstoneSHA256
-	if tombstoneHash == "" {
-		tombstoneHash = entry.InstalledSHA256
-	}
-	replacementHash := entry.InstalledSHA256
-	if entry.LegacyDeletePlaceholder {
-		replacementHash = tombstoneHash
-	}
 	live, liveExists, err := snapshotFileBelow(serverDir, entry.RelativePath)
 	if err != nil {
 		return fmt.Errorf("inspect live path: %w", err)
@@ -329,15 +253,6 @@ func (s *Store) recoverQuarantinedJournalEntry(serverDir string, entry JournalEn
 	quarantine, quarantineExists, err := snapshotFileBelow(s.StateDir, entry.QuarantinePath)
 	if err != nil {
 		return fmt.Errorf("inspect quarantine: %w", err)
-	}
-	if entry.Existed && !quarantineExists && (!liveExists || live.SHA256 != entry.OriginalSHA256) {
-		if err := s.seedOriginalQuarantine(entry); err != nil {
-			return fmt.Errorf("seed original quarantine: %w", err)
-		}
-		quarantine, quarantineExists, err = snapshotFileBelow(s.StateDir, entry.QuarantinePath)
-		if err != nil {
-			return fmt.Errorf("inspect seeded quarantine: %w", err)
-		}
 	}
 	tombstone, tombstoneExists, err := snapshotFileBelow(s.StateDir, entry.TombstonePath)
 	if err != nil {
@@ -410,7 +325,7 @@ func (s *Store) recoverQuarantinedJournalEntry(serverDir string, entry JournalEn
 		return s.removeJournalArtifact(entry.QuarantinePath, quarantine)
 	}
 
-	if entry.InstalledSHA256 == "" && !entry.LegacyDeletePlaceholder {
+	if entry.InstalledSHA256 == "" {
 		if tombstoneExists {
 			return fmt.Errorf("stale deletion has unexpected tombstone content")
 		}
@@ -447,7 +362,7 @@ func (s *Store) recoverQuarantinedJournalEntry(serverDir string, entry JournalEn
 			s.syncDirectoryFD,
 		)
 	}
-	if live.SHA256 != replacementHash {
+	if live.SHA256 != entry.InstalledSHA256 {
 		return fmt.Errorf("current replacement was changed externally")
 	}
 	if err := moveFileNoReplace(
@@ -470,69 +385,10 @@ func (s *Store) recoverQuarantinedJournalEntry(serverDir string, entry JournalEn
 		return fmt.Errorf("restore quarantined original: %w", err)
 	}
 	tombstone, exists, err := snapshotFileBelow(s.StateDir, entry.TombstonePath)
-	if err != nil || !exists || tombstone.SHA256 != replacementHash {
+	if err != nil || !exists || tombstone.SHA256 != entry.InstalledSHA256 {
 		return fmt.Errorf("verify replacement tombstone")
 	}
 	return s.removeJournalArtifact(entry.TombstonePath, tombstone)
-}
-
-func (s *Store) convertLegacyDeletePlaceholders(state *State, serverDir string) ([]string, error) {
-	converted := make([]string, 0)
-	for index := range state.Transaction.Entries {
-		entry := &state.Transaction.Entries[index]
-		if entry.OriginalSHA256 == "" && entry.InstalledSHA256 == "" ||
-			!entry.Existed || entry.InstalledSHA256 != "" || entry.LegacyDeletePlaceholder {
-			continue
-		}
-		live, liveExists, err := snapshotFileBelow(serverDir, entry.RelativePath)
-		if err != nil {
-			return nil, err
-		}
-		quarantine, quarantineExists, err := snapshotFileBelow(s.StateDir, entry.QuarantinePath)
-		if err != nil {
-			return nil, err
-		}
-		_, tombstoneExists, err := snapshotFileBelow(s.StateDir, entry.TombstonePath)
-		if err != nil {
-			return nil, err
-		}
-		if !liveExists || len(live.Data) != 0 || !quarantineExists || quarantine.SHA256 != entry.OriginalSHA256 || tombstoneExists {
-			continue
-		}
-		entry.LegacyDeletePlaceholder = true
-		entry.TombstoneSHA256 = hashBytes(nil)
-		converted = append(converted, entry.RelativePath)
-	}
-	return converted, nil
-}
-
-func (s *Store) seedOriginalQuarantine(entry JournalEntry) error {
-	data, mode, err := readFileBelow(s.StateDir, entry.BackupPath)
-	if err != nil {
-		return err
-	}
-	if hashBytes(data) != entry.OriginalSHA256 {
-		return fmt.Errorf("transaction backup does not match original SHA-256")
-	}
-	root, err := s.openStateDirectory(false)
-	if err != nil {
-		return err
-	}
-	defer unix.Close(root)
-	parent, name, err := openRelativeParent(root, entry.QuarantinePath, true, s.syncDirectoryFD)
-	if err != nil {
-		return err
-	}
-	defer unix.Close(parent)
-	temporaryName, err := writeTemporaryFileAt(parent, name, data, mode)
-	if err != nil {
-		return err
-	}
-	defer unix.Unlinkat(parent, temporaryName, 0)
-	if err := unix.Renameat2(parent, temporaryName, parent, name, unix.RENAME_NOREPLACE); err != nil {
-		return err
-	}
-	return s.syncDirectoryFD(parent)
 }
 
 func (s *Store) recoverConfigJournalEntry(serverDir string, entry JournalEntry) error {
@@ -626,16 +482,12 @@ func (s *Store) removeJournalArtifact(relativePath string, expected fileSnapshot
 	return s.syncDirectoryFD(parent)
 }
 
-func validateTransactionState(state State, allowMissingArtifacts bool) error {
+func validateTransactionState(state State, stateDir string) error {
 	journal := state.Transaction
 	if journal == nil {
-		return nil
-	}
-	hashed := journal.Config != nil
-	for _, entry := range journal.Entries {
-		hashed = hashed || entry.OriginalSHA256 != "" || entry.InstalledSHA256 != ""
-	}
-	if !hashed {
+		if state.Candidate != nil {
+			return fmt.Errorf("candidate has no transaction journal")
+		}
 		return nil
 	}
 	if state.Candidate == nil || state.Candidate.ID == "" || state.Candidate.ID != journal.GenerationID {
@@ -650,16 +502,24 @@ func validateTransactionState(state State, allowMissingArtifacts bool) error {
 	if parts, err := relativePathParts(state.Candidate.ID); err != nil || len(parts) != 1 {
 		return fmt.Errorf("candidate generation ID is invalid")
 	}
+	// Live names are server-relative; artifact names are StateDir-relative.
+	// Compare both using absolute server paths, with the state subtree reserved.
+	serverDir := filepath.Dir(stateDir)
 	livePaths := make(map[string]bool, len(journal.Entries)+1)
 	artifactPaths := make(map[string]bool, 2*(len(journal.Entries)+1))
 	validateEntry := func(entry JournalEntry, index int, config bool) error {
-		if _, err := relativePathParts(entry.RelativePath); err != nil {
+		parts, err := relativePathParts(entry.RelativePath)
+		if err != nil {
 			return fmt.Errorf("live path %q is invalid", entry.RelativePath)
 		}
-		if livePaths[entry.RelativePath] {
+		livePath := filepath.Join(serverDir, entry.RelativePath)
+		if parts[0] == ".docker-vrising" || livePath == filepath.Clean(stateDir) || strings.HasPrefix(livePath, filepath.Clean(stateDir)+"/") {
+			return fmt.Errorf("live path %q is inside reserved state namespace", entry.RelativePath)
+		}
+		if livePaths[livePath] {
 			return fmt.Errorf("duplicate live path %q", entry.RelativePath)
 		}
-		livePaths[entry.RelativePath] = true
+		livePaths[livePath] = true
 		if entry.Existed {
 			if !validSHA256(entry.OriginalSHA256) {
 				return fmt.Errorf("original SHA-256 for %q is invalid", entry.RelativePath)
@@ -667,31 +527,24 @@ func validateTransactionState(state State, allowMissingArtifacts bool) error {
 		} else if entry.OriginalSHA256 != "" {
 			return fmt.Errorf("new path %q has an original SHA-256", entry.RelativePath)
 		}
-		if entry.InstalledSHA256 != "" && !validSHA256(entry.InstalledSHA256) {
+		if entry.InstalledSHA256 == "" {
+			if !entry.Existed || config {
+				return fmt.Errorf("installed SHA-256 for %q is missing", entry.RelativePath)
+			}
+		} else if !validSHA256(entry.InstalledSHA256) {
 			return fmt.Errorf("installed SHA-256 for %q is invalid", entry.RelativePath)
 		}
-		if entry.TombstoneSHA256 != "" && !validSHA256(entry.TombstoneSHA256) {
-			return fmt.Errorf("tombstone SHA-256 for %q is invalid", entry.RelativePath)
-		}
-		if entry.LegacyDeletePlaceholder && (!entry.Existed || entry.InstalledSHA256 != "" || entry.TombstoneSHA256 != hashBytes(nil)) {
-			return fmt.Errorf("legacy placeholder metadata for %q is invalid", entry.RelativePath)
+		if entry.TombstoneSHA256 != entry.InstalledSHA256 {
+			return fmt.Errorf("tombstone SHA-256 for %q does not match installed SHA-256", entry.RelativePath)
 		}
 		wantQuarantine, wantTombstone := canonicalTransactionArtifactPaths(state.Candidate.ID, index)
-		if allowMissingArtifacts && entry.QuarantinePath == "" && entry.TombstonePath == "" {
-			return nil
-		}
 		if entry.QuarantinePath != wantQuarantine || entry.TombstonePath != wantTombstone {
 			return fmt.Errorf("transaction artifacts for %q are not canonical", entry.RelativePath)
 		}
 		for _, artifactPath := range []string{entry.QuarantinePath, entry.TombstonePath} {
-			if artifactPath == "state.json" || artifactPath == "package-lock.json" || artifactPath == "update.lock" {
-				return fmt.Errorf("transaction artifact uses reserved name %q", artifactPath)
-			}
-			if _, err := relativePathParts(artifactPath); err != nil {
-				return fmt.Errorf("transaction artifact %q is invalid", artifactPath)
-			}
-			if artifactPaths[artifactPath] || livePaths[artifactPath] {
-				return fmt.Errorf("transaction artifact path %q collides", artifactPath)
+			artifactPath = filepath.Join(stateDir, artifactPath)
+			if artifactPaths[artifactPath] {
+				return fmt.Errorf("duplicate transaction artifact path %q", artifactPath)
 			}
 			artifactPaths[artifactPath] = true
 		}
@@ -766,52 +619,64 @@ func (s *Store) validateProtectedArtifactParent(relativePath string) error {
 	return nil
 }
 
-func (s *Store) commitTransactionArtifacts(state State) error {
-	journal := state.Transaction
-	if journal == nil {
-		return nil
+type transactionArtifact struct {
+	path     string
+	snapshot fileSnapshot
+	exists   bool
+}
+
+// Inspect every artifact before promotion writes intent/lock or recovery mutates
+// any file. Cleanup rechecks each saved identity and hash immediately before unlink.
+func (s *Store) transactionArtifacts(state State) ([]transactionArtifact, error) {
+	if err := validateTransactionState(state, s.StateDir); err != nil {
+		return nil, err
 	}
-	if err := validateTransactionState(state, false); err != nil {
-		return err
+	if state.Transaction == nil {
+		return nil, nil
 	}
-	entries := append([]JournalEntry(nil), journal.Entries...)
-	if journal.Config != nil {
-		entries = append(entries, *journal.Config)
+	entries := append([]JournalEntry(nil), state.Transaction.Entries...)
+	if state.Transaction.Config != nil {
+		entries = append(entries, *state.Transaction.Config)
 	}
+	artifacts := make([]transactionArtifact, 0, 2*len(entries))
 	for _, entry := range entries {
 		if err := s.validateProtectedArtifactParent(entry.QuarantinePath); err != nil {
-			return err
-		}
-		tombstoneHash := entry.TombstoneSHA256
-		if tombstoneHash == "" {
-			tombstoneHash = entry.InstalledSHA256
+			return nil, err
 		}
 		for _, artifact := range []struct {
 			path string
 			hash string
 		}{
 			{path: entry.QuarantinePath, hash: entry.OriginalSHA256},
-			{path: entry.TombstonePath, hash: tombstoneHash},
+			{path: entry.TombstonePath, hash: entry.TombstoneSHA256},
 		} {
-			if artifact.path == "" {
-				continue
-			}
 			snapshot, exists, err := snapshotFileBelow(s.StateDir, artifact.path)
 			if err != nil {
+				return nil, err
+			}
+			if exists && (artifact.hash == "" || snapshot.SHA256 != artifact.hash) {
+				return nil, fmt.Errorf("transaction artifact %s contains unexpected content", artifact.path)
+			}
+			artifacts = append(artifacts, transactionArtifact{path: artifact.path, snapshot: snapshot, exists: exists})
+		}
+	}
+	return artifacts, nil
+}
+
+func (s *Store) commitTransactionArtifacts(state State) error {
+	artifacts, err := s.transactionArtifacts(state)
+	if err != nil {
+		return err
+	}
+	for _, artifact := range artifacts {
+		if !artifact.exists {
+			if err := s.syncStatePathParent(artifact.path); err != nil {
 				return err
 			}
-			if !exists {
-				if err := s.syncStatePathParent(artifact.path); err != nil {
-					return err
-				}
-				continue
-			}
-			if artifact.hash == "" || snapshot.SHA256 != artifact.hash {
-				return fmt.Errorf("transaction artifact %s contains unexpected content", artifact.path)
-			}
-			if err := s.removeJournalArtifact(artifact.path, snapshot); err != nil {
-				return err
-			}
+			continue
+		}
+		if err := s.removeJournalArtifact(artifact.path, artifact.snapshot); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -843,58 +708,6 @@ func (s *Store) syncStatePathParent(relativePath string) error {
 	return s.syncDirectoryFD(parent)
 }
 
-func (s *Store) ensureProtectedArtifactParent(relativePath string) error {
-	parts, err := relativePathParts(relativePath)
-	if err != nil {
-		return err
-	}
-	root, err := s.openStateDirectory(false)
-	if err != nil {
-		return err
-	}
-	defer unix.Close(root)
-	current, err := unix.Dup(root)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = unix.Close(current) }()
-	for _, component := range parts[:len(parts)-1] {
-		created := false
-		next, err := unix.Openat(current, component, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
-		if err == unix.ENOENT {
-			if err := unix.Mkdirat(current, component, 0o700); err != nil && err != unix.EEXIST {
-				return err
-			}
-			created = true
-			if err := s.syncDirectoryFD(current); err != nil {
-				return err
-			}
-			next, err = unix.Openat(current, component, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
-		}
-		if err != nil {
-			return err
-		}
-		var stat unix.Stat_t
-		if err := unix.Fstat(next, &stat); err != nil {
-			unix.Close(next)
-			return err
-		}
-		if stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Uid != uint32(os.Geteuid()) || stat.Mode&0o7777 != 0o700 {
-			unix.Close(next)
-			return fmt.Errorf("transaction artifact namespace must be runtime-owned mode 0700")
-		}
-		if created {
-			if err := s.syncDirectoryFD(next); err != nil {
-				unix.Close(next)
-				return err
-			}
-		}
-		unix.Close(current)
-		current = next
-	}
-	return nil
-}
-
 func (s *Store) syncJournalTargetParent(serverDir, relativePath string) error {
 	root, err := openDirectoryPath(serverDir, false)
 	if err != nil {
@@ -919,8 +732,13 @@ func (s *Store) loadJSON(name string, value any) error {
 	if err != nil {
 		return fmt.Errorf("read %s: %w", name, err)
 	}
-	if err := json.Unmarshal(data, value); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(value); err != nil {
 		return fmt.Errorf("decode %s: %w", name, err)
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return fmt.Errorf("decode %s: unexpected trailing JSON", name)
 	}
 	return nil
 }
@@ -964,58 +782,6 @@ func (s *Store) openStateDirectory(create bool) (int, error) {
 		return -1, fmt.Errorf("state directory must be runtime-owned mode 0700")
 	}
 	return stateDir, nil
-}
-
-func (s *Store) removeInterruptedTarget(serverDir, relativePath string) error {
-	digest := sha256.Sum256([]byte(relativePath))
-	artifactPath := "transaction/legacy-remove/" + hex.EncodeToString(digest[:])
-	if err := s.ensureProtectedArtifactParent(artifactPath); err != nil {
-		return err
-	}
-	artifact, artifactExists, err := snapshotFileBelow(s.StateDir, artifactPath)
-	if err != nil {
-		return err
-	}
-	_, liveExists, err := snapshotFileBelow(serverDir, relativePath)
-	if err != nil {
-		return err
-	}
-	if artifactExists && liveExists {
-		return fmt.Errorf("legacy removal has both live and quarantined content")
-	}
-	if liveExists {
-		if err := moveFileNoReplace(serverDir, relativePath, s.StateDir, artifactPath, s.syncDirectoryFD); err != nil {
-			return err
-		}
-		artifact, artifactExists, err = snapshotFileBelow(s.StateDir, artifactPath)
-		if err != nil || !artifactExists {
-			return fmt.Errorf("verify legacy removal quarantine")
-		}
-	}
-	if artifactExists {
-		if err := s.removeJournalArtifact(artifactPath, artifact); err != nil {
-			return err
-		}
-	}
-	if err := s.syncJournalTargetParent(serverDir, relativePath); err != nil {
-		return fmt.Errorf("sync target parent: %w", err)
-	}
-	return nil
-}
-
-func (s *Store) restoreInterruptedTarget(serverDir, relativePath string, data []byte, mode os.FileMode) error {
-	root, err := openDirectoryPath(serverDir, false)
-	if err != nil {
-		return err
-	}
-	defer unix.Close(root)
-
-	parent, name, err := openRelativeParent(root, relativePath, true, s.syncDirectoryFD)
-	if err != nil {
-		return err
-	}
-	defer unix.Close(parent)
-	return atomicWriteAt(parent, name, data, mode, s.syncDirectoryFD)
 }
 
 func readFileBelow(rootPath, relativePath string) ([]byte, os.FileMode, error) {

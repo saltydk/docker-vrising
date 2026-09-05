@@ -154,11 +154,6 @@ func (m *ModManager) Apply(ctx context.Context, staged StagedGeneration) error {
 			Existed:        existed,
 		}
 		if existed {
-			generationBackup := "rollback/" + relativePath
-			if err := writeGenerationFile(generationRoot, generationBackup, snapshot.Data, snapshot.Mode); err != nil {
-				return fmt.Errorf("back up managed file %s: %w", relativePath, err)
-			}
-			entry.BackupPath = "generations/" + staged.Record.ID + "/" + generationBackup
 			entry.OriginalSHA256 = snapshot.SHA256
 		}
 		if next, ok := nextFiles[relativePath]; ok {
@@ -193,7 +188,7 @@ func (m *ModManager) Apply(ctx context.Context, staged StagedGeneration) error {
 		Entries:      entries,
 		Config:       configEntry,
 	}
-	if err := validateTransactionState(state, false); err != nil {
+	if err := validateTransactionState(state, m.Store.StateDir); err != nil {
 		return fmt.Errorf("validate managed-file journal: %w", err)
 	}
 	journalEntries := append([]JournalEntry(nil), entries...)
@@ -303,16 +298,6 @@ func (m *ModManager) Rollback(ctx context.Context) error {
 		return fmt.Errorf("load mod state for rollback: %w", err)
 	}
 	if state.Transaction == nil {
-		if state.Candidate == nil {
-			return nil
-		}
-		failed := *state.Candidate
-		failed.Status = "failed"
-		state.Candidate = nil
-		state.Failed = &failed
-		if err := m.Store.Save(state); err != nil {
-			return fmt.Errorf("repair recovered candidate state: %w", err)
-		}
 		return nil
 	}
 	if state.Candidate == nil || state.Transaction.GenerationID != state.Candidate.ID {
@@ -352,6 +337,9 @@ func (m *ModManager) Promote(ctx context.Context, staged StagedGeneration) error
 	if state.Promotion != nil {
 		return fmt.Errorf("another generation promotion is already pending")
 	}
+	if _, err := m.Store.transactionArtifacts(state); err != nil {
+		return fmt.Errorf("validate promotion transaction: %w", err)
+	}
 	state.Promotion = &PromotionJournal{GenerationID: staged.Record.ID, Lock: clonePackageLock(lock)}
 	state.PendingCleanup = cleanupGenerationIDs(state.Previous, state.Failed)
 	if err := m.Store.Save(state); err != nil {
@@ -370,6 +358,9 @@ func (m *ModManager) reconcilePromotion(ctx context.Context) error {
 	}
 	if err != nil {
 		return err
+	}
+	if _, err := m.Store.transactionArtifacts(state); err != nil {
+		return fmt.Errorf("validate pending transaction: %w", err)
 	}
 	if state.Promotion != nil {
 		promotion := state.Promotion

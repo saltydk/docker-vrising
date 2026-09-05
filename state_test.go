@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"strings"
 	"testing"
 	"time"
 
@@ -278,55 +277,192 @@ func TestLifetimeLockRejectsSymlinkedLock(t *testing.T) {
 	}
 }
 
-func TestRecoverInterruptedTransactionRestoresRecordedFiles(t *testing.T) {
-	serverDir := t.TempDir()
-	stateDir := filepath.Join(serverDir, ".docker-vrising")
-	store := Store{StateDir: stateDir}
-	managedPath := filepath.Join(serverDir, "BepInEx", "managed.dll")
-	newManagedPath := filepath.Join(serverDir, "BepInEx", "plugins", "new.dll")
-	userPath := filepath.Join(serverDir, "BepInEx", "plugins", "user.dll")
-	backupPath := filepath.Join(stateDir, "transaction", "managed.dll")
+func TestRecoverFinalSchemaRejectsInvalidJournalWithoutMutation(t *testing.T) {
+	tests := []struct {
+		name          string
+		mutate        func(*State)
+		obsoleteField string
+		obsoleteValue any
+	}{
+		{name: "live path inside state", mutate: func(s *State) {
+			s.Transaction.Entries[1].RelativePath = ".docker-vrising/operator.txt"
+		}},
+		{name: "live aliases earlier quarantine", mutate: func(s *State) {
+			s.Transaction.Entries[1].RelativePath = ".docker-vrising/" + s.Transaction.Entries[0].QuarantinePath
+		}},
+		{name: "live aliases later tombstone", mutate: func(s *State) {
+			s.Transaction.Entries[0].RelativePath = ".docker-vrising/" + s.Transaction.Entries[1].TombstonePath
+		}},
+		{name: "unvalidated backup", obsoleteField: "BackupPath", obsoleteValue: "operator-backup.dll"},
+		{name: "missing namespace", mutate: func(s *State) {
+			s.Transaction.Entries[1].QuarantinePath = ""
+			s.Transaction.Entries[1].TombstonePath = ""
+		}},
+		{name: "missing tombstone hash", mutate: func(s *State) {
+			s.Transaction.Entries[1].TombstoneSHA256 = ""
+		}},
+		{name: "wrong tombstone hash", mutate: func(s *State) {
+			s.Transaction.Entries[1].TombstoneSHA256 = hashBytes([]byte("wrong"))
+		}},
+		{name: "unhashed removal", mutate: func(s *State) {
+			for i := range s.Transaction.Entries {
+				s.Transaction.Entries[i] = JournalEntry{RelativePath: s.Transaction.Entries[i].RelativePath}
+			}
+		}},
+		{name: "unhashed candidate mismatch", mutate: func(s *State) {
+			s.Transaction.GenerationID = "other"
+			for i := range s.Transaction.Entries {
+				s.Transaction.Entries[i] = JournalEntry{RelativePath: s.Transaction.Entries[i].RelativePath}
+			}
+		}},
+		{name: "empty candidate mismatch", mutate: func(s *State) {
+			s.Transaction.GenerationID = "other"
+			s.Transaction.Entries = nil
+		}},
+		{name: "legacy placeholder", obsoleteField: "LegacyDeletePlaceholder", obsoleteValue: true, mutate: func(s *State) {
+			e := &s.Transaction.Entries[1]
+			e.InstalledSHA256 = ""
+			e.TombstoneSHA256 = hashBytes(nil)
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			serverDir := t.TempDir()
+			store := Store{StateDir: filepath.Join(serverDir, ".docker-vrising")}
+			state := State{
+				SchemaVersion: schemaVersion,
+				Candidate:     &GenerationRecord{ID: "candidate", Status: "candidate"},
+				Transaction: &TransactionJournal{GenerationID: "candidate", Phase: "applied", Entries: []JournalEntry{
+					canonicalReplacementEntry("candidate", 0, "one.dll"),
+					canonicalReplacementEntry("candidate", 1, "two.dll"),
+				}},
+			}
+			for _, e := range state.Transaction.Entries {
+				writeTestFile(t, filepath.Join(serverDir, e.RelativePath), "candidate")
+				writeTestFile(t, filepath.Join(store.StateDir, e.QuarantinePath), "original")
+			}
+			writeTestFile(t, filepath.Join(store.StateDir, "operator.txt"), "candidate")
+			writeTestFile(t, filepath.Join(store.StateDir, "operator-backup.dll"), "original")
+			if tt.mutate != nil {
+				tt.mutate(&state)
+			}
+			if tt.name == "legacy placeholder" {
+				writeTestFile(t, filepath.Join(serverDir, "two.dll"), "")
+			}
+			data, err := json.Marshal(state)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tt.obsoleteField != "" {
+				var raw map[string]any
+				if err := json.Unmarshal(data, &raw); err != nil {
+					t.Fatal(err)
+				}
+				entries := raw["Transaction"].(map[string]any)["Entries"].([]any)
+				entries[1].(map[string]any)[tt.obsoleteField] = tt.obsoleteValue
+				data, err = json.Marshal(raw)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			writeTestFile(t, filepath.Join(store.StateDir, "state.json"), string(data))
+			before := transactionTree(t, serverDir)
+			if err := store.RecoverInterruptedTransaction(); err == nil {
+				t.Error("recovery accepted invalid final-schema journal")
+			}
+			if after := transactionTree(t, serverDir); !reflect.DeepEqual(before, after) {
+				t.Error("rejected journal mutated the server or state tree")
+			}
+		})
+	}
+}
 
-	writeTestFile(t, managedPath, "replacement")
-	writeTestFile(t, newManagedPath, "new managed file")
-	writeTestFile(t, userPath, "user file")
-	writeTestFile(t, backupPath, "original")
-	if err := store.Save(State{
-		SchemaVersion: 1,
-		Transaction: &TransactionJournal{
-			GenerationID: "generation-2",
-			Phase:        "applying",
-			Entries: []JournalEntry{
-				{RelativePath: "BepInEx/managed.dll", BackupPath: "transaction/managed.dll", Existed: true},
-				{RelativePath: "BepInEx/plugins/new.dll", Existed: false},
-			},
-		},
-	}); err != nil {
-		t.Fatalf("save transaction state: %v", err)
+func TestStoreTrueOsirisMigrationRequiresPristineState(t *testing.T) {
+	for _, input := range []string{"pristine", "malformed", "intermediate"} {
+		t.Run(input, func(t *testing.T) {
+			serverDir := t.TempDir()
+			store := Store{StateDir: filepath.Join(serverDir, ".docker-vrising")}
+			for _, path := range []string{"VRisingServer.exe", "save-data/Saves/world.save", "BepInEx/config/BepInEx.cfg", "BepInEx/plugins/manual.dll"} {
+				writeTestFile(t, filepath.Join(serverDir, path), "existing TrueOsiris data")
+			}
+			if input != "pristine" {
+				data := "{broken"
+				if input == "intermediate" {
+					data = `{"SchemaVersion":1,"Candidate":{"ID":"candidate","Status":"candidate"},"Transaction":{"GenerationID":"candidate","Phase":"applying","Entries":[{"RelativePath":"BepInEx/plugins/manual.dll","Existed":false}]}}`
+				}
+				writeTestFile(t, filepath.Join(store.StateDir, "state.json"), data)
+			}
+			before := transactionTree(t, serverDir)
+			state, err := store.Load()
+			if input == "pristine" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if state.SchemaVersion != 1 || state.Transaction != nil || state.Candidate != nil {
+					t.Fatalf("initial state = %#v", state)
+				}
+				if _, err := os.Stat(store.StateDir); !os.IsNotExist(err) {
+					t.Fatalf("Load created StateDir: %v", err)
+				}
+				if err := store.Save(state); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := store.Load(); err != nil {
+					t.Fatal(err)
+				}
+				// State initialization may only add its private directory and state.json.
+				after := transactionTree(t, serverDir)
+				delete(after, ".docker-vrising")
+				delete(after, ".docker-vrising/state.json")
+				if !reflect.DeepEqual(before, after) {
+					t.Fatal("initialization touched existing server files")
+				}
+				return
+			}
+			if err == nil {
+				t.Error("Load accepted malformed or intermediate state")
+			}
+			if err := store.RecoverInterruptedTransaction(); err == nil {
+				t.Error("recovery accepted malformed or intermediate state")
+			}
+			if !reflect.DeepEqual(before, transactionTree(t, serverDir)) {
+				t.Fatal("rejection touched existing files")
+			}
+		})
 	}
+}
 
-	if err := store.RecoverInterruptedTransaction(); err != nil {
-		t.Fatalf("RecoverInterruptedTransaction() error = %v", err)
-	}
-	if got := readTestFile(t, managedPath); got != "original" {
-		t.Fatalf("recovered managed file = %q, want original", got)
-	}
-	if _, err := os.Stat(newManagedPath); !os.IsNotExist(err) {
-		t.Fatalf("new managed file stat error = %v, want not exist", err)
-	}
-	if got := readTestFile(t, userPath); got != "user file" {
-		t.Fatalf("user file = %q, want unchanged user file", got)
-	}
-	state, err := store.Load()
+func transactionTree(t *testing.T, root string) map[string]string {
+	t.Helper()
+	files := make(map[string]string)
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == root {
+			return nil
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		files[relative] = info.Mode().String()
+		if info.Mode().IsRegular() {
+			snapshot, exists, err := snapshotFileBelow(root, relative)
+			if err != nil {
+				return err
+			}
+			if !exists {
+				return fmt.Errorf("fixture disappeared: %s", path)
+			}
+			files[relative] += fmt.Sprintf(":%d:%d:%s", snapshot.Dev, snapshot.Ino, snapshot.SHA256)
+		}
+		return nil
+	})
 	if err != nil {
-		t.Fatalf("load recovered state: %v", err)
+		t.Fatal(err)
 	}
-	if state.Transaction != nil {
-		t.Fatalf("recovered transaction = %#v, want nil", state.Transaction)
-	}
-	if err := store.RecoverInterruptedTransaction(); err != nil {
-		t.Fatalf("second RecoverInterruptedTransaction() error = %v", err)
-	}
+	return files
 }
 
 func TestRecoverInterruptedTransactionMarksCandidateFailedWithJournalClear(t *testing.T) {
@@ -341,16 +477,16 @@ func TestRecoverInterruptedTransactionMarksCandidateFailedWithJournalClear(t *te
 	}
 	managedPath := filepath.Join(serverDir, "winhttp.dll")
 	writeTestFile(t, managedPath, "candidate")
+	entry := canonicalReplacementEntry(candidate.ID, 0, "winhttp.dll")
+	entry.Existed, entry.OriginalSHA256 = false, ""
+	prepareTestArtifactParent(t, &store, entry)
 	if err := store.Save(State{
 		SchemaVersion: schemaVersion,
 		Candidate:     &candidate,
 		Transaction: &TransactionJournal{
 			GenerationID: candidate.ID,
 			Phase:        "applying",
-			Entries: []JournalEntry{{
-				RelativePath: "winhttp.dll",
-				Existed:      false,
-			}},
+			Entries:      []JournalEntry{entry},
 		},
 	}); err != nil {
 		t.Fatal(err)
@@ -426,7 +562,6 @@ func TestRecoverInterruptedTransactionDistinguishesObservedEntryState(t *testing
 			stateDir := filepath.Join(serverDir, ".docker-vrising")
 			store := Store{StateDir: stateDir}
 			target := filepath.Join(serverDir, "managed.dll")
-			backup := filepath.Join(stateDir, "transaction", "managed.dll")
 			if tt.targetContent != "" {
 				writeTestFile(t, target, tt.targetContent)
 			}
@@ -442,10 +577,15 @@ func TestRecoverInterruptedTransactionDistinguishesObservedEntryState(t *testing
 				RelativePath:    "managed.dll",
 				Existed:         tt.existed,
 				InstalledSHA256: tt.installedHash,
+				TombstoneSHA256: tt.installedHash,
+				QuarantinePath:  "generations/candidate/rollback/quarantine/0000.displaced",
+				TombstonePath:   "generations/candidate/rollback/quarantine/0000.tombstone",
 			}
+			prepareTestArtifactParent(t, &store, entry)
 			if tt.existed {
-				writeTestFile(t, backup, "original")
-				entry.BackupPath = "transaction/managed.dll"
+				if tt.targetContent != "original" {
+					writeTestFile(t, filepath.Join(stateDir, entry.QuarantinePath), "original")
+				}
 				entry.OriginalSHA256 = hashBytes([]byte("original"))
 			}
 			candidate := GenerationRecord{ID: "candidate", LockDigest: "lock", Status: "candidate"}
@@ -513,7 +653,6 @@ func TestRecoverInterruptedHashedNoopResyncsBeforeJournalClear(t *testing.T) {
 			create: true,
 			entry: JournalEntry{
 				RelativePath:    "managed.dll",
-				BackupPath:      "transaction/managed.dll",
 				Existed:         true,
 				OriginalSHA256:  hashBytes([]byte("original")),
 				InstalledSHA256: hashBytes([]byte("candidate")),
@@ -527,8 +666,11 @@ func TestRecoverInterruptedHashedNoopResyncsBeforeJournalClear(t *testing.T) {
 			store := Store{StateDir: stateDir}
 			if tt.create {
 				writeTestFile(t, filepath.Join(serverDir, "managed.dll"), "original")
-				writeTestFile(t, filepath.Join(stateDir, "transaction", "managed.dll"), "original")
 			}
+			tt.entry.QuarantinePath = "generations/candidate/rollback/quarantine/0000.displaced"
+			tt.entry.TombstonePath = "generations/candidate/rollback/quarantine/0000.tombstone"
+			tt.entry.TombstoneSHA256 = tt.entry.InstalledSHA256
+			prepareTestArtifactParent(t, &store, tt.entry)
 			candidate := GenerationRecord{ID: "candidate", LockDigest: "lock", Status: "candidate"}
 			if err := store.Save(State{
 				SchemaVersion: schemaVersion,
@@ -568,16 +710,16 @@ func TestRecoverInterruptedTransactionRejectsFIFOWithoutBlocking(t *testing.T) {
 		t.Fatal(err)
 	}
 	candidate := GenerationRecord{ID: "candidate", LockDigest: "lock", Status: "candidate"}
+	entry := canonicalReplacementEntry(candidate.ID, 0, "managed.dll")
+	entry.Existed, entry.OriginalSHA256 = false, ""
+	prepareTestArtifactParent(t, &store, entry)
 	if err := store.Save(State{
 		SchemaVersion: schemaVersion,
 		Candidate:     &candidate,
 		Transaction: &TransactionJournal{
 			GenerationID: "candidate",
 			Phase:        "applying",
-			Entries: []JournalEntry{{
-				RelativePath:    "managed.dll",
-				InstalledSHA256: hashBytes([]byte("candidate")),
-			}},
+			Entries:      []JournalEntry{entry},
 		},
 	}); err != nil {
 		t.Fatal(err)
@@ -604,72 +746,6 @@ func TestRecoverInterruptedTransactionRejectsFIFOWithoutBlocking(t *testing.T) {
 	}
 }
 
-func TestRecoverLegacyZeroByteStaleDeletePlaceholder(t *testing.T) {
-	serverDir := t.TempDir()
-	stateDir := filepath.Join(serverDir, ".docker-vrising")
-	store := Store{StateDir: stateDir}
-	candidate := GenerationRecord{ID: "candidate", LockDigest: "lock", Status: "candidate"}
-	quarantinePath := "generations/candidate/rollback/quarantine/0000.displaced"
-	tombstonePath := "generations/candidate/rollback/quarantine/0000.tombstone"
-	livePath := filepath.Join(serverDir, "stale.dll")
-	writeTestFile(t, livePath, "")
-	writeTestFile(t, filepath.Join(stateDir, filepath.FromSlash(quarantinePath)), "original")
-	if err := store.Save(State{
-		SchemaVersion: schemaVersion,
-		Candidate:     &candidate,
-		Transaction: &TransactionJournal{
-			GenerationID: candidate.ID,
-			Phase:        "applying",
-			Entries: []JournalEntry{{
-				RelativePath:   "stale.dll",
-				QuarantinePath: quarantinePath,
-				TombstonePath:  tombstonePath,
-				Existed:        true,
-				OriginalSHA256: hashBytes([]byte("original")),
-			}},
-		},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	store.recoveryHook = func(stage, relativePath string) error {
-		if stage == "legacy-placeholder-converted" && relativePath == "stale.dll" {
-			return errors.New("crash after legacy conversion")
-		}
-		return nil
-	}
-
-	if err := store.RecoverInterruptedTransaction(); err == nil || !strings.Contains(err.Error(), "crash after legacy conversion") {
-		t.Fatalf("first recovery error = %v, want conversion crash", err)
-	}
-	state, err := store.Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	entry := state.Transaction.Entries[0]
-	if !entry.LegacyDeletePlaceholder || entry.TombstoneSHA256 != hashBytes(nil) {
-		t.Fatalf("converted legacy entry = %#v, want durable zero-byte placeholder metadata", entry)
-	}
-	if got := readTestFile(t, livePath); got != "" {
-		t.Fatalf("live placeholder before retry = %q, want zero bytes", got)
-	}
-	if got := readTestFile(t, filepath.Join(stateDir, filepath.FromSlash(quarantinePath))); got != "original" {
-		t.Fatalf("quarantined original before retry = %q", got)
-	}
-
-	store.recoveryHook = nil
-	if err := store.RecoverInterruptedTransaction(); err != nil {
-		t.Fatalf("second recovery error = %v", err)
-	}
-	if got := readTestFile(t, livePath); got != "original" {
-		t.Fatalf("recovered stale file = %q, want original", got)
-	}
-	for _, artifact := range []string{quarantinePath, tombstonePath} {
-		if _, err := os.Lstat(filepath.Join(stateDir, filepath.FromSlash(artifact))); !os.IsNotExist(err) {
-			t.Fatalf("artifact %s stat error = %v, want not exist", artifact, err)
-		}
-	}
-}
-
 func TestRecoverConfigSyncsLiveBeforeDeletingFallback(t *testing.T) {
 	serverDir := t.TempDir()
 	stateDir := filepath.Join(serverDir, ".docker-vrising")
@@ -693,6 +769,7 @@ func TestRecoverConfigSyncsLiveBeforeDeletingFallback(t *testing.T) {
 				Existed:         true,
 				OriginalSHA256:  hashBytes([]byte("console=true")),
 				InstalledSHA256: hashBytes([]byte("console=false")),
+				TombstoneSHA256: hashBytes([]byte("console=false")),
 			},
 		},
 	}); err != nil {
@@ -796,7 +873,6 @@ func TestRecoverRejectsPermissiveTransactionArtifactNamespace(t *testing.T) {
 			Phase:        "applying",
 			Entries: []JournalEntry{{
 				RelativePath:    "managed.dll",
-				BackupPath:      "generations/candidate/rollback/managed.dll",
 				QuarantinePath:  quarantinePath,
 				TombstonePath:   "generations/candidate/rollback/quarantine/0000.tombstone",
 				Existed:         true,
@@ -887,9 +963,8 @@ func TestRecoverValidatesCompleteJournalBeforeMutation(t *testing.T) {
 			candidate := GenerationRecord{ID: candidateID, LockDigest: "lock", Status: "candidate"}
 			for _, entry := range entries {
 				writeTestFile(t, filepath.Join(serverDir, filepath.FromSlash(entry.RelativePath)), "candidate")
-				writeTestFile(t, filepath.Join(stateDir, filepath.FromSlash(entry.BackupPath)), "original")
 			}
-			if err := store.Save(State{
+			if err := store.saveJSON("state.json", State{
 				SchemaVersion: schemaVersion,
 				Candidate:     &candidate,
 				Transaction: &TransactionJournal{
@@ -923,7 +998,6 @@ func canonicalReplacementEntry(candidateID string, index int, relativePath strin
 	artifactBase := fmt.Sprintf("generations/%s/rollback/quarantine/%04d", candidateID, index)
 	return JournalEntry{
 		RelativePath:    relativePath,
-		BackupPath:      fmt.Sprintf("generations/%s/rollback/%s", candidateID, relativePath),
 		QuarantinePath:  artifactBase + ".displaced",
 		TombstonePath:   artifactBase + ".tombstone",
 		Existed:         true,
@@ -944,12 +1018,13 @@ func TestRecoverInterruptedTransactionDoesNotDeleteThroughSymlink(t *testing.T) 
 	if err := os.Symlink(externalDir, filepath.Join(serverDir, "BepInEx")); err != nil {
 		t.Fatalf("create target symlink: %v", err)
 	}
+	entry := canonicalReplacementEntry("candidate", 0, "BepInEx/managed.dll")
+	entry.Existed, entry.OriginalSHA256 = false, ""
+	prepareTestArtifactParent(t, &store, entry)
 	if err := store.Save(State{
 		SchemaVersion: 1,
-		Transaction: &TransactionJournal{Entries: []JournalEntry{{
-			RelativePath: "BepInEx/managed.dll",
-			Existed:      false,
-		}}},
+		Candidate:     &GenerationRecord{ID: "candidate", Status: "candidate"},
+		Transaction:   &TransactionJournal{GenerationID: "candidate", Phase: "applying", Entries: []JournalEntry{entry}},
 	}); err != nil {
 		t.Fatalf("save transaction state: %v", err)
 	}
@@ -962,191 +1037,11 @@ func TestRecoverInterruptedTransactionDoesNotDeleteThroughSymlink(t *testing.T) 
 	}
 }
 
-func TestRecoverInterruptedTransactionDoesNotRestoreFromSymlinkedBackup(t *testing.T) {
-	serverDir := t.TempDir()
-	stateDir := filepath.Join(serverDir, ".docker-vrising")
-	externalDir := t.TempDir()
-	managedPath := filepath.Join(serverDir, "BepInEx", "managed.dll")
-	externalBackup := filepath.Join(externalDir, "managed.dll")
-	store := Store{StateDir: stateDir}
-
-	writeTestFile(t, managedPath, "replacement")
-	writeTestFile(t, externalBackup, "external backup")
-	if err := os.MkdirAll(stateDir, 0o700); err != nil {
-		t.Fatalf("create state directory: %v", err)
+func prepareTestArtifactParent(t *testing.T, store *Store, entry JournalEntry) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(store.StateDir, entry.QuarantinePath)), 0o700); err != nil {
+		t.Fatal(err)
 	}
-	if err := os.Symlink(externalDir, filepath.Join(stateDir, "transaction")); err != nil {
-		t.Fatalf("create backup symlink: %v", err)
-	}
-	if err := store.Save(State{
-		SchemaVersion: 1,
-		Transaction: &TransactionJournal{Entries: []JournalEntry{{
-			RelativePath: "BepInEx/managed.dll",
-			BackupPath:   "transaction/managed.dll",
-			Existed:      true,
-		}}},
-	}); err != nil {
-		t.Fatalf("save transaction state: %v", err)
-	}
-
-	if err := store.RecoverInterruptedTransaction(); err == nil {
-		t.Fatal("RecoverInterruptedTransaction() restored from a symlinked backup")
-	}
-	if got := readTestFile(t, managedPath); got != "replacement" {
-		t.Fatalf("managed file = %q, want unchanged replacement", got)
-	}
-}
-
-func TestRecoverInterruptedTransactionRetainsJournalWhenRemovalParentSyncFails(t *testing.T) {
-	serverDir := t.TempDir()
-	stateDir := filepath.Join(serverDir, ".docker-vrising")
-	managedPath := filepath.Join(serverDir, "BepInEx", "new.dll")
-	store := Store{StateDir: stateDir}
-
-	writeTestFile(t, managedPath, "new managed file")
-	if err := store.Save(State{
-		SchemaVersion: 1,
-		Transaction: &TransactionJournal{Entries: []JournalEntry{{
-			RelativePath: "BepInEx/new.dll",
-			Existed:      false,
-		}}},
-	}); err != nil {
-		t.Fatalf("save transaction state: %v", err)
-	}
-	store.syncDirectory = func(int) error { return errors.New("target parent sync failed") }
-
-	if err := store.RecoverInterruptedTransaction(); err == nil {
-		t.Fatal("RecoverInterruptedTransaction() succeeded after target parent sync failed")
-	}
-	assertTransactionRetained(t, &store)
-}
-
-func TestRecoverInterruptedTransactionRetainsJournalWhenCreatedAncestorSyncFails(t *testing.T) {
-	serverDir := t.TempDir()
-	stateDir := filepath.Join(serverDir, ".docker-vrising")
-	backupPath := filepath.Join(stateDir, "transaction", "managed.dll")
-	store := Store{StateDir: stateDir}
-
-	writeTestFile(t, backupPath, "original")
-	if err := store.Save(State{
-		SchemaVersion: 1,
-		Transaction: &TransactionJournal{Entries: []JournalEntry{{
-			RelativePath: "BepInEx/plugins/managed.dll",
-			BackupPath:   "transaction/managed.dll",
-			Existed:      true,
-		}}},
-	}); err != nil {
-		t.Fatalf("save transaction state: %v", err)
-	}
-	store.syncDirectory = func(int) error { return errors.New("created ancestor sync failed") }
-
-	if err := store.RecoverInterruptedTransaction(); err == nil {
-		t.Fatal("RecoverInterruptedTransaction() succeeded after created ancestor sync failed")
-	}
-	assertTransactionRetained(t, &store)
-}
-
-func TestRecoverInterruptedTransactionResyncsParentAfterFailedDeleteSync(t *testing.T) {
-	serverDir := t.TempDir()
-	stateDir := filepath.Join(serverDir, ".docker-vrising")
-	managedPath := filepath.Join(serverDir, "BepInEx", "new.dll")
-	store := Store{StateDir: stateDir}
-
-	writeTestFile(t, managedPath, "new managed file")
-	if err := store.Save(State{
-		SchemaVersion: 1,
-		Transaction: &TransactionJournal{Entries: []JournalEntry{{
-			RelativePath: "BepInEx/new.dll",
-			Existed:      false,
-		}}},
-	}); err != nil {
-		t.Fatalf("save transaction state: %v", err)
-	}
-	syncer := newFailFirstDirectorySync(t, filepath.Dir(managedPath))
-	store.syncDirectory = syncer.Sync
-
-	if err := store.RecoverInterruptedTransaction(); err == nil {
-		t.Fatal("first RecoverInterruptedTransaction() succeeded after target parent sync failed")
-	}
-	assertTransactionRetained(t, &store)
-	if err := store.RecoverInterruptedTransaction(); err != nil {
-		t.Fatalf("second RecoverInterruptedTransaction() error = %v", err)
-	}
-	if syncer.targetCalls != 2 {
-		t.Fatalf("target parent sync calls = %d, want 2 across failed and successful attempts", syncer.targetCalls)
-	}
-	assertTransactionCleared(t, &store)
-}
-
-func TestRecoverInterruptedTransactionResyncsExistingAncestorAfterFailedCreateSync(t *testing.T) {
-	serverDir := t.TempDir()
-	stateDir := filepath.Join(serverDir, ".docker-vrising")
-	backupPath := filepath.Join(stateDir, "transaction", "managed.dll")
-	store := Store{StateDir: stateDir}
-
-	writeTestFile(t, backupPath, "original")
-	if err := store.Save(State{
-		SchemaVersion: 1,
-		Transaction: &TransactionJournal{Entries: []JournalEntry{{
-			RelativePath: "BepInEx/plugins/managed.dll",
-			BackupPath:   "transaction/managed.dll",
-			Existed:      true,
-		}}},
-	}); err != nil {
-		t.Fatalf("save transaction state: %v", err)
-	}
-	syncer := newFailFirstDirectorySync(t, serverDir)
-	store.syncDirectory = syncer.Sync
-
-	if err := store.RecoverInterruptedTransaction(); err == nil {
-		t.Fatal("first RecoverInterruptedTransaction() succeeded after created ancestor parent sync failed")
-	}
-	assertTransactionRetained(t, &store)
-	if info, err := os.Stat(filepath.Join(serverDir, "BepInEx")); err != nil || !info.IsDir() {
-		t.Fatalf("first attempt did not leave the expected created ancestor: info=%v err=%v", info, err)
-	}
-	if err := store.RecoverInterruptedTransaction(); err != nil {
-		t.Fatalf("second RecoverInterruptedTransaction() error = %v", err)
-	}
-	if syncer.targetCalls != 2 {
-		t.Fatalf("created ancestor parent sync calls = %d, want 2 across failed and successful attempts", syncer.targetCalls)
-	}
-	assertTransactionCleared(t, &store)
-}
-
-func TestRecoverInterruptedTransactionDoesNotLeakDescriptorsAfterFailedAncestorSync(t *testing.T) {
-	serverDir := t.TempDir()
-	stateDir := filepath.Join(serverDir, ".docker-vrising")
-	backupPath := filepath.Join(stateDir, "transaction", "managed.dll")
-	store := Store{StateDir: stateDir}
-
-	writeTestFile(t, backupPath, "original")
-	if err := os.MkdirAll(filepath.Join(serverDir, "BepInEx"), 0o700); err != nil {
-		t.Fatalf("create managed parent: %v", err)
-	}
-	if err := store.Save(State{
-		SchemaVersion: 1,
-		Transaction: &TransactionJournal{Entries: []JournalEntry{{
-			RelativePath: "BepInEx/managed.dll",
-			BackupPath:   "transaction/managed.dll",
-			Existed:      true,
-		}}},
-	}); err != nil {
-		t.Fatalf("save transaction state: %v", err)
-	}
-	store.syncDirectory = func(int) error { return errors.New("injected ancestor parent sync failure") }
-
-	before := descriptorCount(t)
-	for range 64 {
-		if err := store.RecoverInterruptedTransaction(); err == nil {
-			t.Fatal("RecoverInterruptedTransaction() succeeded after ancestor parent sync failed")
-		}
-	}
-	after := descriptorCount(t)
-	if after > before+3 {
-		t.Fatalf("open descriptor count grew from %d to %d after failed recovery attempts", before, after)
-	}
-	assertTransactionRetained(t, &store)
 }
 
 func TestProcessIdentityRejectsReusedPID(t *testing.T) {
@@ -1241,13 +1136,4 @@ func directoryIdentityFor(t *testing.T, path string) directoryIdentity {
 		t.Fatalf("stat directory %s: %v", path, err)
 	}
 	return directoryIdentity{dev: info.Dev, ino: info.Ino}
-}
-
-func descriptorCount(t *testing.T) int {
-	t.Helper()
-	entries, err := os.ReadDir("/proc/self/fd")
-	if err != nil {
-		t.Fatalf("read process descriptors: %v", err)
-	}
-	return len(entries)
 }
