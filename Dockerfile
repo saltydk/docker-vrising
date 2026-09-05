@@ -32,19 +32,15 @@ ARG TARGETOS
 ARG TARGETARCH
 
 WORKDIR /src
-COPY testdata/container/sidecar/main.go ./main.go
+COPY go.mod go.sum ./
+RUN go mod download
+COPY *.go ./
+COPY testdata/container/sidecar/main.go /fixture-sidecar/main.go
 RUN test "$TARGETOS/$TARGETARCH" = "linux/amd64" && \
     CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" \
-    go build -trimpath -buildvcs=false -ldflags="-s -w" -o /out/fixture-sidecar ./main.go && \
-    openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
-      -subj /CN=docker-vrising-fixture-ca \
-      -keyout /out/ca.key -out /out/ca.crt && \
-    openssl req -newkey rsa:2048 -nodes -subj /CN=thunderstore.io \
-      -keyout /out/server.key -out /out/server.csr && \
-    printf '%s\n' 'subjectAltName=DNS:thunderstore.io' > /out/server.ext && \
-    openssl x509 -req -days 2 -in /out/server.csr \
-      -CA /out/ca.crt -CAkey /out/ca.key -CAcreateserial \
-      -extfile /out/server.ext -out /out/server.crt
+    go build -tags fixture -trimpath -buildvcs=false -ldflags="-s -w" -o /out/vrisingctl-fixture . && \
+    CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" \
+    go build -trimpath -buildvcs=false -ldflags="-s -w" -o /out/fixture-sidecar /fixture-sidecar/main.go
 
 FROM ubuntu:22.04@sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc AS production
 
@@ -104,12 +100,10 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=30m --retries=3 CMD ["/us
 
 FROM production AS fixture
 
+COPY --from=fixture-build /out/vrisingctl-fixture /usr/local/bin/vrisingctl
 COPY --from=fixture-build /out/fixture-sidecar /usr/local/bin/fixture-sidecar
-COPY --from=fixture-build /out/ca.crt /usr/local/share/ca-certificates/docker-vrising-fixture-ca.crt
-COPY --from=fixture-build /out/server.crt /fixture/tls/server.crt
-COPY --from=fixture-build /out/server.key /fixture/tls/server.key
 COPY testdata/container/bin/ /fixture/bin/
-RUN update-ca-certificates && chmod 0755 /fixture/bin/* /usr/local/bin/fixture-sidecar
+RUN chmod 0755 /fixture/bin/* /usr/local/bin/fixture-sidecar
 
 ENV PATH="/fixture/bin:${PATH}"
 

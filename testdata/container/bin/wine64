@@ -1,35 +1,55 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-printf '%q ' "$0" "$@" >>"${FIXTURE_RECORD_DIR:?}/wine64.argv"
-printf '\n' >>"$FIXTURE_RECORD_DIR/wine64.argv"
+fail() {
+  echo "fake wine64: $*" >&2
+  exit 64
+}
 
-server_log=
-persistent_data=
-previous=
-for argument in "$@"; do
-  case $previous in
-    -logFile) server_log=$argument ;;
-    -persistentDataPath) persistent_data=$argument ;;
-  esac
-  previous=$argument
-done
-[[ -n $server_log && -n $persistent_data ]] || { echo 'missing Wine log or persistent-data argument' >&2; exit 64; }
+[[ ${FIXTURE_RECORD_DIR-} == /fixture/records ]] || fail 'unexpected record directory'
+[[ ${FIXTURE_RUN_TOKEN-} =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || fail 'invalid run token'
+[[ $PWD == /mnt/vrising/server ]] || fail "unexpected cwd: $PWD"
+[[ ${HOME-} == /mnt/vrising/server/.docker-vrising/home ]] || fail 'unexpected HOME'
+[[ ${WINEPREFIX-} == /mnt/vrising/server/.docker-vrising/wineprefix ]] || fail 'unexpected WINEPREFIX'
+[[ ${DISPLAY-} == :99 ]] || fail 'unexpected DISPLAY'
 
-printf 'WINEDLLOVERRIDES=%s\n' "${WINEDLLOVERRIDES-}" >>"$FIXTURE_RECORD_DIR/wine64.env"
-printf '%s\n' "$$" >>"$FIXTURE_RECORD_DIR/wine64.pid"
+mods_enabled=${MODS_ENABLED:-true}
+expected_overrides=winhttp=n,b
+[[ $mods_enabled == true || $mods_enabled == false ]] || fail 'invalid MODS_ENABLED'
+[[ $mods_enabled == true ]] || expected_overrides=winhttp=b
+[[ ${WINEDLLOVERRIDES-} == "$expected_overrides" ]] || fail 'unexpected WINEDLLOVERRIDES'
+
+(( $# == 5 )) || fail 'unexpected argument count'
+[[ $1 == VRisingServer.exe && $2 == -persistentDataPath && $3 == /mnt/vrising/persistentdata && $4 == -logFile ]] \
+  || fail 'unexpected argv'
+server_log=$5
+[[ $server_log =~ ^/mnt/vrising/persistentdata/logs/VRisingServer-[0-9]{8}T[0-9]{6}\.[0-9]{9}Z-[0-9]{6}\.log$ ]] \
+  || fail 'invalid controller-owned log path'
+
+run_dir=$FIXTURE_RECORD_DIR/runs/$FIXTURE_RUN_TOKEN
+mkdir -p "$run_dir"
+{
+  printf 'cwd=%q argv=' "$PWD"
+  printf '%q ' "$@"
+  printf '\n'
+} >"$run_dir/wine.argv"
+printf 'HOME=%s\nWINEPREFIX=%s\nDISPLAY=%s\nWINEDLLOVERRIDES=%s\nFIXTURE_RECORD_DIR=%s\nFIXTURE_RUN_TOKEN=%s\n' \
+  "$HOME" "$WINEPREFIX" "$DISPLAY" "$WINEDLLOVERRIDES" "$FIXTURE_RECORD_DIR" "$FIXTURE_RUN_TOKEN" \
+  >"$run_dir/wine.env"
+printf '%s\n' "$$" >"$run_dir/wine.pid"
 
 terminated=false
 on_term() {
   terminated=true
-  printf 'TERM\n' >>"$FIXTURE_RECORD_DIR/wine64.signals"
+  printf 'token=%s pid=%s signal=TERM\n' "$FIXTURE_RUN_TOKEN" "$$" >"$run_dir/wine.term"
 }
-trap on_term TERM INT
+trap on_term TERM
+trap 'fail "unexpected INT"' INT
 
 mkdir -p "$(dirname "$server_log")" "$PWD/BepInEx"
 sleep 0.5
 printf '%s\n' '2026-09-05T12:00:00Z [Info] [Server] Startup Completed' >>"$server_log"
-if [[ ${MODS_ENABLED:-true} == true ]]; then
+if [[ $mods_enabled == true ]]; then
   printf '%s\n' \
     '[Message:   BepInEx] Chainloader startup complete' \
     '[Info   :VampireCommandFramework] Plugin gg.deca.VampireCommandFramework version 0.10.4 is loaded!' \
@@ -42,3 +62,4 @@ while [[ $terminated == false ]]; do
   sleep 0.1 &
   wait $! || true
 done
+printf 'token=%s pid=%s status=0\n' "$FIXTURE_RUN_TOKEN" "$$" >"$run_dir/wine.exit"

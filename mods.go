@@ -282,6 +282,9 @@ func (m *ModManager) Apply(ctx context.Context, staged StagedGeneration) error {
 			); err != nil {
 				return fmt.Errorf("install managed file %s: %w", relativePath, err)
 			}
+			if err := fixtureAfterManagedPublication(ctx, relativePath); err != nil {
+				return fmt.Errorf("after publishing managed file %s: %w", relativePath, err)
+			}
 		} else {
 			_, exists, err := snapshotFileBelow(m.ServerDir, relativePath)
 			if err != nil {

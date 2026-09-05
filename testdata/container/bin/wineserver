@@ -1,6 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-printf '%q ' "$0" "$@" >>"${FIXTURE_RECORD_DIR:?}/wineserver.argv"
-printf '\n' >>"$FIXTURE_RECORD_DIR/wineserver.argv"
-exit 0
+fail() {
+  echo "fake wineserver: $*" >&2
+  exit 64
+}
+
+[[ ${FIXTURE_RECORD_DIR-} == /fixture/records ]] || fail 'unexpected record directory'
+[[ ${FIXTURE_RUN_TOKEN-} =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || fail 'invalid run token'
+[[ $PWD == / ]] || fail "unexpected cwd: $PWD"
+[[ ${HOME-} == /mnt/vrising/server/.docker-vrising/home ]] || fail 'unexpected HOME'
+[[ ${WINEPREFIX-} == /mnt/vrising/server/.docker-vrising/wineprefix ]] || fail 'unexpected WINEPREFIX'
+[[ ${DISPLAY-} == :99 ]] || fail 'unexpected DISPLAY'
+[[ ${WINEDLLOVERRIDES-} == winhttp=n,b || ${WINEDLLOVERRIDES-} == winhttp=b ]] || fail 'unexpected WINEDLLOVERRIDES'
+if (( $# != 1 )) || [[ $1 != -k ]]; then
+  fail 'unexpected argv'
+fi
+
+run_dir=$FIXTURE_RECORD_DIR/runs/$FIXTURE_RUN_TOKEN
+mkdir -p "$run_dir"
+printf 'cwd=%q argv=%q\n' "$PWD" "$1" >"$run_dir/wineserver.argv"
+printf 'HOME=%s\nWINEPREFIX=%s\nDISPLAY=%s\nWINEDLLOVERRIDES=%s\nFIXTURE_RECORD_DIR=%s\nFIXTURE_RUN_TOKEN=%s\n' \
+  "$HOME" "$WINEPREFIX" "$DISPLAY" "$WINEDLLOVERRIDES" "$FIXTURE_RECORD_DIR" "$FIXTURE_RUN_TOKEN" \
+  >"$run_dir/wineserver.env"

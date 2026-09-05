@@ -20,7 +20,8 @@ image-check: image
 
 container-test:
 	docker buildx build --platform linux/amd64 --target production --load -t docker-vrising:production-test .
+	docker buildx build --platform linux/amd64 --load -t docker-vrising:default-test .
 	docker buildx build --platform linux/amd64 --target fixture --load -t docker-vrising:fixture-test .
-	PRODUCTION_IMAGE=docker-vrising:production-test FIXTURE_IMAGE=docker-vrising:fixture-test bash hack/container-fixture-test.sh
+	PRODUCTION_IMAGE=docker-vrising:production-test DEFAULT_IMAGE=docker-vrising:default-test FIXTURE_IMAGE=docker-vrising:fixture-test bash hack/container-fixture-test.sh
 
 check: fmt-check test vet

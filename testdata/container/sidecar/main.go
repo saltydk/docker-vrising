@@ -4,10 +4,12 @@ import (
 	"archive/zip"
 	"bytes"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path"
@@ -73,8 +75,16 @@ func archive(pkg fixturePackage) []byte {
 
 func main() {
 	recordDir := os.Getenv("FIXTURE_RECORD_DIR")
-	if recordDir != "" {
-		_ = os.WriteFile(path.Join(recordDir, "sidecar.argv"), []byte(strings.Join(os.Args, " ")+"\n"), 0o644)
+	token := os.Getenv("FIXTURE_RUN_TOKEN")
+	if len(os.Args) != 2 || os.Args[1] != "serve" || recordDir != "/fixture/records" || !validToken(token) {
+		log.Fatal("invalid fixture sidecar invocation")
+	}
+	runDir := path.Join(recordDir, "runs", token)
+	if err := os.MkdirAll(runDir, 0o700); err != nil {
+		log.Fatal(err)
+	}
+	if err := os.WriteFile(path.Join(runDir, "sidecar.argv"), []byte(strings.Join(os.Args[1:], " ")+"\n"), 0o600); err != nil {
+		log.Fatal(err)
 	}
 	allPackages := append(append([]fixturePackage(nil), packages...), updatedPackages...)
 	archives := make(map[string][]byte, len(allPackages))
@@ -91,10 +101,9 @@ func main() {
 			}
 		}
 
-		selected := packages
+		selectedRoots := []fixturePackage{packages[2], packages[4]}
 		if _, err := os.Stat(path.Join(recordDir, "updated-packages")); err == nil {
-			selected = append(append([]fixturePackage(nil), packages[:2]...), packages[3])
-			selected = append(selected, updatedPackages...)
+			selectedRoots = updatedPackages
 		}
 		for _, pkg := range allPackages {
 			key := pkg.Namespace + "/" + pkg.Name + "/" + pkg.Version
@@ -116,7 +125,7 @@ func main() {
 				return
 			}
 		}
-		for _, pkg := range selected {
+		for _, pkg := range selectedRoots {
 			latestPath := "/api/experimental/package/" + pkg.Namespace + "/" + pkg.Name + "/"
 			if r.URL.Path != latestPath {
 				continue
@@ -136,7 +145,34 @@ func main() {
 		http.NotFound(w, r)
 	})
 
-	log.Fatal(http.ListenAndServeTLS(":443", "/fixture/tls/server.crt", "/fixture/tls/server.key", nil))
+	certificate, err := tls.LoadX509KeyPair("/fixture/tls/server.crt", "/fixture/tls/server.key")
+	if err != nil {
+		log.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", ":443")
+	if err != nil {
+		log.Fatal(err)
+	}
+	tlsListener := tls.NewListener(listener, &tls.Config{Certificates: []tls.Certificate{certificate}, MinVersion: tls.VersionTLS12})
+	readyPath := path.Join(recordDir, "sidecar-ready."+token)
+	if err := os.WriteFile(readyPath, []byte(token+"\n"), 0o600); err != nil {
+		_ = tlsListener.Close()
+		log.Fatal(err)
+	}
+	log.Fatal(http.Serve(tlsListener, nil))
+}
+
+func validToken(token string) bool {
+	if token == "" || len(token) > 128 {
+		return false
+	}
+	for index, value := range token {
+		if value >= 'a' && value <= 'z' || value >= 'A' && value <= 'Z' || value >= '0' && value <= '9' || index > 0 && (value == '_' || value == '.' || value == '-') {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func metadata(pkg fixturePackage, downloadURL string, body []byte) map[string]any {

@@ -1,30 +1,49 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-record_dir=/fixture/records
-printf '%q ' "$0" "$@" >>"$record_dir/steamcmd.argv"
-printf '\n' >>"$record_dir/steamcmd.argv"
+fail() {
+  echo "fake steamcmd: $*" >&2
+  exit 64
+}
 
-if [[ " $* " == *' +app_info_print 1829350 '* ]]; then
+record_dir=/fixture/records
+expected_home=/mnt/vrising/server/.docker-vrising/home
+[[ $PWD == "$expected_home" ]] || fail "unexpected cwd: $PWD"
+[[ ${HOME-} == "$expected_home" ]] || fail "unexpected HOME: ${HOME-}"
+[[ -d $record_dir ]] || fail 'record directory is unavailable'
+
+mode=
+if (( $# == 9 )) &&
+  [[ $1 == +@sSteamCmdForcePlatformType && $2 == windows &&
+     $3 == +login && $4 == anonymous &&
+     $5 == +app_info_update && $6 == 1 &&
+     $7 == +app_info_print && $8 == 1829350 && $9 == +quit ]]; then
+  mode=remote
+elif (( $# == 10 )) &&
+  [[ $1 == +@sSteamCmdForcePlatformType && $2 == windows &&
+     $3 == +force_install_dir && $4 == /mnt/vrising/server &&
+     $5 == +login && $6 == anonymous &&
+     $7 == +app_update && $8 == 1829350 && $9 == validate && ${10} == +quit ]]; then
+  mode=update
+else
+  fail 'unexpected argv'
+fi
+
+{
+  printf 'mode=%s cwd=%q HOME=%q argv=' "$mode" "$PWD" "$HOME"
+  printf '%q ' "$@"
+  printf '\n'
+} >>"$record_dir/steamcmd.accepted"
+
+if [[ $mode == remote ]]; then
 	printf '"1829350"\n{\n\t"depots"\n\t{\n\t\t"1829351"\n\t\t{\n\t\t\t"manifests"\n\t\t\t{\n\t\t\t\t"public"\n\t\t\t\t{\n\t\t\t\t\t"gid"\t\t"515151"\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\t"branches"\n\t\t{\n\t\t\t"public"\n\t\t\t{\n\t\t\t\t"buildid"\t\t"424242"\n\t\t\t}\n\t\t}\n\t}\n}\n'
   exit 0
 fi
 
-install_dir=
-previous=
-for argument in "$@"; do
-  if [[ $previous == +force_install_dir ]]; then
-    install_dir=$argument
-    break
-  fi
-  previous=$argument
-done
-
-if [[ " $* " == *' +app_update 1829350 '* ]] && [[ -n $install_dir ]]; then
-  mkdir -p "$install_dir/steamapps"
-  : >"$install_dir/VRisingServer.exe"
-  printf '1604030\n' >"$install_dir/steam_appid.txt"
-  cat >"$install_dir/steamapps/appmanifest_1829350.acf" <<'EOF'
+mkdir -p /mnt/vrising/server/steamapps
+: >/mnt/vrising/server/VRisingServer.exe
+printf '1604030\n' >/mnt/vrising/server/steam_appid.txt
+cat >/mnt/vrising/server/steamapps/appmanifest_1829350.acf <<'EOF'
 "AppState"
 {
     "appid"        "1829350"
@@ -39,8 +58,3 @@ if [[ " $* " == *' +app_update 1829350 '* ]] && [[ -n $install_dir ]]; then
     }
 }
 EOF
-  exit 0
-fi
-
-echo "unsupported fake steamcmd invocation" >&2
-exit 64

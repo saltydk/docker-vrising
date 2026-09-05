@@ -1,23 +1,37 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-printf '%q ' "$0" "$@" >>"${FIXTURE_RECORD_DIR:?}/xvfb.argv"
-printf '\n' >>"$FIXTURE_RECORD_DIR/xvfb.argv"
+fail() {
+  echo "fake Xvfb: $*" >&2
+  exit 64
+}
 
-display_fd=
-previous=
-for argument in "$@"; do
-  if [[ $previous == -displayfd ]]; then
-    display_fd=$argument
-    break
-  fi
-  previous=$argument
-done
-[[ -n $display_fd ]] || { echo 'missing -displayfd' >&2; exit 64; }
-printf '99\n' >&"$display_fd"
+[[ ${FIXTURE_RECORD_DIR-} == /fixture/records ]] || fail 'unexpected record directory'
+[[ ${FIXTURE_RUN_TOKEN-} =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || fail 'invalid run token'
+[[ $PWD == / ]] || fail "unexpected cwd: $PWD"
+(( $# == 7 )) || fail 'unexpected argument count'
+[[ $1 == -displayfd && $2 == 3 && $3 == -screen && $4 == 0 && $5 == 1024x768x24 && $6 == -nolisten && $7 == tcp ]] \
+  || fail 'unexpected argv'
+[[ -e /proc/$$/fd/3 ]] || fail 'display fd 3 is not live'
 
-printf '%s\n' "$$" >>"$FIXTURE_RECORD_DIR/xvfb.pid"
-trap 'printf "TERM\n" >>"$FIXTURE_RECORD_DIR/xvfb.signals"; exit 0' TERM INT
+run_dir=$FIXTURE_RECORD_DIR/runs/$FIXTURE_RUN_TOKEN
+mkdir -p "$run_dir"
+{
+  printf 'cwd=%q argv=' "$PWD"
+  printf '%q ' "$@"
+  printf '\n'
+} >"$run_dir/xvfb.argv"
+printf 'FIXTURE_RECORD_DIR=%s\nFIXTURE_RUN_TOKEN=%s\n' "$FIXTURE_RECORD_DIR" "$FIXTURE_RUN_TOKEN" >"$run_dir/xvfb.env"
+printf '%s\n' "$$" >"$run_dir/xvfb.pid"
+printf '99\n' >&3
+
+on_term() {
+  printf 'token=%s pid=%s signal=TERM\n' "$FIXTURE_RUN_TOKEN" "$$" >"$run_dir/xvfb.term"
+  printf 'token=%s pid=%s status=0\n' "$FIXTURE_RUN_TOKEN" "$$" >"$run_dir/xvfb.exit"
+  exit 0
+}
+trap on_term TERM
+trap 'fail "unexpected INT"' INT
 while :; do
   sleep 1 &
   wait $! || true
