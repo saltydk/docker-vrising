@@ -326,6 +326,95 @@ func TestApplyRefusesEditedManagedFile(t *testing.T) {
 	}
 }
 
+func TestApplyPreservesEditImmediatelyBeforeManagedInstall(t *testing.T) {
+	manager := newTestModManager(t)
+	first := stageTestGeneration(t, manager, managedArchiveContents{
+		bepInEx: defaultBepInExEntries("first"),
+	})
+	applyAndPromote(t, manager, first)
+	target := filepath.Join(manager.ServerDir, "winhttp.dll")
+	second := stageTestGeneration(t, manager, managedArchiveContents{
+		bepInEx: defaultBepInExEntries("second"),
+	})
+	manager.beforeManagedMutation = func(relativePath string) error {
+		if relativePath == "winhttp.dll" {
+			writeTestFile(t, target, "operator edit before install")
+		}
+		return nil
+	}
+
+	if err := manager.Apply(t.Context(), second); err == nil || !strings.Contains(err.Error(), "changed before install") {
+		t.Fatalf("Apply() error = %v, want concurrent managed edit rejection", err)
+	}
+	if got := readTestFile(t, target); got != "operator edit before install" {
+		t.Fatalf("concurrently edited managed file = %q, want preserved operator edit", got)
+	}
+}
+
+func TestApplyPreservesCollisionImmediatelyBeforeNewInstall(t *testing.T) {
+	manager := newTestModManager(t)
+	staged := stageTestGeneration(t, manager, managedArchiveContents{})
+	target := filepath.Join(manager.ServerDir, ".doorstop_version")
+	manager.beforeManagedMutation = func(relativePath string) error {
+		if relativePath == ".doorstop_version" {
+			writeTestFile(t, target, "operator collision")
+		}
+		return nil
+	}
+
+	if err := manager.Apply(t.Context(), staged); err == nil || !strings.Contains(err.Error(), "appeared before install") {
+		t.Fatalf("Apply() error = %v, want concurrent collision rejection", err)
+	}
+	if got := readTestFile(t, target); got != "operator collision" {
+		t.Fatalf("concurrent collision = %q, want preserved operator file", got)
+	}
+}
+
+func TestApplyPreservesEditImmediatelyBeforeStaleDelete(t *testing.T) {
+	manager := newTestModManager(t)
+	first := stageTestGeneration(t, manager, managedArchiveContents{
+		bepInEx: append(defaultBepInExEntries("first"), zipEntry{
+			name: "BepInExPack_V_Rising/BepInEx/core/stale.dll", body: "stale original",
+		}),
+	})
+	applyAndPromote(t, manager, first)
+	target := filepath.Join(manager.ServerDir, "BepInEx", "core", "stale.dll")
+	second := stageTestGeneration(t, manager, managedArchiveContents{
+		bepInEx: defaultBepInExEntries("second"),
+	})
+	manager.beforeManagedMutation = func(relativePath string) error {
+		if relativePath == "BepInEx/core/stale.dll" {
+			writeTestFile(t, target, "operator edit before delete")
+		}
+		return nil
+	}
+
+	if err := manager.Apply(t.Context(), second); err == nil || !strings.Contains(err.Error(), "changed before delete") {
+		t.Fatalf("Apply() error = %v, want concurrent stale edit rejection", err)
+	}
+	if got := readTestFile(t, target); got != "operator edit before delete" {
+		t.Fatalf("concurrently edited stale file = %q, want preserved operator edit", got)
+	}
+}
+
+func TestApplyPreservesConfigReplacementImmediatelyBeforeEdit(t *testing.T) {
+	manager := newTestModManager(t)
+	staged := stageTestGeneration(t, manager, managedArchiveContents{})
+	target := filepath.Join(manager.ServerDir, "BepInEx", "config", "BepInEx.cfg")
+	writeTestFile(t, target, "[Logging.Console]\nEnabled = true\n")
+	manager.beforeConfigMutation = func() error {
+		writeTestFile(t, target, "[Logging.Console]\nEnabled = true\nOperator = changed\n")
+		return nil
+	}
+
+	if err := manager.Apply(t.Context(), staged); err == nil || !strings.Contains(err.Error(), "config changed before edit") {
+		t.Fatalf("Apply() error = %v, want concurrent config replacement rejection", err)
+	}
+	if got := readTestFile(t, target); got != "[Logging.Console]\nEnabled = true\nOperator = changed\n" {
+		t.Fatalf("concurrently replaced config = %q, want preserved operator config", got)
+	}
+}
+
 func TestRollbackRestoresPreviousGeneration(t *testing.T) {
 	manager := newTestModManager(t)
 	first := stageTestGeneration(t, manager, managedArchiveContents{
@@ -357,6 +446,31 @@ func TestRollbackRestoresPreviousGeneration(t *testing.T) {
 	}
 	if err := manager.Rollback(t.Context()); err != nil {
 		t.Fatalf("second Rollback() error = %v", err)
+	}
+}
+
+func TestRollbackRepairsRecoveryClearedCandidate(t *testing.T) {
+	manager := newTestModManager(t)
+	candidate := stageTestGeneration(t, manager, managedArchiveContents{})
+	if err := manager.Store.Save(State{
+		SchemaVersion: schemaVersion,
+		Candidate:     &candidate.Record,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := manager.Rollback(t.Context()); err != nil {
+		t.Fatalf("Rollback() error = %v", err)
+	}
+	state, err := manager.Store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Candidate != nil {
+		t.Fatalf("candidate after restart repair = %#v, want nil", state.Candidate)
+	}
+	if state.Failed == nil || state.Failed.ID != candidate.Record.ID || state.Failed.Status != "failed" {
+		t.Fatalf("failed generation = %#v, want stranded candidate marked failed", state.Failed)
 	}
 }
 
@@ -515,6 +629,122 @@ func TestPromotionRetainsFailedEvidenceUntilLaterSuccess(t *testing.T) {
 	}
 	if _, err := os.Stat(first.Dir); err != nil {
 		t.Fatalf("previous generation was not retained: %v", err)
+	}
+}
+
+func TestPromotionReconcilesLockWrittenBeforeState(t *testing.T) {
+	manager := newTestModManager(t)
+	first := stageTestGeneration(t, manager, managedArchiveContents{
+		bepInEx: defaultBepInExEntries("first"),
+	})
+	applyAndPromote(t, manager, first)
+	second := stageTestGeneration(t, manager, managedArchiveContents{
+		bepInEx: defaultBepInExEntries("second"),
+	})
+	if err := manager.Apply(t.Context(), second); err != nil {
+		t.Fatal(err)
+	}
+	manager.promotionHook = func(stage string) error {
+		if stage == "lock-written" {
+			return errors.New("crash after lock write")
+		}
+		return nil
+	}
+
+	if err := manager.Promote(t.Context(), second); err == nil || !strings.Contains(err.Error(), "crash after lock write") {
+		t.Fatalf("Promote() error = %v, want lock-write crash", err)
+	}
+	state, err := manager.Store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Active == nil || state.Active.ID != first.Record.ID || state.Candidate == nil || state.Candidate.ID != second.Record.ID {
+		t.Fatalf("state at lock-write crash = %#v, want first active and second candidate", state)
+	}
+	if state.Promotion == nil || state.Promotion.GenerationID != second.Record.ID {
+		t.Fatalf("promotion intent = %#v, want second generation", state.Promotion)
+	}
+	lock, err := manager.Store.LoadPackageLock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !samePackageLock(lock, second.Lock) {
+		t.Fatalf("lock at crash = %#v, want second lock", lock)
+	}
+
+	restarted := &ModManager{ServerDir: manager.ServerDir, GenerationsDir: manager.GenerationsDir, Store: manager.Store}
+	if err := restarted.Rollback(t.Context()); err != nil {
+		t.Fatalf("restart reconciliation error = %v", err)
+	}
+	state, err = manager.Store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Active == nil || state.Active.ID != second.Record.ID || state.Previous == nil || state.Previous.ID != first.Record.ID ||
+		state.Candidate != nil || state.Transaction != nil || state.Promotion != nil {
+		t.Fatalf("reconciled promotion state = %#v", state)
+	}
+	lock, err = manager.Store.LoadPackageLock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !samePackageLock(lock, second.Lock) {
+		t.Fatalf("reconciled lock = %#v, want second lock", lock)
+	}
+}
+
+func TestPromotionRestartCompletesPendingCleanup(t *testing.T) {
+	manager := newTestModManager(t)
+	first := stageTestGeneration(t, manager, managedArchiveContents{
+		bepInEx: defaultBepInExEntries("first"),
+	})
+	applyAndPromote(t, manager, first)
+	second := stageTestGeneration(t, manager, managedArchiveContents{
+		bepInEx: defaultBepInExEntries("second"),
+	})
+	applyAndPromote(t, manager, second)
+	third := stageTestGeneration(t, manager, managedArchiveContents{
+		bepInEx: defaultBepInExEntries("third"),
+	})
+	if err := manager.Apply(t.Context(), third); err != nil {
+		t.Fatal(err)
+	}
+	manager.promotionHook = func(stage string) error {
+		if stage == "state-written" {
+			return errors.New("crash before cleanup")
+		}
+		return nil
+	}
+
+	if err := manager.Promote(t.Context(), third); err == nil || !strings.Contains(err.Error(), "crash before cleanup") {
+		t.Fatalf("Promote() error = %v, want post-state crash", err)
+	}
+	state, err := manager.Store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Active == nil || state.Active.ID != third.Record.ID || state.Promotion == nil ||
+		!reflect.DeepEqual(state.PendingCleanup, []string{first.Record.ID}) {
+		t.Fatalf("state before cleanup = %#v, want third active and first pending", state)
+	}
+	if _, err := os.Stat(first.Dir); err != nil {
+		t.Fatalf("pending cleanup generation was removed before cleanup: %v", err)
+	}
+
+	restarted := &ModManager{ServerDir: manager.ServerDir, GenerationsDir: manager.GenerationsDir, Store: manager.Store}
+	if err := restarted.Rollback(t.Context()); err != nil {
+		t.Fatalf("restart cleanup error = %v", err)
+	}
+	if _, err := os.Stat(first.Dir); !os.IsNotExist(err) {
+		t.Fatalf("cleaned generation stat error = %v, want not exist", err)
+	}
+	state, err = manager.Store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Promotion != nil || len(state.PendingCleanup) != 0 || state.Active == nil || state.Active.ID != third.Record.ID ||
+		state.Previous == nil || state.Previous.ID != second.Record.ID {
+		t.Fatalf("state after restart cleanup = %#v", state)
 	}
 }
 

@@ -108,6 +108,91 @@ func TestStorePackageLockSaveIsAtomicAndRoundTrips(t *testing.T) {
 	}
 }
 
+func TestStoreWritesRemainConfinedAfterStateDirSymlinkSwap(t *testing.T) {
+	tests := []struct {
+		name     string
+		fileName string
+		save     func(*Store) error
+	}{
+		{
+			name:     "state",
+			fileName: "state.json",
+			save: func(store *Store) error {
+				return store.Save(State{SchemaVersion: schemaVersion})
+			},
+		},
+		{
+			name:     "package lock",
+			fileName: "package-lock.json",
+			save: func(store *Store) error {
+				return store.SavePackageLock(PackageLock{SchemaVersion: schemaVersion})
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			stateDir := filepath.Join(root, ".docker-vrising")
+			heldDir := filepath.Join(root, "held-state")
+			externalDir := t.TempDir()
+			store := &Store{StateDir: stateDir}
+			store.beforeWrite = func(name string) error {
+				if name != tt.fileName {
+					t.Fatalf("write hook name = %q, want %q", name, tt.fileName)
+				}
+				if err := os.Rename(stateDir, heldDir); err != nil {
+					return err
+				}
+				return os.Symlink(externalDir, stateDir)
+			}
+
+			if err := tt.save(store); err != nil {
+				t.Fatalf("save after StateDir swap: %v", err)
+			}
+			if _, err := os.Lstat(filepath.Join(externalDir, tt.fileName)); !os.IsNotExist(err) {
+				t.Fatalf("external %s stat error = %v, want not exist", tt.fileName, err)
+			}
+			info, err := os.Stat(filepath.Join(heldDir, tt.fileName))
+			if err != nil {
+				t.Fatalf("stat confined %s: %v", tt.fileName, err)
+			}
+			if info.Mode().Perm() != 0o600 {
+				t.Fatalf("confined %s mode = %04o, want 0600", tt.fileName, info.Mode().Perm())
+			}
+		})
+	}
+}
+
+func TestStoreLoadsRejectSymlinkedStateDir(t *testing.T) {
+	externalDir := t.TempDir()
+	stateData, err := json.Marshal(State{SchemaVersion: schemaVersion})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockData, err := json.Marshal(PackageLock{SchemaVersion: schemaVersion})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(externalDir, "state.json"), stateData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(externalDir, "package-lock.json"), lockData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stateDir := filepath.Join(t.TempDir(), ".docker-vrising")
+	if err := os.Symlink(externalDir, stateDir); err != nil {
+		t.Fatal(err)
+	}
+	store := &Store{StateDir: stateDir}
+
+	if _, err := store.Load(); err == nil {
+		t.Fatal("Load() accepted state through a symlinked StateDir")
+	}
+	if _, err := store.LoadPackageLock(); err == nil {
+		t.Fatal("LoadPackageLock() accepted a lock through a symlinked StateDir")
+	}
+}
+
 func TestStoreRejectsUnknownSchemaVersion(t *testing.T) {
 	stateDir := t.TempDir()
 	data, err := json.Marshal(State{SchemaVersion: 2})
@@ -212,6 +297,170 @@ func TestRecoverInterruptedTransactionRestoresRecordedFiles(t *testing.T) {
 	}
 	if err := store.RecoverInterruptedTransaction(); err != nil {
 		t.Fatalf("second RecoverInterruptedTransaction() error = %v", err)
+	}
+}
+
+func TestRecoverInterruptedTransactionMarksCandidateFailedWithJournalClear(t *testing.T) {
+	serverDir := t.TempDir()
+	stateDir := filepath.Join(serverDir, ".docker-vrising")
+	store := Store{StateDir: stateDir}
+	candidate := GenerationRecord{
+		ID:         "candidate-generation",
+		LockDigest: "candidate-lock",
+		Status:     "candidate",
+		CreatedAt:  time.Date(2026, time.September, 5, 14, 0, 0, 0, time.UTC),
+	}
+	managedPath := filepath.Join(serverDir, "winhttp.dll")
+	writeTestFile(t, managedPath, "candidate")
+	if err := store.Save(State{
+		SchemaVersion: schemaVersion,
+		Candidate:     &candidate,
+		Transaction: &TransactionJournal{
+			GenerationID: candidate.ID,
+			Phase:        "applying",
+			Entries: []JournalEntry{{
+				RelativePath: "winhttp.dll",
+				Existed:      false,
+			}},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.RecoverInterruptedTransaction(); err != nil {
+		t.Fatalf("RecoverInterruptedTransaction() error = %v", err)
+	}
+	state, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Transaction != nil || state.Candidate != nil {
+		t.Fatalf("recovered state = %#v, want cleared transaction and candidate", state)
+	}
+	if state.Failed == nil || state.Failed.ID != candidate.ID || state.Failed.Status != "failed" {
+		t.Fatalf("failed generation = %#v, want recovered candidate marked failed", state.Failed)
+	}
+}
+
+func TestRecoverInterruptedTransactionDistinguishesObservedEntryState(t *testing.T) {
+	tests := []struct {
+		name          string
+		existed       bool
+		installedHash string
+		targetContent string
+		wantContent   string
+		wantAbsent    bool
+		wantErr       bool
+		preserveInode bool
+	}{
+		{
+			name:    "replacement unapplied",
+			existed: true, installedHash: hashBytes([]byte("candidate")),
+			targetContent: "original", wantContent: "original", preserveInode: true,
+		},
+		{
+			name:    "replacement applied",
+			existed: true, installedHash: hashBytes([]byte("candidate")),
+			targetContent: "candidate", wantContent: "original",
+		},
+		{
+			name:    "replacement externally changed",
+			existed: true, installedHash: hashBytes([]byte("candidate")),
+			targetContent: "operator", wantContent: "operator", wantErr: true, preserveInode: true,
+		},
+		{
+			name:          "new file unapplied",
+			installedHash: hashBytes([]byte("candidate")), wantAbsent: true,
+		},
+		{
+			name:          "new file applied",
+			installedHash: hashBytes([]byte("candidate")),
+			targetContent: "candidate", wantAbsent: true,
+		},
+		{
+			name:          "new file externally collided",
+			installedHash: hashBytes([]byte("candidate")),
+			targetContent: "operator", wantContent: "operator", wantErr: true, preserveInode: true,
+		},
+		{
+			name:    "stale delete unapplied",
+			existed: true, targetContent: "original", wantContent: "original", preserveInode: true,
+		},
+		{
+			name:    "stale delete applied",
+			existed: true, wantContent: "original",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			serverDir := t.TempDir()
+			stateDir := filepath.Join(serverDir, ".docker-vrising")
+			store := Store{StateDir: stateDir}
+			target := filepath.Join(serverDir, "managed.dll")
+			backup := filepath.Join(stateDir, "transaction", "managed.dll")
+			if tt.targetContent != "" {
+				writeTestFile(t, target, tt.targetContent)
+			}
+			var before os.FileInfo
+			if tt.preserveInode {
+				var err error
+				before, err = os.Stat(target)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			entry := JournalEntry{
+				RelativePath:    "managed.dll",
+				Existed:         tt.existed,
+				InstalledSHA256: tt.installedHash,
+			}
+			if tt.existed {
+				writeTestFile(t, backup, "original")
+				entry.BackupPath = "transaction/managed.dll"
+				entry.OriginalSHA256 = hashBytes([]byte("original"))
+			}
+			if err := store.Save(State{
+				SchemaVersion: schemaVersion,
+				Transaction: &TransactionJournal{
+					GenerationID: "candidate",
+					Phase:        "applying",
+					Entries:      []JournalEntry{entry},
+				},
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			err := store.RecoverInterruptedTransaction()
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("RecoverInterruptedTransaction() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantAbsent {
+				if _, err := os.Lstat(target); !os.IsNotExist(err) {
+					t.Fatalf("target stat error = %v, want not exist", err)
+				}
+			} else if got := readTestFile(t, target); got != tt.wantContent {
+				t.Fatalf("target content = %q, want %q", got, tt.wantContent)
+			}
+			if tt.preserveInode {
+				after, err := os.Stat(target)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !os.SameFile(before, after) {
+					t.Fatal("recovery replaced a file that it did not apply")
+				}
+			}
+			state, loadErr := store.Load()
+			if loadErr != nil {
+				t.Fatal(loadErr)
+			}
+			if tt.wantErr && state.Transaction == nil {
+				t.Fatal("recovery cleared journal after an external change")
+			}
+			if !tt.wantErr && state.Transaction != nil {
+				t.Fatalf("recovery retained completed journal = %#v", state.Transaction)
+			}
+		})
 	}
 }
 

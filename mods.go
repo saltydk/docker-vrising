@@ -51,7 +51,10 @@ type ModManager struct {
 	GenerationsDir string
 	Store          *Store
 
-	applyFileHook func(string) error
+	beforeManagedMutation func(string) error
+	beforeConfigMutation  func() error
+	applyFileHook         func(string) error
+	promotionHook         func(string) error
 }
 
 func (m *ModManager) Apply(ctx context.Context, staged StagedGeneration) error {
@@ -121,7 +124,7 @@ func (m *ModManager) Apply(ctx context.Context, staged StagedGeneration) error {
 		}
 	}
 
-	configData, configMode, configChanged, err := m.prepareConsoleConfig(generationRoot)
+	configData, configMode, configChanged, configSnapshot, err := m.prepareConsoleConfig(generationRoot)
 	if err != nil {
 		return err
 	}
@@ -142,6 +145,10 @@ func (m *ModManager) Apply(ctx context.Context, staged StagedGeneration) error {
 				return fmt.Errorf("back up managed file %s: %w", relativePath, err)
 			}
 			entry.BackupPath = "generations/" + staged.Record.ID + "/" + generationBackup
+			entry.OriginalSHA256 = snapshot.SHA256
+		}
+		if next, ok := nextFiles[relativePath]; ok {
+			entry.InstalledSHA256 = next.SHA256
 		}
 		entries = append(entries, entry)
 	}
@@ -162,6 +169,11 @@ func (m *ModManager) Apply(ctx context.Context, staged StagedGeneration) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if m.beforeManagedMutation != nil {
+			if err := m.beforeManagedMutation(relativePath); err != nil {
+				return fmt.Errorf("before mutating managed file %s: %w", relativePath, err)
+			}
+		}
 		if next, ok := nextFiles[relativePath]; ok {
 			data, mode, err := readFileAt(generationRoot, overlayDirectory+"/"+relativePath)
 			if err != nil {
@@ -170,10 +182,17 @@ func (m *ModManager) Apply(ctx context.Context, staged StagedGeneration) error {
 			if hashBytes(data) != next.SHA256 || mode.Perm() != next.Mode.Perm() {
 				return fmt.Errorf("staged managed file %s no longer matches its manifest", relativePath)
 			}
-			if err := writeServerFile(m.ServerDir, relativePath, data, next.Mode); err != nil {
+			var expected *fileSnapshot
+			if snapshot, exists := serverFiles[relativePath]; exists {
+				expected = &snapshot
+			}
+			if err := replaceServerFile(
+				m.ServerDir, relativePath, data, next.Mode, expected,
+				"current file changed before install", "current file appeared before install",
+			); err != nil {
 				return fmt.Errorf("install managed file %s: %w", relativePath, err)
 			}
-		} else if err := removeServerFile(m.ServerDir, relativePath); err != nil {
+		} else if err := removeServerFile(m.ServerDir, relativePath, serverFiles[relativePath]); err != nil {
 			return fmt.Errorf("remove stale managed file %s: %w", relativePath, err)
 		}
 		if m.applyFileHook != nil {
@@ -183,7 +202,15 @@ func (m *ModManager) Apply(ctx context.Context, staged StagedGeneration) error {
 		}
 	}
 	if configChanged {
-		if err := writeServerFile(m.ServerDir, "BepInEx/config/BepInEx.cfg", configData, configMode); err != nil {
+		if m.beforeConfigMutation != nil {
+			if err := m.beforeConfigMutation(); err != nil {
+				return fmt.Errorf("before editing BepInEx console config: %w", err)
+			}
+		}
+		if err := replaceServerFile(
+			m.ServerDir, "BepInEx/config/BepInEx.cfg", configData, configMode, configSnapshot,
+			"config changed before edit", "config appeared before edit",
+		); err != nil {
 			return fmt.Errorf("disable BepInEx console logging: %w", err)
 		}
 	}
@@ -202,6 +229,9 @@ func (m *ModManager) Rollback(ctx context.Context) error {
 	if err := m.validate(); err != nil {
 		return err
 	}
+	if err := m.reconcilePromotion(ctx); err != nil {
+		return fmt.Errorf("reconcile promotion: %w", err)
+	}
 	state, err := m.Store.Load()
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
@@ -210,24 +240,23 @@ func (m *ModManager) Rollback(ctx context.Context) error {
 		return fmt.Errorf("load mod state for rollback: %w", err)
 	}
 	if state.Transaction == nil {
+		if state.Candidate == nil {
+			return nil
+		}
+		failed := *state.Candidate
+		failed.Status = "failed"
+		state.Candidate = nil
+		state.Failed = &failed
+		if err := m.Store.Save(state); err != nil {
+			return fmt.Errorf("repair recovered candidate state: %w", err)
+		}
 		return nil
 	}
 	if state.Candidate == nil || state.Transaction.GenerationID != state.Candidate.ID {
 		return fmt.Errorf("managed-file journal does not match the candidate generation")
 	}
-	failed := *state.Candidate
 	if err := m.Store.RecoverInterruptedTransaction(); err != nil {
 		return fmt.Errorf("recover managed-file transaction: %w", err)
-	}
-	state, err = m.Store.Load()
-	if err != nil {
-		return fmt.Errorf("reload mod state after rollback: %w", err)
-	}
-	failed.Status = "failed"
-	state.Candidate = nil
-	state.Failed = &failed
-	if err := m.Store.Save(state); err != nil {
-		return fmt.Errorf("persist rolled-back mod state: %w", err)
 	}
 	return nil
 }
@@ -243,7 +272,9 @@ func (m *ModManager) Promote(ctx context.Context, staged StagedGeneration) error
 	if err != nil {
 		return err
 	}
-	defer unix.Close(generationRoot)
+	if err := unix.Close(generationRoot); err != nil {
+		return fmt.Errorf("close staged generation: %w", err)
+	}
 
 	state, err := m.Store.Load()
 	if err != nil {
@@ -255,48 +286,126 @@ func (m *ModManager) Promote(ctx context.Context, staged StagedGeneration) error
 	if state.Transaction == nil || state.Transaction.GenerationID != staged.Record.ID || state.Transaction.Phase != "applied" {
 		return fmt.Errorf("candidate generation has not completed apply")
 	}
-
-	oldPrevious := state.Previous
-	oldFailed := state.Failed
-	if state.Active != nil {
-		previous := *state.Active
-		previous.Status = "previous"
-		state.Previous = &previous
-	} else {
-		state.Previous = nil
+	if state.Promotion != nil {
+		return fmt.Errorf("another generation promotion is already pending")
 	}
-	active := *state.Candidate
-	active.Status = "active"
-	state.Active = &active
-	state.Candidate = nil
-	state.Failed = nil
-	state.Transaction = nil
-	if err := m.Store.SavePackageLock(lock); err != nil {
-		return fmt.Errorf("persist promoted package lock: %w", err)
-	}
+	state.Promotion = &PromotionJournal{GenerationID: staged.Record.ID, Lock: clonePackageLock(lock)}
+	state.PendingCleanup = cleanupGenerationIDs(state.Previous, state.Failed)
 	if err := m.Store.Save(state); err != nil {
-		return fmt.Errorf("persist promoted mod state: %w", err)
+		return fmt.Errorf("persist generation promotion intent: %w", err)
+	}
+	return m.reconcilePromotion(ctx)
+}
+
+func (m *ModManager) reconcilePromotion(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	state, err := m.Store.Load()
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if state.Promotion != nil {
+		promotion := state.Promotion
+		if promotion.GenerationID == "" || promotion.Lock.Digest == "" ||
+			promotion.Lock.Digest != PackageLockDigest(promotion.Lock) {
+			return fmt.Errorf("pending promotion metadata is invalid")
+		}
+		if state.Candidate != nil {
+			if state.Candidate.ID != promotion.GenerationID || state.Candidate.LockDigest != promotion.Lock.Digest ||
+				state.Transaction == nil || state.Transaction.GenerationID != promotion.GenerationID || state.Transaction.Phase != "applied" {
+				return fmt.Errorf("pending promotion does not match applied candidate")
+			}
+			if err := m.Store.SavePackageLock(promotion.Lock); err != nil {
+				return fmt.Errorf("persist pending promotion lock: %w", err)
+			}
+			if m.promotionHook != nil {
+				if err := m.promotionHook("lock-written"); err != nil {
+					return err
+				}
+			}
+			if state.Active != nil {
+				previous := *state.Active
+				previous.Status = "previous"
+				state.Previous = &previous
+			} else {
+				state.Previous = nil
+			}
+			active := *state.Candidate
+			active.Status = "active"
+			state.Active = &active
+			state.Candidate = nil
+			state.Failed = nil
+			state.Transaction = nil
+			if err := m.Store.Save(state); err != nil {
+				return fmt.Errorf("persist promoted mod state: %w", err)
+			}
+		} else {
+			if state.Active == nil || state.Active.ID != promotion.GenerationID || state.Active.LockDigest != promotion.Lock.Digest {
+				return fmt.Errorf("pending promotion has no matching candidate or active generation")
+			}
+			lock, err := m.Store.LoadPackageLock()
+			if err != nil || !samePackageLock(lock, promotion.Lock) {
+				if err := m.Store.SavePackageLock(promotion.Lock); err != nil {
+					return fmt.Errorf("reconcile promoted package lock: %w", err)
+				}
+			}
+		}
+		if m.promotionHook != nil {
+			if err := m.promotionHook("state-written"); err != nil {
+				return err
+			}
+		}
 	}
 
-	if err := removeTreeAt(generationRoot, "rollback"); err != nil {
-		return fmt.Errorf("remove promoted rollback area: %w", err)
-	}
-	if err := unix.Fsync(generationRoot); err != nil {
-		return fmt.Errorf("sync promoted generation: %w", err)
-	}
-	keep := map[string]bool{active.ID: true}
-	if state.Previous != nil {
-		keep[state.Previous.ID] = true
-	}
-	for _, obsolete := range []*GenerationRecord{oldPrevious, oldFailed} {
-		if obsolete == nil || keep[obsolete.ID] {
-			continue
+	for len(state.PendingCleanup) > 0 {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		if err := m.removeGeneration(obsolete.ID); err != nil {
-			return fmt.Errorf("remove obsolete generation %s: %w", obsolete.ID, err)
+		generationID := state.PendingCleanup[0]
+		if generationIsReferenced(state, generationID) {
+			return fmt.Errorf("pending cleanup generation %s is still referenced", generationID)
+		}
+		if err := m.removeGeneration(generationID); err != nil {
+			return fmt.Errorf("remove pending generation %s: %w", generationID, err)
+		}
+		state.PendingCleanup = append([]string(nil), state.PendingCleanup[1:]...)
+		if err := m.Store.Save(state); err != nil {
+			return fmt.Errorf("clear completed generation cleanup %s: %w", generationID, err)
+		}
+	}
+	if state.Promotion != nil {
+		state.Promotion = nil
+		if err := m.Store.Save(state); err != nil {
+			return fmt.Errorf("clear completed promotion intent: %w", err)
 		}
 	}
 	return nil
+}
+
+func cleanupGenerationIDs(records ...*GenerationRecord) []string {
+	ids := make([]string, 0, len(records))
+	seen := make(map[string]bool, len(records))
+	for _, record := range records {
+		if record == nil || record.ID == "" || seen[record.ID] {
+			continue
+		}
+		seen[record.ID] = true
+		ids = append(ids, record.ID)
+	}
+	return ids
+}
+
+func generationIsReferenced(state State, generationID string) bool {
+	for _, record := range []*GenerationRecord{state.Active, state.Previous, state.Candidate, state.Failed} {
+		if record != nil && record.ID == generationID {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *ModManager) removeGeneration(generationID string) error {
@@ -574,39 +683,84 @@ func (m *ModManager) loadManagedManifest(generationID string) (ManagedManifest, 
 	return manifest, nil
 }
 
-func (m *ModManager) prepareConsoleConfig(generationRoot int) ([]byte, fs.FileMode, bool, error) {
-	data, mode, err := readFileBelow(m.ServerDir, "BepInEx/config/BepInEx.cfg")
+func (m *ModManager) prepareConsoleConfig(generationRoot int) ([]byte, fs.FileMode, bool, *fileSnapshot, error) {
+	snapshot, exists, err := snapshotFileBelow(m.ServerDir, "BepInEx/config/BepInEx.cfg")
 	if err != nil {
-		if !errors.Is(err, unix.ENOENT) {
-			return nil, 0, false, fmt.Errorf("read BepInEx console config: %w", err)
-		}
-		data, mode, err = readFileAt(generationRoot, configTemplateName)
-		if err != nil {
-			return nil, 0, false, fmt.Errorf("read staged BepInEx config template: %w", err)
-		}
+		return nil, 0, false, nil, fmt.Errorf("read BepInEx console config: %w", err)
 	}
-	updated := disableConsoleLogging(data)
-	return updated, mode.Perm(), !bytes.Equal(updated, data) || !generationFileExistsBelow(m.ServerDir, "BepInEx/config/BepInEx.cfg"), nil
+	if exists {
+		updated := disableConsoleLogging(snapshot.Data)
+		return updated, snapshot.Mode, !bytes.Equal(updated, snapshot.Data), &snapshot, nil
+	}
+	data, mode, err := readFileAt(generationRoot, configTemplateName)
+	if err != nil {
+		return nil, 0, false, nil, fmt.Errorf("read staged BepInEx config template: %w", err)
+	}
+	return disableConsoleLogging(data), mode.Perm(), true, nil, nil
 }
 
 type fileSnapshot struct {
 	Data   []byte
 	SHA256 string
 	Mode   fs.FileMode
+	Dev    uint64
+	Ino    uint64
 }
 
 func snapshotFileBelow(rootPath, relativePath string) (fileSnapshot, bool, error) {
-	data, mode, err := readFileBelow(rootPath, relativePath)
+	root, err := openDirectoryPath(rootPath, false)
+	if err != nil {
+		return fileSnapshot{}, false, err
+	}
+	defer unix.Close(root)
+	parent, name, err := openRelativeParent(root, relativePath, false, nil)
 	if err != nil {
 		if errors.Is(err, unix.ENOENT) {
 			return fileSnapshot{}, false, nil
 		}
 		return fileSnapshot{}, false, err
 	}
-	return fileSnapshot{Data: data, SHA256: hashBytes(data), Mode: mode.Perm()}, true, nil
+	defer unix.Close(parent)
+	snapshot, err := snapshotFileAt(parent, name)
+	if errors.Is(err, unix.ENOENT) {
+		return fileSnapshot{}, false, nil
+	}
+	if err != nil {
+		return fileSnapshot{}, false, err
+	}
+	return snapshot, true, nil
 }
 
-func writeServerFile(serverDir, relativePath string, data []byte, mode fs.FileMode) error {
+func snapshotFileAt(parent int, name string) (fileSnapshot, error) {
+	fd, err := unix.Openat(parent, name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return fileSnapshot{}, err
+	}
+	file := os.NewFile(uintptr(fd), name)
+	defer file.Close()
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		return fileSnapshot{}, err
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFREG {
+		return fileSnapshot{}, fmt.Errorf("is not a regular file")
+	}
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return fileSnapshot{}, err
+	}
+	return fileSnapshot{
+		Data: data, SHA256: hashBytes(data), Mode: fs.FileMode(stat.Mode).Perm(), Dev: stat.Dev, Ino: stat.Ino,
+	}, nil
+}
+
+func replaceServerFile(
+	serverDir, relativePath string,
+	data []byte,
+	mode fs.FileMode,
+	expected *fileSnapshot,
+	changedMessage, appearedMessage string,
+) error {
 	root, err := openDirectoryPath(serverDir, false)
 	if err != nil {
 		return err
@@ -617,7 +771,48 @@ func writeServerFile(serverDir, relativePath string, data []byte, mode fs.FileMo
 		return err
 	}
 	defer unix.Close(parent)
-	return atomicWriteAt(parent, name, data, mode, unix.Fsync)
+	temporaryName, err := writeTemporaryFileAt(parent, name, data, mode)
+	if err != nil {
+		return err
+	}
+	removeTemporary := true
+	defer func() {
+		if removeTemporary {
+			_ = unix.Unlinkat(parent, temporaryName, 0)
+		}
+	}()
+	if expected == nil {
+		if err := unix.Renameat2(parent, temporaryName, parent, name, unix.RENAME_NOREPLACE); err != nil {
+			if err == unix.EEXIST {
+				return fmt.Errorf("%s", appearedMessage)
+			}
+			return err
+		}
+		removeTemporary = false
+		return unix.Fsync(parent)
+	}
+	if err := unix.Renameat2(parent, temporaryName, parent, name, unix.RENAME_EXCHANGE); err != nil {
+		if err == unix.ENOENT {
+			return fmt.Errorf("%s", changedMessage)
+		}
+		return err
+	}
+	displaced, err := snapshotFileAt(parent, temporaryName)
+	if err != nil || !sameFileSnapshot(displaced, *expected) {
+		restoreErr := unix.Renameat2(parent, temporaryName, parent, name, unix.RENAME_EXCHANGE)
+		if restoreErr != nil {
+			return fmt.Errorf("%s; restore changed file: %w", changedMessage, restoreErr)
+		}
+		if syncErr := unix.Fsync(parent); syncErr != nil {
+			return fmt.Errorf("%s; sync restored file: %w", changedMessage, syncErr)
+		}
+		return fmt.Errorf("%s", changedMessage)
+	}
+	if err := unix.Unlinkat(parent, temporaryName, 0); err != nil {
+		return err
+	}
+	removeTemporary = false
+	return unix.Fsync(parent)
 }
 
 func ensureServerParents(serverDir string, relativePaths []string) error {
@@ -638,7 +833,7 @@ func ensureServerParents(serverDir string, relativePaths []string) error {
 	return nil
 }
 
-func removeServerFile(serverDir, relativePath string) error {
+func removeServerFile(serverDir, relativePath string, expected fileSnapshot) error {
 	root, err := openDirectoryPath(serverDir, false)
 	if err != nil {
 		return err
@@ -649,10 +844,68 @@ func removeServerFile(serverDir, relativePath string) error {
 		return err
 	}
 	defer unix.Close(parent)
-	if err := unix.Unlinkat(parent, name, 0); err != nil && err != unix.ENOENT {
+	temporaryName, err := writeTemporaryFileAt(parent, name, nil, 0o600)
+	if err != nil {
 		return err
 	}
+	removeTemporary := true
+	defer func() {
+		if removeTemporary {
+			_ = unix.Unlinkat(parent, temporaryName, 0)
+		}
+	}()
+	if err := unix.Renameat2(parent, temporaryName, parent, name, unix.RENAME_EXCHANGE); err != nil {
+		return fmt.Errorf("current file changed before delete")
+	}
+	displaced, err := snapshotFileAt(parent, temporaryName)
+	if err != nil || !sameFileSnapshot(displaced, expected) {
+		restoreErr := unix.Renameat2(parent, temporaryName, parent, name, unix.RENAME_EXCHANGE)
+		if restoreErr != nil {
+			return fmt.Errorf("current file changed before delete; restore changed file: %w", restoreErr)
+		}
+		if syncErr := unix.Fsync(parent); syncErr != nil {
+			return fmt.Errorf("current file changed before delete; sync restored file: %w", syncErr)
+		}
+		return fmt.Errorf("current file changed before delete")
+	}
+	if err := unix.Unlinkat(parent, temporaryName, 0); err != nil {
+		return err
+	}
+	if err := unix.Unlinkat(parent, name, 0); err != nil {
+		return err
+	}
+	removeTemporary = false
 	return unix.Fsync(parent)
+}
+
+func writeTemporaryFileAt(parent int, targetName string, data []byte, mode fs.FileMode) (string, error) {
+	temporaryName, fd, err := createTemporaryFileAt(parent, targetName, mode)
+	if err != nil {
+		return "", err
+	}
+	file := os.NewFile(uintptr(fd), temporaryName)
+	remove := true
+	defer func() {
+		_ = file.Close()
+		if remove {
+			_ = unix.Unlinkat(parent, temporaryName, 0)
+		}
+	}()
+	if _, err := file.Write(data); err != nil {
+		return "", err
+	}
+	if err := file.Sync(); err != nil {
+		return "", err
+	}
+	if err := file.Close(); err != nil {
+		return "", err
+	}
+	remove = false
+	return temporaryName, nil
+}
+
+func sameFileSnapshot(left, right fileSnapshot) bool {
+	return left.Dev == right.Dev && left.Ino == right.Ino && left.SHA256 == right.SHA256
 }
 
 func readFileAt(root int, relativePath string) ([]byte, fs.FileMode, error) {

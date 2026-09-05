@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -67,9 +68,11 @@ type RuntimeState struct {
 }
 
 type JournalEntry struct {
-	RelativePath string
-	BackupPath   string
-	Existed      bool
+	RelativePath    string
+	BackupPath      string
+	Existed         bool
+	OriginalSHA256  string
+	InstalledSHA256 string
 }
 
 type TransactionJournal struct {
@@ -78,20 +81,28 @@ type TransactionJournal struct {
 	Entries      []JournalEntry
 }
 
+type PromotionJournal struct {
+	GenerationID string
+	Lock         PackageLock
+}
+
 type State struct {
-	SchemaVersion int
-	SteamBuild    string
-	Active        *GenerationRecord
-	Previous      *GenerationRecord
-	Candidate     *GenerationRecord
-	Failed        *GenerationRecord
-	Transaction   *TransactionJournal
-	Runtime       RuntimeState
+	SchemaVersion  int
+	SteamBuild     string
+	Active         *GenerationRecord
+	Previous       *GenerationRecord
+	Candidate      *GenerationRecord
+	Failed         *GenerationRecord
+	Transaction    *TransactionJournal
+	Promotion      *PromotionJournal
+	PendingCleanup []string
+	Runtime        RuntimeState
 }
 
 type Store struct {
 	StateDir      string
 	syncDirectory func(int) error
+	beforeWrite   func(string) error
 }
 
 func (s *Store) syncDirectoryFD(fd int) error {
@@ -134,7 +145,7 @@ func (s *Store) OpenLifetimeLock() (io.Closer, error) {
 func (s *Store) Load() (State, error) {
 	var state State
 	if err := s.loadJSON("state.json", &state); err != nil {
-		if os.IsNotExist(err) {
+		if errors.Is(err, unix.ENOENT) {
 			return State{SchemaVersion: schemaVersion}, nil
 		}
 		return State{}, err
@@ -178,9 +189,18 @@ func (s *Store) RecoverInterruptedTransaction() error {
 	if state.Transaction == nil {
 		return nil
 	}
+	if state.Candidate != nil && state.Candidate.ID != state.Transaction.GenerationID {
+		return fmt.Errorf("transaction generation does not match candidate")
+	}
 
 	serverDir := filepath.Dir(s.StateDir)
 	for _, entry := range state.Transaction.Entries {
+		if entry.OriginalSHA256 != "" || entry.InstalledSHA256 != "" {
+			if err := s.recoverObservedJournalEntry(serverDir, entry); err != nil {
+				return fmt.Errorf("recover managed file %s: %w", entry.RelativePath, err)
+			}
+			continue
+		}
 		if !entry.Existed {
 			if err := s.removeInterruptedTarget(serverDir, entry.RelativePath); err != nil {
 				return fmt.Errorf("remove interrupted managed file %s: %w", entry.RelativePath, err)
@@ -197,14 +217,68 @@ func (s *Store) RecoverInterruptedTransaction() error {
 	}
 
 	state.Transaction = nil
+	if state.Candidate != nil {
+		failed := *state.Candidate
+		failed.Status = "failed"
+		state.Failed = &failed
+		state.Candidate = nil
+	}
 	if err := s.Save(state); err != nil {
 		return fmt.Errorf("clear recovered transaction: %w", err)
 	}
 	return nil
 }
 
+func (s *Store) recoverObservedJournalEntry(serverDir string, entry JournalEntry) error {
+	current, exists, err := snapshotFileBelow(serverDir, entry.RelativePath)
+	if err != nil {
+		return err
+	}
+	if !entry.Existed {
+		if !exists {
+			return nil
+		}
+		if entry.InstalledSHA256 == "" || current.SHA256 != entry.InstalledSHA256 {
+			return fmt.Errorf("current file was changed externally")
+		}
+		return removeServerFile(serverDir, entry.RelativePath, current)
+	}
+	if entry.OriginalSHA256 == "" {
+		return fmt.Errorf("journal entry is missing original SHA-256")
+	}
+	if exists && current.SHA256 == entry.OriginalSHA256 {
+		return nil
+	}
+	if entry.InstalledSHA256 == "" {
+		if exists {
+			return fmt.Errorf("current stale file was changed externally")
+		}
+		return s.restoreObservedJournalEntry(serverDir, entry, nil)
+	}
+	if !exists || current.SHA256 != entry.InstalledSHA256 {
+		return fmt.Errorf("current replacement was changed externally")
+	}
+	return s.restoreObservedJournalEntry(serverDir, entry, &current)
+}
+
+func (s *Store) restoreObservedJournalEntry(serverDir string, entry JournalEntry, expected *fileSnapshot) error {
+	data, mode, err := readFileBelow(s.StateDir, entry.BackupPath)
+	if err != nil {
+		return fmt.Errorf("read transaction backup %s: %w", entry.BackupPath, err)
+	}
+	return replaceServerFile(
+		serverDir, entry.RelativePath, data, mode, expected,
+		"current file changed during recovery", "current file appeared during recovery",
+	)
+}
+
 func (s *Store) loadJSON(name string, value any) error {
-	data, err := os.ReadFile(s.path(name))
+	stateDir, err := s.openStateDirectory(false)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", name, err)
+	}
+	defer unix.Close(stateDir)
+	data, _, err := readFileAt(stateDir, name)
 	if err != nil {
 		return fmt.Errorf("read %s: %w", name, err)
 	}
@@ -215,26 +289,22 @@ func (s *Store) loadJSON(name string, value any) error {
 }
 
 func (s *Store) saveJSON(name string, value any) error {
-	if err := s.ensureStateDir(); err != nil {
-		return err
-	}
 	data, err := json.Marshal(value)
 	if err != nil {
 		return fmt.Errorf("encode %s: %w", name, err)
 	}
-	if err := atomicWrite(s.path(name), data, 0o600); err != nil {
-		return fmt.Errorf("write %s: %w", name, err)
-	}
-	return nil
-}
-
-func (s *Store) ensureStateDir() error {
 	stateDir, err := s.openStateDirectory(true)
 	if err != nil {
 		return err
 	}
-	if err := unix.Close(stateDir); err != nil {
-		return fmt.Errorf("close state directory: %w", err)
+	defer unix.Close(stateDir)
+	if s.beforeWrite != nil {
+		if err := s.beforeWrite(name); err != nil {
+			return fmt.Errorf("before writing %s: %w", name, err)
+		}
+	}
+	if err := atomicWriteAt(stateDir, name, data, 0o600, s.syncDirectoryFD); err != nil {
+		return fmt.Errorf("write %s: %w", name, err)
 	}
 	return nil
 }
@@ -248,49 +318,6 @@ func (s *Store) openStateDirectory(create bool) (int, error) {
 		return -1, fmt.Errorf("open state directory: %w", err)
 	}
 	return stateDir, nil
-}
-
-func (s *Store) path(name string) string {
-	return filepath.Join(s.StateDir, name)
-}
-
-func atomicWrite(path string, data []byte, mode os.FileMode) error {
-	dir := filepath.Dir(path)
-	temporary, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-")
-	if err != nil {
-		return fmt.Errorf("create temporary file: %w", err)
-	}
-	temporaryPath := temporary.Name()
-	defer os.Remove(temporaryPath)
-
-	if err := temporary.Chmod(mode); err != nil {
-		temporary.Close()
-		return fmt.Errorf("set temporary file mode: %w", err)
-	}
-	if _, err := temporary.Write(data); err != nil {
-		temporary.Close()
-		return fmt.Errorf("write temporary file: %w", err)
-	}
-	if err := temporary.Sync(); err != nil {
-		temporary.Close()
-		return fmt.Errorf("sync temporary file: %w", err)
-	}
-	if err := temporary.Close(); err != nil {
-		return fmt.Errorf("close temporary file: %w", err)
-	}
-	if err := os.Rename(temporaryPath, path); err != nil {
-		return fmt.Errorf("rename temporary file: %w", err)
-	}
-
-	parent, err := os.Open(dir)
-	if err != nil {
-		return fmt.Errorf("open parent directory: %w", err)
-	}
-	defer parent.Close()
-	if err := parent.Sync(); err != nil {
-		return fmt.Errorf("sync parent directory: %w", err)
-	}
-	return nil
 }
 
 func (s *Store) removeInterruptedTarget(serverDir, relativePath string) error {
