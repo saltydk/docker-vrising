@@ -87,13 +87,18 @@ func (t *Thunderstore) Resolve(ctx context.Context, selections []RootSelection) 
 		visiting:     make(map[PackageRef]bool),
 		visited:      make(map[PackageRef]bool),
 		versions:     make(map[string]string),
+		packages:     make(map[PackageRef]ResolvedPackage),
 	}
 	for _, root := range roots {
 		if err := resolver.visit(ctx, root); err != nil {
 			return ResolvedGraph{}, err
 		}
 	}
-	return ResolvedGraph{Roots: roots, Packages: resolver.packages}, nil
+	packages, err := resolvedPackagesInCanonicalOrder(roots, resolver.packages)
+	if err != nil {
+		return ResolvedGraph{}, fmt.Errorf("order resolved packages: %w", err)
+	}
+	return ResolvedGraph{Roots: roots, Packages: packages}, nil
 }
 
 var managedRootIdentities = []PackageRef{
@@ -185,7 +190,7 @@ type graphResolver struct {
 	visiting     map[PackageRef]bool
 	visited      map[PackageRef]bool
 	versions     map[string]string
-	packages     []ResolvedPackage
+	packages     map[PackageRef]ResolvedPackage
 }
 
 func (r *graphResolver) visit(ctx context.Context, ref PackageRef) error {
@@ -228,15 +233,76 @@ func (r *graphResolver) visit(ctx context.Context, ref PackageRef) error {
 	}
 
 	r.visited[ref] = true
-	r.packages = append(r.packages, ResolvedPackage{
+	r.packages[ref] = ResolvedPackage{
 		Ref:          ref,
 		FullName:     metadata.FullName,
 		DownloadURL:  metadata.DownloadURL,
 		FileSize:     metadata.FileSize,
 		IsActive:     metadata.IsActive,
 		Dependencies: dependencies,
-	})
+	}
 	return nil
+}
+
+func resolvedPackagesInCanonicalOrder(roots []PackageRef, packages map[PackageRef]ResolvedPackage) ([]ResolvedPackage, error) {
+	dependencies := make(map[PackageRef][]PackageRef, len(packages))
+	for ref, pkg := range packages {
+		if pkg.Ref != ref {
+			return nil, fmt.Errorf("resolved package map identity does not match package")
+		}
+		dependencies[ref] = pkg.Dependencies
+	}
+	order, err := canonicalPackageOrder(roots, dependencies)
+	if err != nil {
+		return nil, err
+	}
+	ordered := make([]ResolvedPackage, len(order))
+	for i, ref := range order {
+		ordered[i] = packages[ref]
+	}
+	return ordered, nil
+}
+
+func canonicalPackageOrder(roots []PackageRef, packages map[PackageRef][]PackageRef) ([]PackageRef, error) {
+	const (
+		packageVisiting = iota + 1
+		packageVisited
+	)
+	states := make(map[PackageRef]int, len(packages))
+	ordered := make([]PackageRef, 0, len(packages))
+	var visit func(PackageRef) error
+	visit = func(ref PackageRef) error {
+		switch states[ref] {
+		case packageVisiting:
+			return fmt.Errorf("dependency cycle at %s", packageVersionFullName(ref))
+		case packageVisited:
+			return nil
+		}
+		dependencies, ok := packages[ref]
+		if !ok {
+			return fmt.Errorf("package graph is missing %s", packageVersionFullName(ref))
+		}
+		states[ref] = packageVisiting
+		dependencies = append([]PackageRef(nil), dependencies...)
+		sortPackageRefs(dependencies)
+		for _, dependency := range dependencies {
+			if err := visit(dependency); err != nil {
+				return err
+			}
+		}
+		states[ref] = packageVisited
+		ordered = append(ordered, ref)
+		return nil
+	}
+	for _, root := range roots {
+		if err := visit(root); err != nil {
+			return nil, err
+		}
+	}
+	if len(ordered) != len(packages) {
+		return nil, fmt.Errorf("package graph contains packages outside the managed roots")
+	}
+	return ordered, nil
 }
 
 func parseDependency(dependency string) (PackageRef, error) {
@@ -380,17 +446,13 @@ func packageVersionFullName(ref PackageRef) string {
 
 func sortPackageRefs(refs []PackageRef) {
 	sort.Slice(refs, func(i, j int) bool {
-		if refs[i].Namespace != refs[j].Namespace {
-			return refs[i].Namespace < refs[j].Namespace
-		}
-		if refs[i].Name != refs[j].Name {
-			return refs[i].Name < refs[j].Name
-		}
-		return refs[i].Version < refs[j].Version
+		return comparePackageRefs(refs[i], refs[j]) < 0
 	})
 }
 
 func PackageLockDigest(lock PackageLock) string {
+	// The digest represents graph content, not caller-provided ordering. Staging
+	// separately enforces canonicalPackageOrder before persisting a lock.
 	roots := append([]PackageRef(nil), lock.Roots...)
 	sortPackageRefs(roots)
 	packages := make([]canonicalLockedPackage, len(lock.Packages))

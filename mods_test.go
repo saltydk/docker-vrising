@@ -178,6 +178,24 @@ func TestStageRejectsPartialOrUnorderedManagedRoots(t *testing.T) {
 	}
 }
 
+func TestStageRejectsNoncanonicalPackageOrder(t *testing.T) {
+	manager := newTestModManager(t)
+	lock, archives := newManagedArchiveSet(t, managedArchiveContents{})
+	wantDigest := lock.Digest
+	lock.Packages[0], lock.Packages[1] = lock.Packages[1], lock.Packages[0]
+	lock.Digest = PackageLockDigest(lock)
+	if lock.Digest != wantDigest {
+		t.Fatalf("permuted lock digest = %q, want stable digest %q", lock.Digest, wantDigest)
+	}
+
+	if _, err := manager.Stage(t.Context(), lock, archives); err == nil {
+		t.Fatal("Stage() accepted a noncanonical package order with a valid digest")
+	}
+	if _, err := os.Lstat(manager.GenerationsDir); !os.IsNotExist(err) {
+		t.Fatalf("generations directory stat error = %v, want no staging mutation", err)
+	}
+}
+
 func TestStageBorrowsValidatedArchivesWithoutClosingThem(t *testing.T) {
 	manager := newTestModManager(t)
 	lock, archives := newManagedArchiveSet(t, managedArchiveContents{})

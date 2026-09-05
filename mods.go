@@ -1258,6 +1258,7 @@ func validateManagedArchiveSet(lock PackageLock, archives map[PackageRef]*Valida
 		return fmt.Errorf("managed package lock must contain exactly BepInEx, VampireCommandFramework, KindredCommands, HookDOTS API, and Satisvampory")
 	}
 	seen := make(map[string]PackageRef, len(lock.Packages))
+	dependencies := make(map[PackageRef][]PackageRef, len(lock.Packages))
 	for _, locked := range lock.Packages {
 		kind := managedPackageKind(locked.Ref)
 		if kind == "" {
@@ -1267,6 +1268,7 @@ func validateManagedArchiveSet(lock PackageLock, archives map[PackageRef]*Valida
 			return fmt.Errorf("managed package lock contains duplicate %s package", kind)
 		}
 		seen[kind] = locked.Ref
+		dependencies[locked.Ref] = locked.Dependencies
 		archive, ok := archives[locked.Ref]
 		if !ok || archive == nil {
 			return fmt.Errorf("validated archive for %s is required", packageVersionFullName(locked.Ref))
@@ -1294,6 +1296,15 @@ func validateManagedArchiveSet(lock PackageLock, archives map[PackageRef]*Valida
 	}
 	if seen["kindred"] != lock.Roots[0] || seen["satisvampory"] != lock.Roots[1] {
 		return fmt.Errorf("package lock roots do not match locked root packages")
+	}
+	canonicalOrder, err := canonicalPackageOrder(lock.Roots, dependencies)
+	if err != nil {
+		return fmt.Errorf("validate package order: %w", err)
+	}
+	for i, ref := range canonicalOrder {
+		if lock.Packages[i].Ref != ref {
+			return fmt.Errorf("managed package lock packages are not in canonical dependency order")
+		}
 	}
 	return nil
 }
