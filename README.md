@@ -33,7 +33,17 @@ For an existing TrueOsiris-style deployment, change only its image line:
 
 Keep both existing bind mounts. The first start operates on the current server
 installation, saves, settings, ports, network, and compatible environment
-variables in place; it does not relocate or erase existing bytes.
+variables in place. It is not a byte-immutable operation: Steam may replace or
+remove game binaries, the managed-file transaction may replace or prune the
+recognized mod overlay, `LOGDAYS` may prune recognized server logs, and backup
+retention may prune older recognized backup archives.
+
+Existing saves and settings are not deleted or rewritten by the controller as
+part of migration. They are included in the documented pre-Steam-upgrade
+backup transaction and are never restored automatically; after launch, the
+game itself may legitimately write or migrate them. Unmanaged server and mod
+content remains outside the managed-file inventory and is not pruned by the
+controller.
 
 The exact checked-in [`compose.yaml`](compose.yaml) is:
 

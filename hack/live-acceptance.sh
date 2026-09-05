@@ -19,6 +19,10 @@ container_name=
 network_name=
 server_dir=
 data_dir=
+container_created=false
+created_container_id=
+network_created=false
+created_network_id=
 
 usage() {
 	printf 'usage: %s fresh IMAGE\n' "$0" >&2
@@ -90,55 +94,44 @@ assert_sources_quiescent() {
 	assert_no_running_container_uses_sources
 }
 
-cleanup_labeled_resources() {
+container_identity_matches() {
+	local actual_id actual_name owner
+
+	[[ $container_created == true && -n $created_container_id ]] || return 1
+	actual_id=$(docker inspect --format '{{.Id}}' "$created_container_id" 2>/dev/null) || return 1
+	actual_name=$(docker inspect --format '{{.Name}}' "$created_container_id" 2>/dev/null) || return 1
+	owner=$(docker inspect --format "{{ index .Config.Labels \"$label_key\" }}" "$created_container_id" 2>/dev/null) || return 1
+	[[ $actual_id == "$created_container_id" && $actual_name == "/$container_name" && $owner == "$suite_token" ]]
+}
+
+network_identity_matches() {
+	local actual_id actual_name owner
+
+	[[ $network_created == true && -n $created_network_id ]] || return 1
+	actual_id=$(docker network inspect --format '{{.Id}}' "$created_network_id" 2>/dev/null) || return 1
+	actual_name=$(docker network inspect --format '{{.Name}}' "$created_network_id" 2>/dev/null) || return 1
+	owner=$(docker network inspect --format "{{ index .Labels \"$label_key\" }}" "$created_network_id" 2>/dev/null) || return 1
+	[[ $actual_id == "$created_network_id" && $actual_name == "$network_name" && $owner == "$suite_token" ]]
+}
+
+cleanup_created_resources() {
 	local failed=0
-	local resource_ids resource_id owner remaining
 
-	[[ -n ${suite_label:-} ]] || return 0
-
-	if resource_ids=$(docker ps -aq --filter "label=$suite_label" 2>/dev/null); then
-		while IFS= read -r resource_id; do
-			[[ -n $resource_id ]] || continue
-			owner=$(docker inspect --format "{{ index .Config.Labels \"$label_key\" }}" "$resource_id" 2>/dev/null) || {
-				failed=1
-				continue
-			}
-			[[ $owner == "$suite_token" ]] || {
-				failed=1
-				continue
-			}
-			docker rm -fv "$resource_id" >/dev/null 2>&1 || failed=1
-		done <<<"$resource_ids"
-	else
-		failed=1
+	if [[ $container_created == true ]]; then
+		if container_identity_matches && docker rm -fv "$created_container_id" >/dev/null 2>&1; then
+			container_created=false
+			created_container_id=
+		else
+			failed=1
+		fi
 	fi
-
-	if resource_ids=$(docker network ls -q --filter "label=$suite_label" 2>/dev/null); then
-		while IFS= read -r resource_id; do
-			[[ -n $resource_id ]] || continue
-			owner=$(docker network inspect --format "{{ index .Labels \"$label_key\" }}" "$resource_id" 2>/dev/null) || {
-				failed=1
-				continue
-			}
-			[[ $owner == "$suite_token" ]] || {
-				failed=1
-				continue
-			}
-			docker network rm "$resource_id" >/dev/null 2>&1 || failed=1
-		done <<<"$resource_ids"
-	else
-		failed=1
-	fi
-
-	if remaining=$(docker ps -aq --filter "label=$suite_label" 2>/dev/null); then
-		[[ -z $remaining ]] || failed=1
-	else
-		failed=1
-	fi
-	if remaining=$(docker network ls -q --filter "label=$suite_label" 2>/dev/null); then
-		[[ -z $remaining ]] || failed=1
-	else
-		failed=1
+	if [[ $network_created == true ]]; then
+		if network_identity_matches && docker network rm "$created_network_id" >/dev/null 2>&1; then
+			network_created=false
+			created_network_id=
+		else
+			failed=1
+		fi
 	fi
 	return "$failed"
 }
@@ -157,7 +150,7 @@ cleanup() {
 
 	trap - EXIT INT TERM
 	set +e
-	if ! cleanup_labeled_resources && [[ $status -eq 0 ]]; then
+	if ! cleanup_created_resources && [[ $status -eq 0 ]]; then
 		status=1
 	fi
 	if [[ $status -eq 0 ]]; then
@@ -190,17 +183,14 @@ assert_no_resource_collisions() {
 }
 
 assert_container_owned() {
-	local owner
-
-	owner=$(docker inspect --format "{{ index .Config.Labels \"$label_key\" }}" "$container_name") \
-		|| fail "cannot inspect acceptance container label"
-	[[ $owner == "$suite_token" ]] || fail "acceptance container label does not match its temporary root"
+	container_identity_matches \
+		|| fail "acceptance container identity does not match its successful creation"
 }
 
 assert_bind_mounts() {
 	local mounts
 
-	mounts=$(docker inspect --format '{{json .Mounts}}' "$container_name") \
+	mounts=$(docker inspect --format '{{json .Mounts}}' "$created_container_id") \
 		|| fail "cannot inspect acceptance container mounts"
 	jq -e --arg server "$server_dir" --arg data "$data_dir" '
 		length == 2 and
@@ -231,21 +221,26 @@ start_container() {
 	fi
 	arguments+=("$image")
 
-	docker "${arguments[@]}" >/dev/null || fail "could not start acceptance container"
+	created_container_id=$(docker "${arguments[@]}") || fail "could not start acceptance container"
+	container_created=true
+	[[ -n $created_container_id && $created_container_id != *$'\n'* ]] \
+		|| fail "Docker returned an invalid acceptance container ID"
 	assert_container_owned
 	assert_bind_mounts
 }
 
 remove_container() {
 	assert_container_owned
-	docker rm -f "$container_name" >/dev/null || fail "could not remove acceptance container"
+	docker rm -f "$created_container_id" >/dev/null || fail "could not remove acceptance container"
+	container_created=false
+	created_container_id=
 }
 
 stop_cleanly() {
 	local exit_code
 
-	docker stop --time 130 "$container_name" >/dev/null || fail "container did not stop within the shutdown allowance"
-	exit_code=$(docker inspect --format '{{.State.ExitCode}}' "$container_name") \
+	docker stop --time 130 "$created_container_id" >/dev/null || fail "container did not stop within the shutdown allowance"
+	exit_code=$(docker inspect --format '{{.State.ExitCode}}' "$created_container_id") \
 		|| fail "cannot inspect stopped container exit status"
 	[[ $exit_code -eq 0 ]] || fail "controller returned a non-zero status during clean shutdown"
 	remove_container
@@ -256,9 +251,9 @@ wait_healthy() {
 	local status health
 
 	while (( SECONDS < deadline )); do
-		status=$(docker inspect --format '{{.State.Status}}' "$container_name" 2>/dev/null) \
+		status=$(docker inspect --format '{{.State.Status}}' "$created_container_id" 2>/dev/null) \
 			|| fail "acceptance container disappeared before health validation"
-		health=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' "$container_name") \
+		health=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' "$created_container_id") \
 			|| fail "cannot inspect acceptance container health"
 		[[ $health == healthy ]] && return 0
 		[[ $health != missing ]] || fail "image has no Docker health check"
@@ -272,7 +267,7 @@ assert_published_port() {
 	local port=$1
 	local protocol=$2
 
-	docker port "$container_name" "$port/$protocol" >/dev/null 2>&1 \
+	docker port "$created_container_id" "$port/$protocol" >/dev/null 2>&1 \
 		|| fail "$protocol port $port is not published"
 }
 
@@ -289,7 +284,7 @@ assert_container_socket() {
 		*) fail "unsupported socket protocol" ;;
 	esac
 
-	docker exec "$container_name" awk -v expected_port="$port_hex" -v protocol="$protocol" '
+	docker exec "$created_container_id" awk -v expected_port="$port_hex" -v protocol="$protocol" '
 		NR > 1 {
 			split($2, local_address, ":")
 			if (toupper(local_address[2]) == expected_port && (protocol != "tcp" || $4 == "0A")) {
@@ -305,6 +300,11 @@ assert_udp_ports() {
 		assert_published_port "$port" udp
 		assert_container_socket udp "$port"
 	done
+}
+
+assert_live_installation() {
+	docker exec "$created_container_id" vrisingctl verify >/dev/null \
+		|| fail "deep live Steam, lock, generation, and managed-file validation failed"
 }
 
 assert_rcon_if_enabled() {
@@ -489,10 +489,14 @@ run_fresh() {
 	[[ -z $(find "$server_dir" -mindepth 1 -print -quit) ]] || fail "fresh server bind is not empty"
 	[[ -z $(find "$data_dir" -mindepth 1 -print -quit) ]] || fail "fresh data bind is not empty"
 
-	docker network create --label "$suite_label" "$network_name" >/dev/null \
+	created_network_id=$(docker network create --label "$suite_label" "$network_name") \
 		|| fail "could not create acceptance network"
+	network_created=true
+	[[ -n $created_network_id && $created_network_id != *$'\n'* ]] \
+		|| fail "Docker returned an invalid acceptance network ID"
 	start_container "$network_name" true
 	wait_healthy
+	assert_live_installation
 	assert_steam_state
 	assert_package_graph
 	assert_managed_dlls
@@ -505,6 +509,7 @@ run_fresh() {
 
 	start_container none false
 	wait_healthy
+	assert_live_installation
 	assert_runtime_state true
 	[[ $(jq -er '.Active.ID' "$server_dir/.docker-vrising/state.json") == "$active_id" ]] \
 		|| fail "offline restart changed the active generation"
@@ -537,10 +542,14 @@ run_migrate() {
 	assert_snapshot_equal "$source_before" "$source_after_copy" "a source Settings/Saves entry changed while it was copied"
 	assert_sources_quiescent
 
-	docker network create --label "$suite_label" "$network_name" >/dev/null \
+	created_network_id=$(docker network create --label "$suite_label" "$network_name") \
 		|| fail "could not create acceptance network"
+	network_created=true
+	[[ -n $created_network_id && $created_network_id != *$'\n'* ]] \
+		|| fail "Docker returned an invalid acceptance network ID"
 	start_container "$network_name" true
 	wait_healthy
+	assert_live_installation
 	assert_steam_state
 	assert_package_graph
 	assert_managed_dlls
@@ -573,7 +582,7 @@ case ${1:-} in
 	*) usage ;;
 esac
 
-for command in awk cmp comm docker find grep jq mkdir mktemp readlink realpath rm sha256sum sort stat tr; do
+for command in awk cmp comm docker find grep jq mkdir mktemp readlink realpath rm sha256sum sleep sort stat tr; do
 	require_command "$command"
 done
 

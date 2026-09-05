@@ -26,7 +26,7 @@ func main() {
 
 func dispatch(args []string, output io.Writer) int {
 	if len(args) != 1 {
-		fmt.Fprintln(output, "usage: vrisingctl {run|health|version}")
+		fmt.Fprintln(output, "usage: vrisingctl {run|health|verify|version}")
 		return exitUsage
 	}
 
@@ -35,11 +35,13 @@ func dispatch(args []string, output io.Writer) int {
 		return runCommand(output, Config{})
 	case "health":
 		return healthCommand(output)
+	case "verify":
+		return verifyCommand(output, Config{})
 	case "version":
 		fmt.Fprintln(output, buildVersion)
 		return 0
 	default:
-		fmt.Fprintln(output, "usage: vrisingctl {run|health|version}")
+		fmt.Fprintln(output, "usage: vrisingctl {run|health|verify|version}")
 		return exitUsage
 	}
 }

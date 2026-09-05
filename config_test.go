@@ -146,7 +146,7 @@ func TestCommandDispatchHandlesNonRunCommands(t *testing.T) {
 	}{
 		{name: "health", args: []string{"health"}, wantOut: "not running\n", want: 1},
 		{name: "version", args: []string{"version"}, wantOut: "dev\n", want: 0},
-		{name: "unknown", args: []string{"wat"}, wantOut: "usage: vrisingctl {run|health|version}\n", want: exitUsage},
+		{name: "unknown", args: []string{"wat"}, wantOut: "usage: vrisingctl {run|health|verify|version}\n", want: exitUsage},
 	}
 
 	for _, tt := range tests {
