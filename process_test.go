@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 type fakeWaitResult struct {
@@ -23,7 +25,13 @@ type fakeManagedProcess struct {
 	pid           int
 	startTicks    uint64
 	startTicksErr error
+	tickObserved  chan struct{}
+	tickOnce      sync.Once
+	finished      bool
+	finishedProbe chan struct{}
+	probeOnce     sync.Once
 	wait          chan fakeWaitResult
+	waitGate      <-chan struct{}
 	waitOnce      sync.Once
 	waitCalls     int
 	tickCalls     int
@@ -33,10 +41,12 @@ type fakeManagedProcess struct {
 
 func newFakeManagedProcess(pid int) *fakeManagedProcess {
 	return &fakeManagedProcess{
-		pid:        pid,
-		startTicks: uint64(pid * 10),
-		wait:       make(chan fakeWaitResult, 1),
-		exitOn:     make(map[os.Signal]int),
+		pid:           pid,
+		startTicks:    uint64(pid * 10),
+		tickObserved:  make(chan struct{}),
+		finishedProbe: make(chan struct{}),
+		wait:          make(chan fakeWaitResult, 1),
+		exitOn:        make(map[os.Signal]int),
 	}
 }
 
@@ -46,6 +56,11 @@ func (p *fakeManagedProcess) StartTicks() (uint64, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.tickCalls++
+	p.tickOnce.Do(func() { close(p.tickObserved) })
+	if p.finished {
+		p.probeOnce.Do(func() { close(p.finishedProbe) })
+		return 0, os.ErrProcessDone
+	}
 	return p.startTicks, p.startTicksErr
 }
 
@@ -63,12 +78,19 @@ func (p *fakeManagedProcess) SignalGroup(signal os.Signal) error {
 func (p *fakeManagedProcess) Wait() (int, error) {
 	p.mu.Lock()
 	p.waitCalls++
+	waitGate := p.waitGate
 	p.mu.Unlock()
 	result := <-p.wait
+	if waitGate != nil {
+		<-waitGate
+	}
 	return result.exitCode, result.err
 }
 
 func (p *fakeManagedProcess) finish(exitCode int, err error) {
+	p.mu.Lock()
+	p.finished = true
+	p.mu.Unlock()
 	p.waitOnce.Do(func() {
 		p.wait <- fakeWaitResult{exitCode: exitCode, err: err}
 	})
@@ -91,6 +113,8 @@ type fakeProcessFactory struct {
 	wineServerEnvs  [][]string
 	wineStarted     chan struct{}
 	wineStartedOnce sync.Once
+	readyPersisted  chan struct{}
+	readyOnce       sync.Once
 	startXvfbErr    error
 	startWineErr    error
 	killWineHook    func()
@@ -101,10 +125,11 @@ func newFakeProcessFactory() *fakeProcessFactory {
 	xvfb.exitOn[syscall.SIGTERM] = 0
 	xvfb.exitOn[syscall.SIGKILL] = 0
 	return &fakeProcessFactory{
-		xvfb:        xvfb,
-		wine:        newFakeManagedProcess(202),
-		display:     "77",
-		wineStarted: make(chan struct{}),
+		xvfb:           xvfb,
+		wine:           newFakeManagedProcess(202),
+		display:        "77",
+		wineStarted:    make(chan struct{}),
+		readyPersisted: make(chan struct{}),
 	}
 }
 
@@ -187,8 +212,12 @@ func testLaunchRequest(t *testing.T, modsEnabled bool) (LaunchRequest, *Store) {
 		BaseEnv:             []string{"PATH=/usr/bin"},
 	}
 	return LaunchRequest{
-		Config:     cfg,
-		Identity:   RuntimeIdentity{UID: 1000, GID: 1000, Home: filepath.Join(root, "home")},
+		Config:   cfg,
+		Identity: RuntimeIdentity{UID: 1000, GID: 1000, Home: filepath.Join(root, "home")},
+		PackageLock: PackageLock{Roots: []PackageRef{
+			{Namespace: "odjit", Name: "KindredCommands", Version: "1.2.3"},
+			{Namespace: "Team_GreenEye", Name: "Satisvampory", Version: "4.5.6"},
+		}},
 		Generation: "generation-1",
 		SteamBuild: "steam-build-1",
 	}, &Store{StateDir: cfg.StateDir}
@@ -214,6 +243,21 @@ func testSupervisor(store *Store, factory ProcessFactory) *Supervisor {
 
 func runSupervisor(t *testing.T, supervisor *Supervisor, request LaunchRequest, factory *fakeProcessFactory) <-chan supervisorOutcome {
 	t.Helper()
+	previousSync := supervisor.Store.syncDirectory
+	supervisor.Store.syncDirectory = func(fd int) error {
+		if previousSync != nil {
+			if err := previousSync(fd); err != nil {
+				return err
+			}
+		} else if err := unix.Fsync(fd); err != nil {
+			return err
+		}
+		state, err := supervisor.Store.Load()
+		if err == nil && state.Runtime.Ready {
+			factory.readyOnce.Do(func() { close(factory.readyPersisted) })
+		}
+		return nil
+	}
 	outcome := make(chan supervisorOutcome, 1)
 	go func() {
 		result, err := supervisor.Run(t.Context(), request)
@@ -224,7 +268,21 @@ func runSupervisor(t *testing.T, supervisor *Supervisor, request LaunchRequest, 
 	case <-time.After(time.Second):
 		t.Fatal("Wine did not start")
 	}
+	select {
+	case <-factory.wine.tickObserved:
+	case <-time.After(time.Second):
+		t.Fatal("Wine start ticks were not recorded")
+	}
 	return outcome
+}
+
+func waitForReadyState(t *testing.T, factory *fakeProcessFactory) {
+	t.Helper()
+	select {
+	case <-factory.readyPersisted:
+	case <-time.After(time.Second):
+		t.Fatal("ready state was not persisted")
+	}
 }
 
 func receiveOutcome(t *testing.T, outcome <-chan supervisorOutcome) supervisorOutcome {
@@ -248,11 +306,23 @@ func envValue(env []string, name string) (string, bool) {
 	return "", false
 }
 
+func envValueCount(env []string, name string) int {
+	prefix := name + "="
+	count := 0
+	for _, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			count++
+		}
+	}
+	return count
+}
+
 func TestSupervisorStartsXvfbBeforeWine(t *testing.T) {
 	request, store := testLaunchRequest(t, false)
 	factory := newFakeProcessFactory()
 	supervisor := testSupervisor(store, factory)
 	outcome := runSupervisor(t, supervisor, request, factory)
+	waitForReadyState(t, factory)
 	factory.wine.finish(0, nil)
 	got := receiveOutcome(t, outcome)
 	if got.err != nil {
@@ -279,6 +349,7 @@ func TestSupervisorBuildsLiteralWineArguments(t *testing.T) {
 	runOnce := func(factory *fakeProcessFactory) CommandSpec {
 		supervisor.Processes = factory
 		outcome := runSupervisor(t, supervisor, request, factory)
+		waitForReadyState(t, factory)
 		factory.wine.finish(0, nil)
 		if got := receiveOutcome(t, outcome); got.err != nil {
 			t.Fatalf("Run() error = %v", got.err)
@@ -320,6 +391,7 @@ func TestSupervisorMergesWinHTTPOverrideWhenModsEnabled(t *testing.T) {
 	factory := newFakeProcessFactory()
 	supervisor := testSupervisor(store, factory)
 	outcome := runSupervisor(t, supervisor, request, factory)
+	waitForReadyState(t, factory)
 	factory.wine.finish(0, nil)
 	if got := receiveOutcome(t, outcome); got.err != nil {
 		t.Fatalf("Run() error = %v", got.err)
@@ -342,6 +414,7 @@ func TestSupervisorForcesBuiltinWinHTTPWhenModsDisabled(t *testing.T) {
 	factory := newFakeProcessFactory()
 	supervisor := testSupervisor(store, factory)
 	outcome := runSupervisor(t, supervisor, request, factory)
+	waitForReadyState(t, factory)
 	factory.wine.finish(0, nil)
 	if got := receiveOutcome(t, outcome); got.err != nil {
 		t.Fatalf("Run() error = %v", got.err)
@@ -355,6 +428,49 @@ func TestSupervisorForcesBuiltinWinHTTPWhenModsDisabled(t *testing.T) {
 	debug, _ := envValue(specs[0].Env, "WINEDEBUG")
 	if debug != "-all" {
 		t.Fatalf("WINEDEBUG = %q", debug)
+	}
+}
+
+func TestSupervisorForcesStateWinePrefixForWineAndWineServer(t *testing.T) {
+	request, store := testLaunchRequest(t, false)
+	request.Config.BaseEnv = []string{
+		"PATH=/usr/bin",
+		"WINEPREFIX=/inherited/first",
+		"WINEPREFIX=/inherited/second",
+	}
+	factory := newFakeProcessFactory()
+	factory.wine.exitOn[syscall.SIGKILL] = 137
+	supervisor := testSupervisor(store, factory)
+	timeouts := make(chan time.Time, 2)
+	supervisor.after = func(time.Duration) <-chan time.Time { return timeouts }
+	signals := make(chan os.Signal, 1)
+	supervisor.signals = signals
+
+	outcome := runSupervisor(t, supervisor, request, factory)
+	signals <- syscall.SIGTERM
+	timeouts <- time.Time{}
+	timeouts <- time.Time{}
+	if got := receiveOutcome(t, outcome); got.err != nil {
+		t.Fatalf("Run() error = %v", got.err)
+	}
+
+	_, xvfbArgs, specs, kills := factory.snapshot()
+	wantXvfbArgs := []string{"-displayfd", "3", "-screen", "0", "1024x768x24", "-nolisten", "tcp"}
+	if !slices.Equal(xvfbArgs, wantXvfbArgs) {
+		t.Fatalf("Xvfb args = %q, want %q", xvfbArgs, wantXvfbArgs)
+	}
+	if len(specs) != 1 || len(kills) != 1 {
+		t.Fatalf("Wine starts = %d, wineserver calls = %d, want 1 each", len(specs), len(kills))
+	}
+	wantPrefix := filepath.Join(request.Config.StateDir, "wineprefix")
+	for name, env := range map[string][]string{"Wine": specs[0].Env, "wineserver": kills[0]} {
+		gotPrefix, ok := envValue(env, "WINEPREFIX")
+		if !ok || gotPrefix != wantPrefix {
+			t.Errorf("%s WINEPREFIX = %q, %t; want %q", name, gotPrefix, ok, wantPrefix)
+		}
+		if count := envValueCount(env, "WINEPREFIX"); count != 1 {
+			t.Errorf("%s WINEPREFIX count = %d, want 1", name, count)
+		}
 	}
 }
 
@@ -413,6 +529,7 @@ func TestSupervisorReapsXvfbAndWine(t *testing.T) {
 	factory := newFakeProcessFactory()
 	supervisor := testSupervisor(store, factory)
 	outcome := runSupervisor(t, supervisor, request, factory)
+	waitForReadyState(t, factory)
 	factory.wine.finish(0, nil)
 	if got := receiveOutcome(t, outcome); got.err != nil {
 		t.Fatalf("Run() error = %v", got.err)
@@ -430,6 +547,7 @@ func TestSupervisorReturnsServerExitStatus(t *testing.T) {
 	factory := newFakeProcessFactory()
 	supervisor := testSupervisor(store, factory)
 	outcome := runSupervisor(t, supervisor, request, factory)
+	waitForReadyState(t, factory)
 	factory.wine.finish(23, nil)
 	got := receiveOutcome(t, outcome)
 	if got.err != nil {
@@ -437,6 +555,40 @@ func TestSupervisorReturnsServerExitStatus(t *testing.T) {
 	}
 	if got.result.ExitCode != 23 {
 		t.Fatalf("ExitCode = %d, want 23", got.result.ExitCode)
+	}
+}
+
+func TestSupervisorReportsUnexpectedXvfbExitStatus(t *testing.T) {
+	request, store := testLaunchRequest(t, false)
+	factory := newFakeProcessFactory()
+	factory.wine.exitOn[syscall.SIGTERM] = 0
+	writes := 0
+	store.beforeWrite = func(string) error {
+		writes++
+		if writes == 2 {
+			factory.xvfb.finish(42, nil)
+		}
+		return nil
+	}
+	supervisor := testSupervisor(store, factory)
+
+	got := receiveOutcome(t, runSupervisor(t, supervisor, request, factory))
+	if got.err == nil || !strings.Contains(got.err.Error(), "Xvfb exited unexpectedly with status 42") {
+		t.Fatalf("Run() error = %v, want explicit Xvfb status", got.err)
+	}
+	if got.result.ExitCode != 0 {
+		t.Fatalf("Wine ExitCode = %d, want clean controlled shutdown", got.result.ExitCode)
+	}
+	_, wineWaits, wineSignals := factory.wine.snapshot()
+	_, xvfbWaits, xvfbSignals := factory.xvfb.snapshot()
+	if wineWaits != 1 || xvfbWaits != 1 {
+		t.Fatalf("Wait calls: Wine=%d Xvfb=%d, want 1 each", wineWaits, xvfbWaits)
+	}
+	if !slices.Equal(wineSignals, []os.Signal{syscall.SIGTERM}) {
+		t.Fatalf("Wine signals = %v, want TERM", wineSignals)
+	}
+	if len(xvfbSignals) != 0 {
+		t.Fatalf("Xvfb signals = %v, want none after unexpected exit", xvfbSignals)
 	}
 }
 
@@ -462,15 +614,75 @@ func TestSupervisorStopsCandidateWhenReadinessTimesOut(t *testing.T) {
 	}
 }
 
-func TestSupervisorRecordsPIDAndExactReadinessVersions(t *testing.T) {
+func TestSupervisorDoesNotCommitReadinessWhenChildrenCompleteTogether(t *testing.T) {
+	request, store := testLaunchRequest(t, false)
+	factory := newFakeProcessFactory()
+	waitGate := make(chan struct{})
+	factory.xvfb.waitGate = waitGate
+	factory.wine.waitGate = waitGate
+	readyCommitAttempt := make(chan struct{})
+	writes := 0
+	store.beforeWrite = func(string) error {
+		writes++
+		if writes == 2 {
+			close(readyCommitAttempt)
+		}
+		return nil
+	}
+	readinessReturned := make(chan struct{})
+	supervisor := testSupervisor(store, factory)
+	supervisor.waitReadiness = func(context.Context, ReadinessMonitor, ExpectedReadiness) error {
+		factory.xvfb.finish(0, nil)
+		factory.wine.finish(0, nil)
+		close(readinessReturned)
+		return nil
+	}
+	outcome := runSupervisor(t, supervisor, request, factory)
+	<-readinessReturned
+
+	select {
+	case <-factory.xvfb.finishedProbe:
+	case <-factory.wine.finishedProbe:
+	case <-readyCommitAttempt:
+	case <-time.After(time.Second):
+		t.Fatal("supervisor neither probed child liveness nor attempted a ready-state write")
+	}
+	close(waitGate)
+
+	got := receiveOutcome(t, outcome)
+	if got.result.Ready {
+		t.Fatal("Ready = true after both child processes completed")
+	}
+	if got.err == nil || !strings.Contains(got.err.Error(), "before readiness") {
+		t.Fatalf("Run() error = %v, want child exit before readiness", got.err)
+	}
+	_, wineWaits, _ := factory.wine.snapshot()
+	_, xvfbWaits, _ := factory.xvfb.snapshot()
+	if wineWaits != 1 || xvfbWaits != 1 {
+		t.Fatalf("Wait calls: Wine=%d Xvfb=%d, want 1 each", wineWaits, xvfbWaits)
+	}
+}
+
+func TestParseProcStartTicksRejectsZombie(t *testing.T) {
+	stat := []byte("202 (VRisingServer) Z 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 4242")
+	if _, err := parseProcStartTicks(stat); err == nil || !strings.Contains(err.Error(), "zombie") {
+		t.Fatalf("parseProcStartTicks() error = %v, want zombie rejection", err)
+	}
+}
+
+func TestSupervisorRecordsPIDAndUsesSelectedReadinessVersions(t *testing.T) {
 	request, store := testLaunchRequest(t, true)
 	request.Config.KindredVersion = "latest"
 	request.Config.SatisvamporyVersion = "latest"
+	request.PackageLock.Roots = []PackageRef{
+		{Namespace: "odjit", Name: "KindredCommands", Version: "2.3.4"},
+		{Namespace: "Team_GreenEye", Name: "Satisvampory", Version: "5.6.7"},
+	}
 	if err := store.SavePackageLock(PackageLock{
 		SchemaVersion: schemaVersion,
 		Roots: []PackageRef{
-			{Namespace: "odjit", Name: "KindredCommands", Version: "2.3.4"},
-			{Namespace: "skytech6", Name: "Satisvampory", Version: "5.6.7"},
+			{Namespace: "odjit", Name: "KindredCommands", Version: "1.0.0"},
+			{Namespace: "Team_GreenEye", Name: "Satisvampory", Version: "1.0.1"},
 		},
 	}); err != nil {
 		t.Fatal(err)
@@ -493,13 +705,60 @@ func TestSupervisorRecordsPIDAndExactReadinessVersions(t *testing.T) {
 	if err := <-checked; err != nil {
 		t.Fatal(err)
 	}
+	waitForReadyState(t, factory)
 	factory.wine.finish(0, nil)
 	if got := receiveOutcome(t, outcome); got.err != nil {
 		t.Fatalf("Run() error = %v", got.err)
 	}
 	ticks, _, _ := factory.wine.snapshot()
-	if ticks != 1 {
-		t.Fatalf("StartTicks calls = %d, want 1", ticks)
+	if ticks != 2 {
+		t.Fatalf("StartTicks calls = %d, want 2", ticks)
+	}
+}
+
+func TestSupervisorRejectsInvalidSelectedReadinessRoots(t *testing.T) {
+	tests := []struct {
+		name  string
+		roots []PackageRef
+	}{
+		{
+			name: "wrong Satisvampory namespace",
+			roots: []PackageRef{
+				{Namespace: "odjit", Name: "KindredCommands", Version: "2.3.4"},
+				{Namespace: "skytech6", Name: "Satisvampory", Version: "5.6.7"},
+			},
+		},
+		{
+			name: "non-canonical order",
+			roots: []PackageRef{
+				{Namespace: "Team_GreenEye", Name: "Satisvampory", Version: "5.6.7"},
+				{Namespace: "odjit", Name: "KindredCommands", Version: "2.3.4"},
+			},
+		},
+		{
+			name: "non-exact version",
+			roots: []PackageRef{
+				{Namespace: "odjit", Name: "KindredCommands", Version: "latest"},
+				{Namespace: "Team_GreenEye", Name: "Satisvampory", Version: "5.6.7"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			request, store := testLaunchRequest(t, true)
+			request.PackageLock.Roots = tt.roots
+			factory := newFakeProcessFactory()
+			supervisor := testSupervisor(store, factory)
+			_, err := supervisor.Run(t.Context(), request)
+			if err == nil || !strings.Contains(err.Error(), "expected ordered exact roots") {
+				t.Fatalf("Run() error = %v, want selected root validation error", err)
+			}
+			order, _, _, _ := factory.snapshot()
+			if len(order) != 0 {
+				t.Fatalf("process starts = %v, want none", order)
+			}
+		})
 	}
 }
 
@@ -517,6 +776,7 @@ func TestSupervisorRemovesStaleBepInExLogWithoutFollowingLinks(t *testing.T) {
 		factory := newFakeProcessFactory()
 		supervisor := testSupervisor(store, factory)
 		outcome := runSupervisor(t, supervisor, request, factory)
+		waitForReadyState(t, factory)
 		factory.wine.finish(0, nil)
 		if got := receiveOutcome(t, outcome); got.err != nil {
 			t.Fatalf("Run() error = %v", got.err)

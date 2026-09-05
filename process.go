@@ -44,10 +44,11 @@ type ProcessFactory interface {
 }
 
 type LaunchRequest struct {
-	Config     Config
-	Identity   RuntimeIdentity
-	Generation string
-	SteamBuild string
+	Config      Config
+	Identity    RuntimeIdentity
+	PackageLock PackageLock
+	Generation  string
+	SteamBuild  string
 }
 
 type RunResult struct {
@@ -72,11 +73,12 @@ type processWaitResult struct {
 }
 
 type runningProcess struct {
-	process  ManagedProcess
-	done     chan struct{}
-	result   processWaitResult
-	stopOnce sync.Once
-	stopErr  error
+	process    ManagedProcess
+	startTicks uint64
+	done       chan struct{}
+	result     processWaitResult
+	stopOnce   sync.Once
+	stopErr    error
 }
 
 func newRunningProcess(process ManagedProcess) *runningProcess {
@@ -100,6 +102,36 @@ func (p *runningProcess) exited() bool {
 	}
 }
 
+func (p *runningProcess) recordStartTicks(name string) error {
+	startTicks, err := p.process.StartTicks()
+	if err != nil {
+		return fmt.Errorf("read %s start ticks: %w", name, err)
+	}
+	p.startTicks = startTicks
+	return nil
+}
+
+func (p *runningProcess) verifyAlive(name string) error {
+	select {
+	case <-p.done:
+		return processBeforeReadinessError(name, p.result)
+	default:
+	}
+	startTicks, err := p.process.StartTicks()
+	if err != nil {
+		return fmt.Errorf("%s exited before readiness: verify start ticks: %w", name, err)
+	}
+	if startTicks != p.startTicks {
+		return fmt.Errorf("%s exited before readiness: start ticks changed from %d to %d", name, p.startTicks, startTicks)
+	}
+	select {
+	case <-p.done:
+		return processBeforeReadinessError(name, p.result)
+	default:
+		return nil
+	}
+}
+
 func (s *Supervisor) Run(ctx context.Context, request LaunchRequest) (result RunResult, returnErr error) {
 	if err := ctx.Err(); err != nil {
 		return RunResult{}, err
@@ -120,7 +152,7 @@ func (s *Supervisor) Run(ctx context.Context, request LaunchRequest) (result Run
 		return RunResult{}, fmt.Errorf("shutdown timeout must be positive")
 	}
 
-	expected, err := s.expectedReadiness(request.Config)
+	expected, err := s.expectedReadiness(request)
 	if err != nil {
 		return RunResult{}, err
 	}
@@ -182,6 +214,9 @@ func (s *Supervisor) Run(ctx context.Context, request LaunchRequest) (result Run
 	if strings.TrimSpace(display) == "" {
 		return RunResult{}, fmt.Errorf("start Xvfb: selected display is empty")
 	}
+	if err := xvfb.recordStartTicks("Xvfb"); err != nil {
+		return RunResult{}, err
+	}
 
 	if err := removeStaleBepInExLog(request.Config.ServerDir); err != nil {
 		return RunResult{}, err
@@ -208,13 +243,12 @@ func (s *Supervisor) Run(ctx context.Context, request LaunchRequest) (result Run
 		return RunResult{}, fmt.Errorf("start Wine: process is nil")
 	}
 
-	startTicks, err := wine.process.StartTicks()
-	if err != nil {
-		return RunResult{}, fmt.Errorf("read Wine start ticks: %w", err)
+	if err := wine.recordStartTicks("Wine"); err != nil {
+		return RunResult{}, err
 	}
 	state.Runtime = RuntimeState{
 		Phase:      "starting",
-		Server:     ProcessIdentity{PID: wine.process.PID(), StartTicks: startTicks},
+		Server:     ProcessIdentity{PID: wine.process.PID(), StartTicks: wine.startTicks},
 		Generation: request.Generation,
 		SteamBuild: request.SteamBuild,
 		UpdatedAt:  now(),
@@ -250,7 +284,7 @@ func (s *Supervisor) Run(ctx context.Context, request LaunchRequest) (result Run
 			cancelRun()
 			returnErr = s.stopWine(ctx, wine, syscall.SIGTERM, request.Config.ShutdownTimeout, wineEnv)
 			result.ExitCode = wine.result.exitCode
-			return result, errors.Join(returnErr, processExitError("Xvfb", xvfb.result))
+			return result, errors.Join(returnErr, unexpectedProcessExitError("Xvfb", xvfb.result))
 		case <-wine.done:
 			cancelRun()
 			result.ExitCode = wine.result.exitCode
@@ -262,6 +296,18 @@ func (s *Supervisor) Run(ctx context.Context, request LaunchRequest) (result Run
 				returnErr = s.stopWine(ctx, wine, syscall.SIGTERM, request.Config.ShutdownTimeout, wineEnv)
 				result.ExitCode = wine.result.exitCode
 				return result, errors.Join(fmt.Errorf("wait for server readiness: %w", readinessErr), returnErr)
+			}
+			if err := xvfb.verifyAlive("Xvfb"); err != nil {
+				cancelRun()
+				returnErr = s.stopWine(ctx, wine, syscall.SIGTERM, request.Config.ShutdownTimeout, wineEnv)
+				result.ExitCode = wine.result.exitCode
+				return result, errors.Join(err, returnErr)
+			}
+			if err := wine.verifyAlive("Wine"); err != nil {
+				cancelRun()
+				returnErr = s.stopWine(ctx, wine, syscall.SIGTERM, request.Config.ShutdownTimeout, wineEnv)
+				result.ExitCode = wine.result.exitCode
+				return result, errors.Join(err, returnErr)
 			}
 			result.Ready = true
 			state.Runtime.Phase = "ready"
@@ -291,45 +337,18 @@ func (s *Supervisor) Run(ctx context.Context, request LaunchRequest) (result Run
 	}
 }
 
-func (s *Supervisor) expectedReadiness(cfg Config) (ExpectedReadiness, error) {
-	expected := ExpectedReadiness{RequireMods: cfg.ModsEnabled}
-	if !cfg.ModsEnabled {
+func (s *Supervisor) expectedReadiness(request LaunchRequest) (ExpectedReadiness, error) {
+	expected := ExpectedReadiness{RequireMods: request.Config.ModsEnabled}
+	if !request.Config.ModsEnabled {
 		return expected, nil
 	}
 
-	expected.KindredVersion = cfg.KindredVersion
-	expected.SatisvamporyVersion = cfg.SatisvamporyVersion
-	lock, lockErr := s.Store.LoadPackageLock()
-	if lockErr == nil {
-		if version := rootPackageVersion(lock, "KindredCommands"); version != "" {
-			expected.KindredVersion = version
-		}
-		if version := rootPackageVersion(lock, "Satisvampory"); version != "" {
-			expected.SatisvamporyVersion = version
-		}
+	if err := validateManagedRootRefs(request.PackageLock.Roots); err != nil {
+		return ExpectedReadiness{}, fmt.Errorf("validate selected readiness roots: %w", err)
 	}
-	if !semanticVersion.MatchString(expected.KindredVersion) {
-		if lockErr != nil {
-			return ExpectedReadiness{}, fmt.Errorf("resolve exact KindredCommands version: %w", lockErr)
-		}
-		return ExpectedReadiness{}, fmt.Errorf("exact KindredCommands root version is required")
-	}
-	if !semanticVersion.MatchString(expected.SatisvamporyVersion) {
-		if lockErr != nil {
-			return ExpectedReadiness{}, fmt.Errorf("resolve exact Satisvampory version: %w", lockErr)
-		}
-		return ExpectedReadiness{}, fmt.Errorf("exact Satisvampory root version is required")
-	}
+	expected.KindredVersion = request.PackageLock.Roots[0].Version
+	expected.SatisvamporyVersion = request.PackageLock.Roots[1].Version
 	return expected, nil
-}
-
-func rootPackageVersion(lock PackageLock, name string) string {
-	for _, root := range lock.Roots {
-		if strings.EqualFold(root.Name, name) {
-			return root.Version
-		}
-	}
-	return ""
 }
 
 func uniqueServerLog(dataDir string, now time.Time) string {
@@ -373,6 +392,7 @@ func buildWineEnvironment(request LaunchRequest, display string) []string {
 	if request.Identity.Home != "" {
 		env = setEnvironmentValue(env, "HOME", request.Identity.Home)
 	}
+	env = setEnvironmentValue(env, "WINEPREFIX", filepath.Join(request.Config.StateDir, "wineprefix"))
 	if display != "" {
 		env = setEnvironmentValue(env, "DISPLAY", ":"+strings.TrimPrefix(strings.TrimSpace(display), ":"))
 	}
@@ -513,6 +533,20 @@ func processExitError(name string, result processWaitResult) error {
 		return nil
 	}
 	return fmt.Errorf("wait for %s: %w", name, result.err)
+}
+
+func unexpectedProcessExitError(name string, result processWaitResult) error {
+	if result.err != nil {
+		return fmt.Errorf("%s exited unexpectedly: %w", name, result.err)
+	}
+	return fmt.Errorf("%s exited unexpectedly with status %d", name, result.exitCode)
+}
+
+func processBeforeReadinessError(name string, result processWaitResult) error {
+	if result.err != nil {
+		return fmt.Errorf("%s exited before readiness: %w", name, result.err)
+	}
+	return fmt.Errorf("%s exited with status %d before readiness", name, result.exitCode)
 }
 
 func wrapError(action string, err error) error {
@@ -668,6 +702,9 @@ func parseProcStartTicks(content []byte) (uint64, error) {
 	const startTimeIndexAfterCommand = 19
 	if len(fields) <= startTimeIndexAfterCommand {
 		return 0, fmt.Errorf("process stat has %d fields after command, need at least %d", len(fields), startTimeIndexAfterCommand+1)
+	}
+	if fields[0] == "Z" {
+		return 0, fmt.Errorf("process is a zombie")
 	}
 	startTicks, err := strconv.ParseUint(fields[startTimeIndexAfterCommand], 10, 64)
 	if err != nil {
