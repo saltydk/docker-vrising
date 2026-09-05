@@ -512,6 +512,126 @@ func TestPrepareOwnershipRejectsStateDirectoryReplacementDuringPublication(t *te
 	assertOwnershipMarkerAbsent(t, cfg.StateDir)
 }
 
+func TestPrepareOwnershipReservesHeldStateDirectoryDuringServerWalk(t *testing.T) {
+	requireRoot(t)
+	cfg := newIdentityTestConfig(t)
+	if err := os.Mkdir(cfg.StateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	initialMarker := filepath.Join(cfg.StateDir, ownershipMarkerName)
+	writeMatchingOwnershipMarker(t, initialMarker, testRuntimeUID, testRuntimeGID)
+	trigger := filepath.Join(cfg.ServerDir, "!state-swap-trigger")
+	writeIdentityTestFile(t, trigger)
+	persistent := filepath.Join(cfg.DataDir, "persistent.txt")
+	writeIdentityTestFile(t, persistent)
+	cfg.PUID, cfg.PGID = intPointer(testRuntimeUID), intPointer(testRuntimeGID)
+	identity, err := ResolveIdentity(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	displaced := cfg.StateDir + ".held"
+	replacementContent := filepath.Join(cfg.StateDir, "replacement.txt")
+	replaced := false
+	injected := errors.New("injected persistent-data walk failure")
+	hooks := ownershipHooks{afterEntryInspect: func(mount string, _ int, name string, _ unix.Stat_t) error {
+		if mount == "server" && name == "!state-swap-trigger" && !replaced {
+			replaced = true
+			if err := os.Rename(cfg.StateDir, displaced); err != nil {
+				return err
+			}
+			if err := os.Mkdir(cfg.StateDir, 0o700); err != nil {
+				return err
+			}
+			writeMatchingOwnershipMarker(t, filepath.Join(cfg.StateDir, ownershipMarkerName), identity.UID, identity.GID)
+			return os.WriteFile(replacementContent, []byte("replacement"), 0o600)
+		}
+		if mount == "persistent-data" && name == "persistent.txt" {
+			return injected
+		}
+		return nil
+	}}
+
+	if err := prepareOwnership(cfg, identity, hooks); err == nil {
+		t.Fatal("prepareOwnership accepted replacement StateDir during server migration")
+	}
+	if uid, gid := identityTestPathOwner(t, replacementContent); uid != 0 || gid != 0 {
+		t.Errorf("replacement content owner = %d:%d, want untouched 0:0", uid, gid)
+	}
+	if err := PrepareOwnership(cfg, identity); err != nil {
+		t.Fatal(err)
+	}
+	assertPathOwner(t, persistent, identity.UID, identity.GID)
+}
+
+func TestPrepareOwnershipRejectsInsertionAfterDirectorySnapshot(t *testing.T) {
+	requireRoot(t)
+	cfg := newIdentityTestConfig(t)
+	trigger := filepath.Join(cfg.ServerDir, "!insert-trigger")
+	writeIdentityTestFile(t, trigger)
+	inserted := filepath.Join(cfg.ServerDir, "inserted.txt")
+	cfg.PUID, cfg.PGID = intPointer(testRuntimeUID), intPointer(testRuntimeGID)
+	identity, err := ResolveIdentity(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	insertedOnce := false
+	hooks := ownershipHooks{afterEntryInspect: func(mount string, _ int, name string, _ unix.Stat_t) error {
+		if mount != "server" || name != "!insert-trigger" || insertedOnce {
+			return nil
+		}
+		insertedOnce = true
+		return os.WriteFile(inserted, []byte("late sibling"), 0o600)
+	}}
+
+	if err := prepareOwnership(cfg, identity, hooks); err == nil {
+		t.Fatal("prepareOwnership accepted a sibling inserted after the directory snapshot")
+	}
+	assertOwnershipMarkerAbsent(t, cfg.StateDir)
+}
+
+func TestPrepareOwnershipDoesNotPublishAfterFilesystemSyncFailure(t *testing.T) {
+	requireRoot(t)
+	for _, targetMount := range []string{"server", "persistent-data"} {
+		t.Run(targetMount, func(t *testing.T) {
+			cfg := newIdentityTestConfig(t)
+			external := filepath.Join(identityTestBase(t), "external.txt")
+			writeIdentityTestFile(t, external)
+			mountPath := cfg.ServerDir
+			if targetMount == "persistent-data" {
+				mountPath = cfg.DataDir
+			}
+			link := filepath.Join(mountPath, "barrier-link")
+			if err := os.Symlink(external, link); err != nil {
+				t.Fatal(err)
+			}
+			cfg.PUID, cfg.PGID = intPointer(testRuntimeUID), intPointer(testRuntimeGID)
+			identity, err := ResolveIdentity(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			injected := fmt.Errorf("injected %s syncfs failure", targetMount)
+			hooks := ownershipHooks{syncFilesystem: func(mount string, fd int) error {
+				if mount == targetMount {
+					return injected
+				}
+				return unix.Syncfs(fd)
+			}}
+
+			if err := prepareOwnership(cfg, identity, hooks); !errors.Is(err, injected) {
+				t.Fatalf("prepareOwnership() error = %v, want injected syncfs failure", err)
+			}
+			assertOwnershipMarkerAbsent(t, cfg.StateDir)
+			assertPathOwner(t, link, identity.UID, identity.GID)
+			assertPathOwner(t, external, 0, 0)
+			chownTestPath(t, link, 0, 0)
+			if err := PrepareOwnership(cfg, identity); err != nil {
+				t.Fatal(err)
+			}
+			assertPathOwner(t, link, identity.UID, identity.GID)
+		})
+	}
+}
+
 func TestPrepareOwnershipDoesNotPublishAfterRegularFileSyncFailure(t *testing.T) {
 	requireRoot(t)
 	cfg := newIdentityTestConfig(t)
@@ -743,13 +863,19 @@ func chownTestPath(t *testing.T, path string, uid, gid int) {
 
 func assertPathOwner(t *testing.T, path string, uid, gid int) {
 	t.Helper()
+	gotUID, gotGID := identityTestPathOwner(t, path)
+	if gotUID != uid || gotGID != gid {
+		t.Fatalf("%s owner = %d:%d, want %d:%d", path, gotUID, gotGID, uid, gid)
+	}
+}
+
+func identityTestPathOwner(t *testing.T, path string) (int, int) {
+	t.Helper()
 	var stat unix.Stat_t
 	if err := unix.Lstat(path, &stat); err != nil {
 		t.Fatal(err)
 	}
-	if int(stat.Uid) != uid || int(stat.Gid) != gid {
-		t.Fatalf("%s owner = %d:%d, want %d:%d", path, stat.Uid, stat.Gid, uid, gid)
-	}
+	return int(stat.Uid), int(stat.Gid)
 }
 
 func assertPathOwnerAndMode(t *testing.T, path string, uid, gid int, mode os.FileMode) {
@@ -807,4 +933,13 @@ func assertOwnershipMarkerAbsent(t *testing.T, stateDir string) {
 	if _, err := os.Lstat(filepath.Join(stateDir, ownershipMarkerName)); !os.IsNotExist(err) {
 		t.Fatalf("ownership marker error = %v, want not exist", err)
 	}
+}
+
+func writeMatchingOwnershipMarker(t *testing.T, path string, uid, gid int) {
+	t.Helper()
+	marker := []byte(fmt.Sprintf(`{"uid":%d,"gid":%d}`, uid, gid))
+	if err := os.WriteFile(path, marker, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	chownTestPath(t, path, uid, gid)
 }

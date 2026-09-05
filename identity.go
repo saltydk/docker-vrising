@@ -35,7 +35,19 @@ type ownershipHooks struct {
 	afterEntryInspect  func(string, int, string, unix.Stat_t) error
 	afterEntryOpen     func(string, int, string, int, unix.Stat_t) error
 	syncInode          func(string, string, int) error
+	syncFilesystem     func(string, int) error
 	beforeMarkerRename func() error
+}
+
+type reservedDirectory struct {
+	name string
+	fd   int
+	stat unix.Stat_t
+}
+
+type ownershipEntrySnapshot struct {
+	name string
+	stat unix.Stat_t
 }
 
 func (h ownershipHooks) inspectEntry(mount string, parent int, name string, stat unix.Stat_t) error {
@@ -57,6 +69,13 @@ func (h ownershipHooks) sync(mount, name string, fd int) error {
 		return h.syncInode(mount, name, fd)
 	}
 	return unix.Fsync(fd)
+}
+
+func (h ownershipHooks) syncfs(mount string, fd int) error {
+	if h.syncFilesystem != nil {
+		return h.syncFilesystem(mount, fd)
+	}
+	return unix.Syncfs(fd)
 }
 
 func ResolveIdentity(cfg Config) (RuntimeIdentity, error) {
@@ -122,6 +141,10 @@ func prepareOwnership(cfg Config, identity RuntimeIdentity, hooks ownershipHooks
 	if err != nil {
 		return err
 	}
+	stateName, err := stateDirectoryEntryName(cfg.ServerDir, cfg.StateDir)
+	if err != nil {
+		return err
+	}
 	stateDir, err := openDirectoryPath(cfg.StateDir, true)
 	if err != nil {
 		return fmt.Errorf("open StateDir for ownership preparation: %w", err)
@@ -155,19 +178,41 @@ func prepareOwnership(cfg Config, identity RuntimeIdentity, hooks ownershipHooks
 		return fmt.Errorf("invalidate ownership migration marker: %w", err)
 	}
 	log.Printf("ownership migration: changing server and persistent-data mounts to UID/GID %d:%d", identity.UID, identity.GID)
-	if err := lchownTree(serverFD, server, cfg.ServerDir, "server", identity, hooks); err != nil {
+	stateReservation := &reservedDirectory{name: stateName, fd: stateDir, stat: stateStat}
+	if err := lchownTree(serverFD, server, cfg.ServerDir, "server", identity, hooks, stateReservation); err != nil {
 		return fmt.Errorf("migrate server mount ownership: %w", err)
 	}
-	if err := lchownTree(persistentFD, persistent, cfg.DataDir, "persistent-data", identity, hooks); err != nil {
+	if err := lchownTree(persistentFD, persistent, cfg.DataDir, "persistent-data", identity, hooks, nil); err != nil {
 		return fmt.Errorf("migrate persistent-data mount ownership: %w", err)
 	}
 	if err := preparePrivateDirectories(stateDir, identity); err != nil {
 		return err
 	}
+	if err := syncHeldFilesystem(serverFD, server, cfg.ServerDir, "server", hooks); err != nil {
+		return fmt.Errorf("sync server mount ownership migration: %w", err)
+	}
+	if err := syncHeldFilesystem(persistentFD, persistent, cfg.DataDir, "persistent-data", hooks); err != nil {
+		return fmt.Errorf("sync persistent-data mount ownership migration: %w", err)
+	}
 	if err := writeOwnershipMarker(stateDir, cfg.StateDir, stateStat, identity, hooks); err != nil {
 		return fmt.Errorf("record ownership migration: %w", err)
 	}
 	return nil
+}
+
+func syncHeldFilesystem(pathFD int, stat unix.Stat_t, path, mount string, hooks ownershipHooks) error {
+	if err := verifyPathIdentity(path, stat); err != nil {
+		return err
+	}
+	directory, err := openHeldDirectory(pathFD, stat)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(directory)
+	if err := hooks.syncfs(mount, directory); err != nil {
+		return err
+	}
+	return verifyPathIdentity(path, stat)
 }
 
 func invalidateOwnershipMarker(stateDir int) error {
@@ -285,7 +330,20 @@ func validateRuntimeID(value int, label string, explicit bool) error {
 	return nil
 }
 
-func lchownTree(rootPathFD int, rootStat unix.Stat_t, rootPath, mount string, identity RuntimeIdentity, hooks ownershipHooks) error {
+func stateDirectoryEntryName(serverDir, stateDir string) (string, error) {
+	server := filepath.Clean(serverDir)
+	state := filepath.Clean(stateDir)
+	if filepath.Dir(state) != server {
+		return "", fmt.Errorf("StateDir must be a direct child of the server mount")
+	}
+	name := filepath.Base(state)
+	if name == "." || name == string(filepath.Separator) {
+		return "", fmt.Errorf("StateDir name is invalid")
+	}
+	return name, nil
+}
+
+func lchownTree(rootPathFD int, rootStat unix.Stat_t, rootPath, mount string, identity RuntimeIdentity, hooks ownershipHooks, reserved *reservedDirectory) error {
 	root, err := openHeldDirectory(rootPathFD, rootStat)
 	if err != nil {
 		return err
@@ -297,28 +355,30 @@ func lchownTree(rootPathFD int, rootStat unix.Stat_t, rootPath, mount string, id
 	if err := hooks.sync(mount, ".", root); err != nil {
 		return err
 	}
-	if err := lchownDirectory(root, mount, ".", identity, hooks); err != nil {
+	if err := lchownDirectory(root, mount, ".", identity, hooks, reserved); err != nil {
 		return err
 	}
 	return verifyPathIdentity(rootPath, rootStat)
 }
 
-func lchownDirectory(root int, mount, directoryName string, identity RuntimeIdentity, hooks ownershipHooks) error {
-	copyFD, err := unix.Dup(root)
+func lchownDirectory(root int, mount, directoryName string, identity RuntimeIdentity, hooks ownershipHooks, reserved *reservedDirectory) error {
+	entries, err := snapshotOwnershipDirectory(root)
 	if err != nil {
 		return err
 	}
-	directory := os.NewFile(uintptr(copyFD), "ownership migration")
-	names, err := directory.Readdirnames(-1)
-	closeErr := directory.Close()
-	if err != nil {
-		return err
-	}
-	if closeErr != nil {
-		return closeErr
-	}
-	sort.Strings(names)
-	for _, name := range names {
+	reservedFound := false
+	for _, snapshot := range entries {
+		name := snapshot.name
+		if reserved != nil && name == reserved.name {
+			reservedFound = true
+			if !sameInode(snapshot.stat, reserved.stat) || snapshot.stat.Mode&unix.S_IFMT != unix.S_IFDIR {
+				return fmt.Errorf("reserved StateDir does not match the held directory")
+			}
+			if err := migrateReservedDirectory(root, mount, identity, hooks, *reserved); err != nil {
+				return err
+			}
+			continue
+		}
 		entry, err := unix.Openat(root, name, unix.O_PATH|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 		if err != nil {
 			return err
@@ -327,6 +387,10 @@ func lchownDirectory(root int, mount, directoryName string, identity RuntimeIden
 		if err := unix.Fstat(entry, &before); err != nil {
 			unix.Close(entry)
 			return err
+		}
+		if !sameInode(snapshot.stat, before) || snapshot.stat.Mode&unix.S_IFMT != before.Mode&unix.S_IFMT {
+			unix.Close(entry)
+			return fmt.Errorf("entry changed after ownership snapshot")
 		}
 		if err := hooks.inspectEntry(mount, root, name, before); err != nil {
 			unix.Close(entry)
@@ -338,7 +402,61 @@ func lchownDirectory(root int, mount, directoryName string, identity RuntimeIden
 			return err
 		}
 	}
+	if reserved != nil && !reservedFound {
+		return fmt.Errorf("reserved StateDir is missing from the server mount")
+	}
+	current, err := snapshotOwnershipDirectory(root)
+	if err != nil {
+		return err
+	}
+	if !sameOwnershipDirectorySnapshot(entries, current) {
+		return fmt.Errorf("directory membership changed during ownership migration")
+	}
 	return hooks.sync(mount, directoryName, root)
+}
+
+func snapshotOwnershipDirectory(root int) ([]ownershipEntrySnapshot, error) {
+	copyFD, err := unix.Openat(root, ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	directory := os.NewFile(uintptr(copyFD), "ownership migration")
+	names, err := directory.Readdirnames(-1)
+	closeErr := directory.Close()
+	if err != nil {
+		return nil, err
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	sort.Strings(names)
+	entries := make([]ownershipEntrySnapshot, 0, len(names))
+	for _, name := range names {
+		entry, err := unix.Openat(root, name, unix.O_PATH|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+		if err != nil {
+			return nil, err
+		}
+		var stat unix.Stat_t
+		if err := unix.Fstat(entry, &stat); err != nil {
+			unix.Close(entry)
+			return nil, err
+		}
+		unix.Close(entry)
+		entries = append(entries, ownershipEntrySnapshot{name: name, stat: stat})
+	}
+	return entries, nil
+}
+
+func sameOwnershipDirectorySnapshot(left, right []ownershipEntrySnapshot) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index].name != right[index].name || !sameInode(left[index].stat, right[index].stat) || left[index].stat.Mode&unix.S_IFMT != right[index].stat.Mode&unix.S_IFMT {
+			return false
+		}
+	}
+	return true
 }
 
 func migrateHeldEntry(parent, entry int, mount, name string, stat unix.Stat_t, identity RuntimeIdentity, hooks ownershipHooks) error {
@@ -409,10 +527,32 @@ func migrateHeldDirectory(parent, entry int, mount, name string, stat unix.Stat_
 	if err := verifyNameIdentity(parent, name, stat); err != nil {
 		return err
 	}
-	if err := lchownDirectory(directory, mount, name, identity, hooks); err != nil {
+	if err := lchownDirectory(directory, mount, name, identity, hooks, nil); err != nil {
 		return err
 	}
 	return verifyNameIdentity(parent, name, stat)
+}
+
+func migrateReservedDirectory(parent int, mount string, identity RuntimeIdentity, hooks ownershipHooks, reserved reservedDirectory) error {
+	if err := verifyNameIdentity(parent, reserved.name, reserved.stat); err != nil {
+		return fmt.Errorf("reserved StateDir changed before migration: %w", err)
+	}
+	if err := unix.Fchown(reserved.fd, identity.UID, identity.GID); err != nil {
+		return err
+	}
+	if err := hooks.sync(mount, reserved.name, reserved.fd); err != nil {
+		return err
+	}
+	if err := verifyNameIdentity(parent, reserved.name, reserved.stat); err != nil {
+		return fmt.Errorf("reserved StateDir changed before descent: %w", err)
+	}
+	if err := lchownDirectory(reserved.fd, mount, reserved.name, identity, hooks, nil); err != nil {
+		return err
+	}
+	if err := verifyNameIdentity(parent, reserved.name, reserved.stat); err != nil {
+		return fmt.Errorf("reserved StateDir changed after migration: %w", err)
+	}
+	return nil
 }
 
 func openHeldDirectory(pathFD int, want unix.Stat_t) (int, error) {
