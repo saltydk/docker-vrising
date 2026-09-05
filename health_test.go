@@ -1,7 +1,9 @@
 package main
 
 import (
+	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -76,6 +78,33 @@ func TestProcInspectorRejectsMalformedStat(t *testing.T) {
 	_, err := (procFSInspector{Root: root}).Identity(42)
 	if err == nil {
 		t.Fatal("Identity() accepted malformed stat data")
+	}
+}
+
+func TestHealthRejectsZombieAndDeadProcessStates(t *testing.T) {
+	for _, processState := range []string{"Z", "X", "x"} {
+		t.Run(processState, func(t *testing.T) {
+			state := healthyRuntimeState()
+			root := t.TempDir()
+			pidDir := filepath.Join(root, fmt.Sprint(state.Runtime.Server.PID))
+			if err := os.Mkdir(pidDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			fields := []string{processState}
+			for range 18 {
+				fields = append(fields, "1")
+			}
+			fields = append(fields, fmt.Sprint(state.Runtime.Server.StartTicks))
+			stat := fmt.Sprintf("%d (server worker) %s\n", state.Runtime.Server.PID, strings.Join(fields, " "))
+			if err := os.WriteFile(filepath.Join(pidDir, "stat"), []byte(stat), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			err := CheckHealth(state, procFSInspector{Root: root})
+			if err == nil || !strings.Contains(err.Error(), "not running") {
+				t.Fatalf("CheckHealth() error = %v, want dead process rejection", err)
+			}
+		})
 	}
 }
 

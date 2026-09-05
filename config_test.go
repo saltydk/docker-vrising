@@ -52,6 +52,7 @@ func TestLoadConfigRejectsInvalidValues(t *testing.T) {
 		{name: "zero duration", env: map[string]string{"STARTUP_TIMEOUT": "0s"}},
 		{name: "negative duration", env: map[string]string{"SHUTDOWN_TIMEOUT": "-1s"}},
 		{name: "backup retention", env: map[string]string{"BACKUP_RETENTION": "0"}},
+		{name: "log retention too large", env: map[string]string{"LOGDAYS": "365001"}},
 		{name: "only puid", env: map[string]string{"PUID": "1000"}},
 		{name: "non-numeric ids", env: map[string]string{"PUID": "user", "PGID": "1000"}},
 		{name: "kindred version", env: map[string]string{"KINDRED_COMMANDS_VERSION": "v1.2"}},
@@ -63,6 +64,16 @@ func TestLoadConfigRejectsInvalidValues(t *testing.T) {
 				t.Fatal("LoadConfig succeeded for invalid environment")
 			}
 		})
+	}
+}
+
+func TestLoadConfigAcceptsMaximumLogRetention(t *testing.T) {
+	cfg, _, err := LoadConfig(map[string]string{"LOGDAYS": "365000"})
+	if err != nil {
+		t.Fatalf("LoadConfig() error = %v", err)
+	}
+	if cfg.LogDays != 365000 {
+		t.Fatalf("LogDays = %d, want 365000", cfg.LogDays)
 	}
 }
 

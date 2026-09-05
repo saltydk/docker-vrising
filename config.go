@@ -11,6 +11,8 @@ import (
 
 var semanticVersion = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
 
+const maxLogDays = 365000
+
 type Config struct {
 	ServerDir       string
 	DataDir         string
@@ -62,6 +64,9 @@ func LoadConfig(env map[string]string) (Config, []string, error) {
 	}
 	if cfg.LogDays, err = intValue(env, "LOGDAYS", cfg.LogDays, 1); err != nil {
 		return Config{}, nil, err
+	}
+	if cfg.LogDays > maxLogDays {
+		return Config{}, nil, fmt.Errorf("LOGDAYS must be at most %d", maxLogDays)
 	}
 	if cfg.StartupTimeout, err = durationValue(env, "STARTUP_TIMEOUT", cfg.StartupTimeout); err != nil {
 		return Config{}, nil, err

@@ -9,8 +9,11 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestReadinessRequiresServerBepInExVCFAndKindred(t *testing.T) {
@@ -72,6 +75,130 @@ func TestReadinessRejectsFatalBepInExOutput(t *testing.T) {
 	}
 }
 
+func TestReadinessFinalBarrierRejectsCrossFileFatalAfterReadyEvidence(t *testing.T) {
+	root := t.TempDir()
+	serverLog := filepath.Join(root, "server.log")
+	bepInExLog := filepath.Join(root, "bepinex.log")
+	writeLog(t, serverLog, "prior run\n")
+	writeLog(t, bepInExLog, "prior run\n")
+
+	observed := newReadinessOutput()
+	output := &injectingReadinessOutput{
+		Writer: observed,
+		match:  "[Server] Startup Completed",
+		inject: func() error {
+			return appendLogError(bepInExLog, "[Fatal : BepInEx] startup aborted\n")
+		},
+	}
+	monitor := ReadinessMonitor{ServerLog: serverLog, BepInExLog: bepInExLog, Output: output, PollEvery: 2 * time.Millisecond}
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	result := waitForReadiness(monitor, ctx, ExpectedReadiness{RequireMods: true, KindredVersion: "2.5.8"})
+	appendUntilObserved(t, serverLog, observed.server, result)
+	appendUntilObserved(t, bepInExLog, observed.bepinex, result)
+	appendLog(t, bepInExLog, readLogFixture(t, "bepinex-ready.log"))
+	waitForOutput(t, observed, "Plugin aa.odjit.KindredCommands version 2.5.8 is loaded!", result)
+	appendLog(t, serverLog, readLogFixture(t, "server-ready.log"))
+
+	err := <-result
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "fatal") {
+		t.Fatalf("Wait() error = %v, want cross-file fatal from final drain; output = %q", err, observed.String())
+	}
+	if output.Err() != nil {
+		t.Fatalf("fatal injection error = %v", output.Err())
+	}
+}
+
+func TestReadinessFinalBarrierDrainsBoundedBacklogBeforeReady(t *testing.T) {
+	root := t.TempDir()
+	serverLog := filepath.Join(root, "server.log")
+	bepInExLog := filepath.Join(root, "bepinex.log")
+	writeLog(t, serverLog, "prior run\n")
+	writeLog(t, bepInExLog, "prior run\n")
+	output := newReadinessOutput()
+	monitor := ReadinessMonitor{ServerLog: serverLog, BepInExLog: bepInExLog, Output: output, PollEvery: 2 * time.Millisecond}
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	result := waitForReadiness(monitor, ctx, ExpectedReadiness{RequireMods: true, KindredVersion: "2.5.8"})
+	appendUntilObserved(t, serverLog, output.server, result)
+	appendUntilObserved(t, bepInExLog, output.bepinex, result)
+	appendLog(t, serverLog, readLogFixture(t, "server-ready.log"))
+	if err := os.Rename(bepInExLog, bepInExLog+".baseline"); err != nil {
+		t.Fatal(err)
+	}
+	writeLog(t, bepInExLog,
+		readLogFixture(t, "bepinex-ready.log")+
+			strings.Repeat("bounded backlog line\n", 125000)+
+			"[Fatal : BepInEx] trailing startup failure\n")
+
+	err := <-result
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "fatal") {
+		t.Fatalf("Wait() error = %v, want fatal beyond bounded batches", err)
+	}
+}
+
+func TestReadinessDrainsRotatedOldBacklogBeforeAdoptingReplacement(t *testing.T) {
+	root := t.TempDir()
+	serverLog := filepath.Join(root, "server.log")
+	bepInExLog := filepath.Join(root, "bepinex.log")
+	writeLog(t, serverLog, "prior run\n")
+	writeLog(t, bepInExLog, "prior run\n")
+	output := newReadinessOutput()
+	monitor := ReadinessMonitor{ServerLog: serverLog, BepInExLog: bepInExLog, Output: output, PollEvery: 2 * time.Millisecond}
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	result := waitForReadiness(monitor, ctx, ExpectedReadiness{RequireMods: true, KindredVersion: "2.5.8"})
+	appendUntilObserved(t, serverLog, output.server, result)
+	appendUntilObserved(t, bepInExLog, output.bepinex, result)
+	appendLog(t, serverLog, readLogFixture(t, "server-ready.log"))
+	appendLog(t, bepInExLog,
+		readLogFixture(t, "bepinex-ready.log")+
+			strings.Repeat("old descriptor backlog\n", 125000)+
+			"[Fatal : BepInEx] fatal at old descriptor tail\n")
+	if err := os.Rename(bepInExLog, bepInExLog+".previous"); err != nil {
+		t.Fatal(err)
+	}
+	writeLog(t, bepInExLog, "new generation\n")
+
+	err := <-result
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "fatal") {
+		t.Fatalf("Wait() error = %v, want fatal from rotated old backlog", err)
+	}
+}
+
+func TestReadinessFinalBarrierRejectsServerFatalAfterModReadyEvidence(t *testing.T) {
+	root := t.TempDir()
+	serverLog := filepath.Join(root, "server.log")
+	bepInExLog := filepath.Join(root, "bepinex.log")
+	writeLog(t, serverLog, "prior run\n")
+	writeLog(t, bepInExLog, "prior run\n")
+	observed := newReadinessOutput()
+	output := &injectingReadinessOutput{
+		Writer: observed,
+		match:  "Plugin aa.odjit.KindredCommands version 2.5.8 is loaded!",
+		inject: func() error {
+			return appendLogError(serverLog, "[Fatal : Doorstop] server-side startup failure\n")
+		},
+	}
+	monitor := ReadinessMonitor{ServerLog: serverLog, BepInExLog: bepInExLog, Output: output, PollEvery: 2 * time.Millisecond}
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	result := waitForReadiness(monitor, ctx, ExpectedReadiness{RequireMods: true, KindredVersion: "2.5.8"})
+	appendUntilObserved(t, serverLog, observed.server, result)
+	appendUntilObserved(t, bepInExLog, observed.bepinex, result)
+	appendLog(t, serverLog, readLogFixture(t, "server-ready.log"))
+	waitForOutput(t, observed, "[Server] Startup Completed", result)
+	appendLog(t, bepInExLog, readLogFixture(t, "bepinex-ready.log"))
+
+	err := <-result
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "fatal") {
+		t.Fatalf("Wait() error = %v, want server fatal from final drain", err)
+	}
+	if output.Err() != nil {
+		t.Fatalf("fatal injection error = %v", output.Err())
+	}
+}
+
 func TestReadinessRequiresExpectedKindredVersion(t *testing.T) {
 	root := t.TempDir()
 	serverLog := filepath.Join(root, "server.log")
@@ -112,6 +239,159 @@ func TestReadinessTimesOut(t *testing.T) {
 	}).Wait(ctx, ExpectedReadiness{RequireMods: true, KindredVersion: "2.5.8"})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Wait() error = %v, want deadline exceeded", err)
+	}
+}
+
+func TestReadinessRejectsOversizedUnterminatedLine(t *testing.T) {
+	root := t.TempDir()
+	serverLog := filepath.Join(root, "server.log")
+	writeLog(t, serverLog, "prior run\n")
+	output := newReadinessOutput()
+	monitor := ReadinessMonitor{ServerLog: serverLog, Output: output, PollEvery: 2 * time.Millisecond}
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	result := waitForReadiness(monitor, ctx, ExpectedReadiness{})
+	appendUntilObserved(t, serverLog, output.server, result)
+	if err := os.Rename(serverLog, serverLog+".baseline"); err != nil {
+		t.Fatal(err)
+	}
+	writeLog(t, serverLog, strings.Repeat("x", (1<<20)+1))
+
+	err := <-result
+	if err == nil || !strings.Contains(err.Error(), "line exceeds") {
+		t.Fatalf("Wait() error = %v, want oversized line rejection", err)
+	}
+}
+
+func TestReadinessChecksCancellationBetweenBoundedChunks(t *testing.T) {
+	root := t.TempDir()
+	serverLog := filepath.Join(root, "server.log")
+	writeLog(t, serverLog, "prior run\n")
+	output := newReadinessOutput()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	var armed atomic.Bool
+	var chunks atomic.Int32
+	var largest atomic.Int64
+	monitor := ReadinessMonitor{
+		ServerLog: serverLog,
+		Output:    output,
+		PollEvery: 2 * time.Millisecond,
+		testHooks: &readinessTestHooks{readChunk: func(_ string, size int) {
+			if !armed.Load() {
+				return
+			}
+			chunks.Add(1)
+			largest.Store(max(largest.Load(), int64(size)))
+			cancel()
+		}},
+	}
+	result := waitForReadiness(monitor, ctx, ExpectedReadiness{})
+	appendUntilObserved(t, serverLog, output.server, result)
+	if err := os.Rename(serverLog, serverLog+".baseline"); err != nil {
+		t.Fatal(err)
+	}
+	armed.Store(true)
+	writeLog(t, serverLog, strings.Repeat("noise line\n", 400000))
+
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Wait() error = %v, want context cancellation", err)
+	}
+	if got := chunks.Load(); got != 1 {
+		t.Fatalf("chunks read after cancellation = %d, want 1", got)
+	}
+	if got := largest.Load(); got > 64<<10 {
+		t.Fatalf("largest read chunk = %d, want at most 65536", got)
+	}
+}
+
+func TestReadinessCapsEachFollowerDrainAtOneMiB(t *testing.T) {
+	root := t.TempDir()
+	serverLog := filepath.Join(root, "server.log")
+	follower, err := newLogFollower(serverLog, "server")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer follower.close()
+	writeLog(t, serverLog, strings.Repeat("bounded line\n", 200000))
+	if lines, err := follower.readAvailable(); err != nil || len(lines) != 0 {
+		t.Fatalf("first handoff observation = %d lines, %v", len(lines), err)
+	}
+	lines, err := follower.readAvailable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	readBytes := 0
+	for _, line := range lines {
+		readBytes += len(line) + 1
+	}
+	if readBytes == 0 || readBytes > 1<<20 {
+		t.Fatalf("first drain input = %d bytes, want 1..1048576", readBytes)
+	}
+	if !follower.more {
+		t.Fatal("first bounded drain did not report remaining input")
+	}
+}
+
+func TestReadinessRejectsFIFOWithoutBlocking(t *testing.T) {
+	root := t.TempDir()
+	fifo := filepath.Join(root, "server.log")
+	if err := unix.Mkfifo(fifo, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result := waitForReadiness(ReadinessMonitor{ServerLog: fifo}, t.Context(), ExpectedReadiness{})
+	select {
+	case err := <-result:
+		if err == nil || !strings.Contains(err.Error(), "regular file") {
+			t.Fatalf("Wait() error = %v, want non-regular log rejection", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		unblockFIFO(t, fifo)
+		<-result
+		t.Fatal("Wait() blocked opening a FIFO")
+	}
+}
+
+func TestReadinessRejectsLateFIFOAndJoinsWatchers(t *testing.T) {
+	root := t.TempDir()
+	serverLog := filepath.Join(root, "server.log")
+	writeLog(t, serverLog, "prior run\n")
+	output := newReadinessOutput()
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	result := waitForReadiness(ReadinessMonitor{ServerLog: serverLog, Output: output, PollEvery: 2 * time.Millisecond}, ctx, ExpectedReadiness{})
+	appendUntilObserved(t, serverLog, output.server, result)
+	if err := os.Rename(serverLog, serverLog+".baseline"); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Mkfifo(serverLog, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if err == nil || !strings.Contains(err.Error(), "regular file") {
+			t.Fatalf("Wait() error = %v, want non-regular late log rejection", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		unblockFIFO(t, serverLog)
+		<-result
+		t.Fatal("Wait() left a watcher blocked opening a late FIFO")
+	}
+}
+
+func TestReadinessRejectsSymlinkedLog(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target.log")
+	writeLog(t, target, "log\n")
+	serverLog := filepath.Join(root, "server.log")
+	if err := os.Symlink(target, serverLog); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	err := (ReadinessMonitor{ServerLog: serverLog}).Wait(ctx, ExpectedReadiness{})
+	if err == nil || errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Wait() error = %v, want immediate symlink rejection", err)
 	}
 }
 
@@ -166,6 +446,11 @@ func TestReadinessHandlesTruncationAndRotation(t *testing.T) {
 	appendUntilObserved(t, serverLog, output.server, result)
 	appendUntilObserved(t, bepInExLog, output.bepinex, result)
 
+	if err := os.Rename(serverLog, serverLog+".baseline"); err != nil {
+		t.Fatal(err)
+	}
+	writeLog(t, serverLog, "current server generation\n")
+	waitForOutput(t, output, "current server generation", result)
 	writeLog(t, serverLog, readLogFixture(t, "server-ready.log"))
 	appendLog(t, bepInExLog, "[Message: BepInEx] Chainloader startup complete\n")
 	appendLog(t, bepInExLog, "Plugin gg.deca.VampireCommandFramework version 0.10.4 is loaded!\n")
@@ -179,7 +464,102 @@ func TestReadinessHandlesTruncationAndRotation(t *testing.T) {
 	}
 }
 
-func TestReadinessDetectsTruncateAndRegrowPastPreviousOffset(t *testing.T) {
+func TestReadinessDrainsAppendDuringRotationHandoff(t *testing.T) {
+	root := t.TempDir()
+	serverLog := filepath.Join(root, "server.log")
+	bepInExLog := filepath.Join(root, "bepinex.log")
+	previousBepInExLog := bepInExLog + ".previous"
+	writeLog(t, serverLog, "prior run\n")
+	writeLog(t, bepInExLog, "prior run\n")
+
+	output := newReadinessOutput()
+	var injectOnce sync.Once
+	var injectErr error
+	monitor := ReadinessMonitor{
+		ServerLog:  serverLog,
+		BepInExLog: bepInExLog,
+		Output:     output,
+		PollEvery:  2 * time.Millisecond,
+		testHooks: &readinessTestHooks{replacementDetected: func(source string) {
+			if source == "bepinex" {
+				injectOnce.Do(func() {
+					injectErr = appendLogError(previousBepInExLog,
+						"[Message: BepInEx] Chainloader startup complete\n"+
+							"Plugin gg.deca.VampireCommandFramework version 0.10.4 is loaded!\n")
+				})
+			}
+		}},
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	result := waitForReadiness(monitor, ctx, ExpectedReadiness{RequireMods: true, KindredVersion: "2.5.8"})
+	appendUntilObserved(t, serverLog, output.server, result)
+	appendUntilObserved(t, bepInExLog, output.bepinex, result)
+	appendLog(t, serverLog, readLogFixture(t, "server-ready.log"))
+	if err := os.Rename(bepInExLog, previousBepInExLog); err != nil {
+		t.Fatal(err)
+	}
+	writeLog(t, bepInExLog, "Plugin aa.odjit.KindredCommands version 2.5.8 is loaded!\n")
+
+	if err := <-result; err != nil {
+		t.Fatalf("Wait() error = %v; output = %q", err, output.String())
+	}
+	if injectErr != nil {
+		t.Fatalf("handoff append error = %v", injectErr)
+	}
+}
+
+func TestReadinessRetainsOldDescriptorThroughStableGracePoll(t *testing.T) {
+	root := t.TempDir()
+	serverLog := filepath.Join(root, "server.log")
+	writeLog(t, serverLog, "prior run\n")
+	output := newReadinessOutput()
+	detected := make(chan struct{})
+	adopted := make(chan struct{})
+	var detectOnce sync.Once
+	var adoptOnce sync.Once
+	monitor := ReadinessMonitor{
+		ServerLog: serverLog,
+		Output:    output,
+		PollEvery: 50 * time.Millisecond,
+		testHooks: &readinessTestHooks{
+			replacementDetected: func(string) { detectOnce.Do(func() { close(detected) }) },
+			generationAdopted:   func(string) { adoptOnce.Do(func() { close(adopted) }) },
+		},
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	result := waitForReadiness(monitor, ctx, ExpectedReadiness{})
+	appendUntilObserved(t, serverLog, output.server, result)
+	if err := os.Rename(serverLog, serverLog+".baseline"); err != nil {
+		t.Fatal(err)
+	}
+	writeLog(t, serverLog, readLogFixture(t, "server-ready.log"))
+	select {
+	case <-detected:
+	case err := <-result:
+		t.Fatalf("Wait() returned before replacement detection: %v", err)
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("replacement was not detected")
+	}
+	select {
+	case <-adopted:
+		t.Fatal("replacement was adopted without a stable grace poll")
+	case <-time.After(20 * time.Millisecond):
+	}
+	select {
+	case <-adopted:
+	case err := <-result:
+		t.Fatalf("Wait() returned before replacement adoption: %v", err)
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("replacement was not adopted after the grace poll")
+	}
+	if err := <-result; err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+}
+
+func TestReadinessDetectsCurrentGenerationTruncateAndRegrowPastPreviousOffset(t *testing.T) {
 	root := t.TempDir()
 	serverLog := filepath.Join(root, "server.log")
 	writeLog(t, serverLog, strings.Repeat("x", 30)+"\n")
@@ -188,9 +568,19 @@ func TestReadinessDetectsTruncateAndRegrowPastPreviousOffset(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer follower.close()
+	if err := os.Rename(serverLog, serverLog+".baseline"); err != nil {
+		t.Fatal(err)
+	}
+	writeLog(t, serverLog, strings.Repeat("y", 30)+"\n")
+	if lines, err := follower.readAvailable(); err != nil || len(lines) != 0 {
+		t.Fatalf("first current generation observation = %q, %v", lines, err)
+	}
+	if lines, err := follower.readAvailable(); err != nil || len(lines) != 1 || lines[0] != strings.Repeat("y", 30) {
+		t.Fatalf("current generation = %q, %v", lines, err)
+	}
 	appendLog(t, serverLog, "follower probe\n")
 	if lines, err := follower.readAvailable(); err != nil || len(lines) != 1 || lines[0] != "follower probe" {
-		t.Fatalf("initial append = %q, %v", lines, err)
+		t.Fatalf("current generation append = %q, %v", lines, err)
 	}
 
 	ready := strings.TrimSuffix(readLogFixture(t, "server-ready.log"), "\n")
@@ -201,6 +591,153 @@ func TestReadinessDetectsTruncateAndRegrowPastPreviousOffset(t *testing.T) {
 	}
 	if len(lines) != 1 || lines[0] != ready {
 		t.Fatalf("lines after truncate and regrow = %q, want complete current log line", lines)
+	}
+}
+
+func TestReadinessTreatsTruncateBetweenReadAndAnchorAsTransition(t *testing.T) {
+	root := t.TempDir()
+	serverLog := filepath.Join(root, "server.log")
+	follower, err := newLogFollower(serverLog, "server")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer follower.close()
+	writeLog(t, serverLog, "current generation\n")
+	if lines, err := follower.readAvailable(); err != nil || len(lines) != 0 {
+		t.Fatalf("first handoff observation = %q, %v", lines, err)
+	}
+	if lines, err := follower.readAvailable(); err != nil || len(lines) != 1 || lines[0] != "current generation" {
+		t.Fatal(err)
+	}
+
+	ready := readLogFixture(t, "server-ready.log")
+	var truncateOnce sync.Once
+	var truncateErr error
+	follower.testHooks = &readinessTestHooks{afterReadChunk: func(source string) {
+		truncateOnce.Do(func() {
+			truncateErr = os.WriteFile(serverLog, []byte(ready), 0o600)
+		})
+	}}
+	appendLog(t, serverLog, "line read before truncate\n")
+	if _, err := follower.readAvailable(); err != nil {
+		t.Fatalf("read across concurrent truncate: %v", err)
+	}
+	if truncateErr != nil {
+		t.Fatalf("truncate error = %v", truncateErr)
+	}
+	lines, err := follower.readAvailable()
+	if err != nil {
+		t.Fatalf("read after truncate transition: %v", err)
+	}
+	if len(lines) != 1 || lines[0] != strings.TrimSuffix(ready, "\n") {
+		t.Fatalf("lines after truncate transition = %q", lines)
+	}
+}
+
+func TestReadinessDoesNotReplayTruncatedBaselinedInode(t *testing.T) {
+	root := t.TempDir()
+	serverLog := filepath.Join(root, "server.log")
+	writeLog(t, serverLog, readLogFixture(t, "server-ready.log")+strings.Repeat("stale\n", 64))
+	output := newReadinessOutput()
+	monitor := ReadinessMonitor{ServerLog: serverLog, Output: output, PollEvery: 2 * time.Millisecond}
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	result := waitForReadiness(monitor, ctx, ExpectedReadiness{})
+	appendUntilObserved(t, serverLog, output.server, result)
+
+	writeLog(t, serverLog, readLogFixture(t, "server-ready.log"))
+	select {
+	case err := <-result:
+		t.Fatalf("Wait() replayed a truncated baselined inode: %v", err)
+	case <-time.After(40 * time.Millisecond):
+	}
+	if err := os.Rename(serverLog, serverLog+".baseline"); err != nil {
+		t.Fatal(err)
+	}
+	writeLog(t, serverLog, readLogFixture(t, "server-ready.log"))
+	if err := <-result; err != nil {
+		t.Fatalf("Wait() error for new current inode = %v", err)
+	}
+}
+
+func TestReadinessInvalidatesBaselinedEvidenceTruncatedDuringRead(t *testing.T) {
+	root := t.TempDir()
+	serverLog := filepath.Join(root, "server.log")
+	writeLog(t, serverLog, "prior run\n")
+	output := newReadinessOutput()
+	var armed atomic.Bool
+	var truncateOnce sync.Once
+	var truncateErr error
+	monitor := ReadinessMonitor{
+		ServerLog: serverLog,
+		Output:    output,
+		PollEvery: 2 * time.Millisecond,
+		testHooks: &readinessTestHooks{afterReadChunk: func(string) {
+			if armed.Load() {
+				truncateOnce.Do(func() {
+					truncateErr = os.WriteFile(serverLog, []byte("truncated baseline\n"), 0o600)
+				})
+			}
+		}},
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	result := waitForReadiness(monitor, ctx, ExpectedReadiness{})
+	appendUntilObserved(t, serverLog, output.server, result)
+	armed.Store(true)
+	appendLog(t, serverLog, readLogFixture(t, "server-ready.log"))
+	select {
+	case err := <-result:
+		t.Fatalf("Wait() retained evidence from a truncated baseline: %v", err)
+	case <-time.After(40 * time.Millisecond):
+	}
+	if truncateErr != nil {
+		t.Fatalf("truncate error = %v", truncateErr)
+	}
+	if err := os.Rename(serverLog, serverLog+".baseline"); err != nil {
+		t.Fatal(err)
+	}
+	writeLog(t, serverLog, readLogFixture(t, "server-ready.log"))
+	if err := <-result; err != nil {
+		t.Fatalf("Wait() error for new inode = %v", err)
+	}
+}
+
+func TestReadinessNeverSwitchesBackToBaselinedInode(t *testing.T) {
+	root := t.TempDir()
+	serverLog := filepath.Join(root, "server.log")
+	baselineLog := filepath.Join(root, "baseline.log")
+	writeLog(t, serverLog, "baseline\n")
+	output := newReadinessOutput()
+	monitor := ReadinessMonitor{ServerLog: serverLog, Output: output, PollEvery: 2 * time.Millisecond}
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	result := waitForReadiness(monitor, ctx, ExpectedReadiness{})
+	appendUntilObserved(t, serverLog, output.server, result)
+
+	if err := os.Rename(serverLog, baselineLog); err != nil {
+		t.Fatal(err)
+	}
+	writeLog(t, serverLog, "current generation probe\n")
+	waitForOutput(t, output, "current generation probe", result)
+	if err := os.Remove(serverLog); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(baselineLog, serverLog); err != nil {
+		t.Fatal(err)
+	}
+	appendLog(t, serverLog, readLogFixture(t, "server-ready.log"))
+	select {
+	case err := <-result:
+		t.Fatalf("Wait() switched back to the baselined inode: %v", err)
+	case <-time.After(40 * time.Millisecond):
+	}
+	if err := os.Rename(serverLog, baselineLog); err != nil {
+		t.Fatal(err)
+	}
+	writeLog(t, serverLog, readLogFixture(t, "server-ready.log"))
+	if err := <-result; err != nil {
+		t.Fatalf("Wait() error for later current inode = %v", err)
 	}
 }
 
@@ -291,6 +828,144 @@ func TestPruneLogsNeverTraversesSubdirectories(t *testing.T) {
 	}
 }
 
+func TestPruneLogsPreservesFileChangedBeforeFinalReopen(t *testing.T) {
+	now := time.Date(2026, time.September, 5, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-8 * 24 * time.Hour)
+	tests := []struct {
+		name   string
+		change func(t *testing.T, path string)
+	}{
+		{
+			name: "append",
+			change: func(t *testing.T, path string) {
+				appendLog(t, path, "changed\n")
+			},
+		},
+		{
+			name: "replace",
+			change: func(t *testing.T, path string) {
+				if err := os.Rename(path, path+".original"); err != nil {
+					t.Fatal(err)
+				}
+				writeLog(t, path, "replacement\n")
+				if err := os.Chtimes(path, old, old); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "refresh mtime",
+			change: func(t *testing.T, path string) {
+				if err := os.Chtimes(path, now, now); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			name := "20260828-1200-VRisingServer.log"
+			path := filepath.Join(root, name)
+			writeDatedLog(t, root, name, old)
+			changed := false
+			err := pruneLogsWithHooks(root, 7, now, pruneTestHooks{
+				beforeReopen: func(got string) {
+					if got == name && !changed {
+						changed = true
+						tt.change(t, path)
+					}
+				},
+			})
+			if err == nil || !strings.Contains(err.Error(), "changed during pruning") {
+				t.Fatalf("pruneLogsWithHooks() error = %v, want changed-file rejection", err)
+			}
+			if _, err := os.Lstat(path); err != nil {
+				t.Fatalf("changed log was not preserved: %v", err)
+			}
+		})
+	}
+}
+
+func TestPruneLogsFinalReopenRejectsFIFOWithoutBlocking(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, time.September, 5, 12, 0, 0, 0, time.UTC)
+	name := "20260828-1200-VRisingServer.log"
+	path := filepath.Join(root, name)
+	writeDatedLog(t, root, name, now.Add(-8*24*time.Hour))
+	var hookErr error
+	result := make(chan error, 1)
+	go func() {
+		result <- pruneLogsWithHooks(root, 7, now, pruneTestHooks{beforeReopen: func(string) {
+			hookErr = os.Rename(path, path+".original")
+			if hookErr == nil {
+				hookErr = unix.Mkfifo(path, 0o600)
+			}
+		}})
+	}()
+	select {
+	case err := <-result:
+		if hookErr != nil {
+			t.Fatalf("replacement hook error = %v", hookErr)
+		}
+		if err == nil || !strings.Contains(err.Error(), "changed during pruning") {
+			t.Fatalf("pruneLogsWithHooks() error = %v, want FIFO replacement rejection", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		unblockFIFO(t, path)
+		<-result
+		t.Fatal("prune final reopen blocked on a FIFO")
+	}
+	if info, err := os.Lstat(path); err != nil || info.Mode()&os.ModeNamedPipe == 0 {
+		t.Fatalf("replacement FIFO info = %v, %v", info, err)
+	}
+}
+
+func TestPruneLogsFsyncsDataDirectoryAfterUnlink(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, time.September, 5, 12, 0, 0, 0, time.UTC)
+	writeDatedLog(t, root, "20260828-1200-VRisingServer.log", now.Add(-8*24*time.Hour))
+	syncs := 0
+	err := pruneLogsWithHooks(root, 7, now, pruneTestHooks{syncDirectory: func(int) error {
+		syncs++
+		return nil
+	}})
+	if err != nil {
+		t.Fatalf("pruneLogsWithHooks() error = %v", err)
+	}
+	if syncs != 1 {
+		t.Fatalf("DataDir fsync calls = %d, want 1", syncs)
+	}
+}
+
+func TestPruneLogsReportsDataDirectoryFsyncFailure(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, time.September, 5, 12, 0, 0, 0, time.UTC)
+	name := "20260828-1200-VRisingServer.log"
+	writeDatedLog(t, root, name, now.Add(-8*24*time.Hour))
+	want := errors.New("sync failed")
+	err := pruneLogsWithHooks(root, 7, now, pruneTestHooks{syncDirectory: func(int) error { return want }})
+	if !errors.Is(err, want) {
+		t.Fatalf("pruneLogsWithHooks() error = %v, want sync failure", err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, name)); !os.IsNotExist(err) {
+		t.Fatalf("unlinked log stat error = %v, want not exist", err)
+	}
+}
+
+func TestPruneLogsRejectsExcessiveRetentionBeforeDeletion(t *testing.T) {
+	root := t.TempDir()
+	now := time.Date(2026, time.September, 5, 12, 0, 0, 0, time.UTC)
+	name := "20200101-0000-VRisingServer.log"
+	writeDatedLog(t, root, name, now.Add(-2000*24*time.Hour))
+	if err := PruneLogs(root, 365001, now); err == nil {
+		t.Fatal("PruneLogs() accepted retention above 1000 years")
+	}
+	if _, err := os.Stat(filepath.Join(root, name)); err != nil {
+		t.Fatalf("log changed before retention validation: %v", err)
+	}
+}
+
 type readinessOutput struct {
 	mu          sync.Mutex
 	buffer      bytes.Buffer
@@ -298,6 +973,32 @@ type readinessOutput struct {
 	bepinex     chan struct{}
 	serverOnce  sync.Once
 	bepinexOnce sync.Once
+}
+
+type injectingReadinessOutput struct {
+	io.Writer
+	match  string
+	inject func() error
+	once   sync.Once
+	mu     sync.Mutex
+	err    error
+}
+
+func (o *injectingReadinessOutput) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte(o.match)) {
+		o.once.Do(func() {
+			o.mu.Lock()
+			o.err = o.inject()
+			o.mu.Unlock()
+		})
+	}
+	return o.Writer.Write(p)
+}
+
+func (o *injectingReadinessOutput) Err() error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.err
 }
 
 func newReadinessOutput() *readinessOutput {
@@ -350,6 +1051,26 @@ func appendUntilObserved(t *testing.T, path string, observed <-chan struct{}, re
 	}
 }
 
+func waitForOutput(t *testing.T, output *readinessOutput, substring string, result <-chan error) {
+	t.Helper()
+	ticker := time.NewTicker(2 * time.Millisecond)
+	defer ticker.Stop()
+	timeout := time.NewTimer(time.Second)
+	defer timeout.Stop()
+	for {
+		if strings.Contains(output.String(), substring) {
+			return
+		}
+		select {
+		case err := <-result:
+			t.Fatalf("Wait() returned before output contained %q: %v", substring, err)
+		case <-ticker.C:
+		case <-timeout.C:
+			t.Fatalf("output did not contain %q: %q", substring, output.String())
+		}
+	}
+}
+
 func readLogFixture(t *testing.T, name string) string {
 	t.Helper()
 	content, err := os.ReadFile(filepath.Join("testdata", "logs", name))
@@ -368,17 +1089,24 @@ func writeLog(t *testing.T, path, content string) {
 
 func appendLog(t *testing.T, path, content string) {
 	t.Helper()
+	if err := appendLogError(path, content); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func appendLogError(path, content string) error {
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
-		t.Fatal(err)
+		return err
 	}
 	if _, err := io.WriteString(file, content); err != nil {
 		file.Close()
-		t.Fatal(err)
+		return err
 	}
 	if err := file.Close(); err != nil {
-		t.Fatal(err)
+		return err
 	}
+	return nil
 }
 
 func writeDatedLog(t *testing.T, root, name string, modified time.Time) {
@@ -408,4 +1136,15 @@ func countOpenPath(t *testing.T, path string) int {
 		}
 	}
 	return count
+}
+
+func unblockFIFO(t *testing.T, path string) {
+	t.Helper()
+	fd, err := unix.Open(path, unix.O_WRONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Close(fd); err != nil {
+		t.Fatal(err)
+	}
 }

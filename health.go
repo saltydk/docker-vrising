@@ -40,6 +40,12 @@ func (p procFSInspector) Identity(pid int) (ProcessIdentity, error) {
 	if len(fields) <= startTimeIndexAfterCommand {
 		return ProcessIdentity{}, fmt.Errorf("malformed process stat")
 	}
+	if len(fields[0]) != 1 {
+		return ProcessIdentity{}, fmt.Errorf("malformed process state")
+	}
+	if fields[0] == "Z" || fields[0] == "X" || fields[0] == "x" {
+		return ProcessIdentity{}, fmt.Errorf("process is not running: %w", fs.ErrNotExist)
+	}
 	startTicks, err := strconv.ParseUint(fields[startTimeIndexAfterCommand], 10, 64)
 	if err != nil || startTicks == 0 {
 		return ProcessIdentity{}, fmt.Errorf("malformed process start ticks")
