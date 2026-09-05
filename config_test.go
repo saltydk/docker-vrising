@@ -137,14 +137,13 @@ func TestLoadConfigParsesValuesAndPreservesGameEnvironment(t *testing.T) {
 	}
 }
 
-func TestCommandDispatchProvidesCompileSafeStubs(t *testing.T) {
+func TestCommandDispatchHandlesNonRunCommands(t *testing.T) {
 	tests := []struct {
 		name    string
 		args    []string
 		wantOut string
 		want    int
 	}{
-		{name: "run", args: []string{"run"}, wantOut: "runtime not implemented\n", want: exitPreflight},
 		{name: "health", args: []string{"health"}, wantOut: "not running\n", want: 1},
 		{name: "version", args: []string{"version"}, wantOut: "dev\n", want: 0},
 		{name: "unknown", args: []string{"wat"}, wantOut: "usage: vrisingctl {run|health|version}\n", want: exitUsage},
