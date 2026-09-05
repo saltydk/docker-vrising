@@ -146,11 +146,11 @@ func (m *ModManager) Apply(ctx context.Context, staged StagedGeneration) error {
 	entries := make([]JournalEntry, 0, len(paths))
 	for index, relativePath := range paths {
 		snapshot, existed := serverFiles[relativePath]
-		artifactBase := fmt.Sprintf("generations/%s/rollback/quarantine/%04d", staged.Record.ID, index)
+		quarantinePath, tombstonePath := canonicalTransactionArtifactPaths(staged.Record.ID, index)
 		entry := JournalEntry{
 			RelativePath:   relativePath,
-			QuarantinePath: artifactBase + ".displaced",
-			TombstonePath:  artifactBase + ".tombstone",
+			QuarantinePath: quarantinePath,
+			TombstonePath:  tombstonePath,
 			Existed:        existed,
 		}
 		if existed {
@@ -163,18 +163,20 @@ func (m *ModManager) Apply(ctx context.Context, staged StagedGeneration) error {
 		}
 		if next, ok := nextFiles[relativePath]; ok {
 			entry.InstalledSHA256 = next.SHA256
+			entry.TombstoneSHA256 = next.SHA256
 		}
 		entries = append(entries, entry)
 	}
 	var configEntry *JournalEntry
 	if configChanged {
-		artifactBase := fmt.Sprintf("generations/%s/rollback/quarantine/%04d", staged.Record.ID, len(paths))
+		quarantinePath, tombstonePath := canonicalTransactionArtifactPaths(staged.Record.ID, len(paths))
 		entry := JournalEntry{
 			RelativePath:    "BepInEx/config/BepInEx.cfg",
-			QuarantinePath:  artifactBase + ".displaced",
-			TombstonePath:   artifactBase + ".tombstone",
+			QuarantinePath:  quarantinePath,
+			TombstonePath:   tombstonePath,
 			Existed:         configSnapshot != nil,
 			InstalledSHA256: hashBytes(configData),
+			TombstoneSHA256: hashBytes(configData),
 		}
 		if configSnapshot != nil {
 			entry.OriginalSHA256 = configSnapshot.SHA256
@@ -190,6 +192,18 @@ func (m *ModManager) Apply(ctx context.Context, staged StagedGeneration) error {
 		Phase:        "applying",
 		Entries:      entries,
 		Config:       configEntry,
+	}
+	if err := validateTransactionState(state, false); err != nil {
+		return fmt.Errorf("validate managed-file journal: %w", err)
+	}
+	journalEntries := append([]JournalEntry(nil), entries...)
+	if configEntry != nil {
+		journalEntries = append(journalEntries, *configEntry)
+	}
+	for _, entry := range journalEntries {
+		if err := m.Store.validateProtectedArtifactParent(entry.QuarantinePath); err != nil {
+			return fmt.Errorf("validate managed-file artifact namespace: %w", err)
+		}
 	}
 	if err := m.Store.Save(state); err != nil {
 		return fmt.Errorf("persist managed-file journal: %w", err)
@@ -376,7 +390,7 @@ func (m *ModManager) reconcilePromotion(ctx context.Context) error {
 					return err
 				}
 			}
-			if err := m.Store.commitTransactionArtifacts(state.Transaction); err != nil {
+			if err := m.Store.commitTransactionArtifacts(state); err != nil {
 				return fmt.Errorf("commit transaction artifacts: %w", err)
 			}
 			if state.Active != nil {

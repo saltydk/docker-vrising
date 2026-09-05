@@ -927,6 +927,42 @@ func TestPromotionRestartCompletesPendingCleanup(t *testing.T) {
 	}
 }
 
+func TestPromotionCleanupRechecksArtifactImmediatelyBeforeDelete(t *testing.T) {
+	manager := newTestModManager(t)
+	first := stageTestGeneration(t, manager, managedArchiveContents{bepInEx: defaultBepInExEntries("first")})
+	applyAndPromote(t, manager, first)
+	second := stageTestGeneration(t, manager, managedArchiveContents{bepInEx: defaultBepInExEntries("second")})
+	if err := manager.Apply(t.Context(), second); err != nil {
+		t.Fatal(err)
+	}
+	state, err := manager.Store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := journalEntryForPath(t, state, "winhttp.dll")
+	quarantine := filepath.Join(manager.Store.StateDir, filepath.FromSlash(entry.QuarantinePath))
+	manager.Store.artifactCleanupHook = func(relativePath string) error {
+		if relativePath == entry.QuarantinePath {
+			writeTestFile(t, quarantine, "operator changed quarantine")
+		}
+		return nil
+	}
+
+	if err := manager.Promote(t.Context(), second); err == nil {
+		t.Fatal("Promote() deleted an artifact changed immediately before cleanup")
+	}
+	if got := readTestFile(t, quarantine); got != "operator changed quarantine" {
+		t.Fatalf("changed quarantine = %q, want preserved operator content", got)
+	}
+	state, err = manager.Store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Promotion == nil || state.Transaction == nil {
+		t.Fatalf("state after rejected artifact cleanup = %#v, want durable promotion and transaction", state)
+	}
+}
+
 func TestApplyCompletesPendingPromotionCleanupBeforeNewCandidate(t *testing.T) {
 	manager := newTestModManager(t)
 	first := stageTestGeneration(t, manager, managedArchiveContents{bepInEx: defaultBepInExEntries("first")})

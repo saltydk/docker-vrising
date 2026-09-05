@@ -3,9 +3,11 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -163,6 +165,21 @@ func TestStoreWritesRemainConfinedAfterStateDirSymlinkSwap(t *testing.T) {
 	}
 }
 
+func TestStoreRejectsPermissiveStateDirectory(t *testing.T) {
+	stateDir := t.TempDir()
+	if err := os.Chmod(stateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	store := &Store{StateDir: stateDir}
+
+	if err := store.Save(State{SchemaVersion: schemaVersion}); err == nil {
+		t.Fatal("Save() accepted a StateDir not protected as mode 0700")
+	}
+	if _, err := os.Lstat(filepath.Join(stateDir, "state.json")); !os.IsNotExist(err) {
+		t.Fatalf("state file stat error = %v, want not exist", err)
+	}
+}
+
 func TestStoreLoadsRejectSymlinkedStateDir(t *testing.T) {
 	externalDir := t.TempDir()
 	stateData, err := json.Marshal(State{SchemaVersion: schemaVersion})
@@ -195,6 +212,9 @@ func TestStoreLoadsRejectSymlinkedStateDir(t *testing.T) {
 
 func TestStoreRejectsUnknownSchemaVersion(t *testing.T) {
 	stateDir := t.TempDir()
+	if err := os.Chmod(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	data, err := json.Marshal(State{SchemaVersion: 2})
 	if err != nil {
 		t.Fatalf("marshal state: %v", err)
@@ -210,6 +230,9 @@ func TestStoreRejectsUnknownSchemaVersion(t *testing.T) {
 
 func TestStoreRejectsUnknownPackageLockSchemaVersion(t *testing.T) {
 	stateDir := t.TempDir()
+	if err := os.Chmod(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	data, err := json.Marshal(PackageLock{SchemaVersion: 2})
 	if err != nil {
 		t.Fatalf("marshal package lock: %v", err)
@@ -225,6 +248,9 @@ func TestStoreRejectsUnknownPackageLockSchemaVersion(t *testing.T) {
 
 func TestLifetimeLockRejectsSecondOwner(t *testing.T) {
 	stateDir := t.TempDir()
+	if err := os.Chmod(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	first, err := (&Store{StateDir: stateDir}).OpenLifetimeLock()
 	if err != nil {
 		t.Fatalf("open first lifetime lock: %v", err)
@@ -238,6 +264,9 @@ func TestLifetimeLockRejectsSecondOwner(t *testing.T) {
 
 func TestLifetimeLockRejectsSymlinkedLock(t *testing.T) {
 	stateDir := t.TempDir()
+	if err := os.Chmod(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	externalLock := filepath.Join(t.TempDir(), "update.lock")
 	writeTestFile(t, externalLock, "external lock")
 	if err := os.Symlink(externalLock, filepath.Join(stateDir, "update.lock")); err != nil {
@@ -419,8 +448,10 @@ func TestRecoverInterruptedTransactionDistinguishesObservedEntryState(t *testing
 				entry.BackupPath = "transaction/managed.dll"
 				entry.OriginalSHA256 = hashBytes([]byte("original"))
 			}
+			candidate := GenerationRecord{ID: "candidate", LockDigest: "lock", Status: "candidate"}
 			if err := store.Save(State{
 				SchemaVersion: schemaVersion,
+				Candidate:     &candidate,
 				Transaction: &TransactionJournal{
 					GenerationID: "candidate",
 					Phase:        "applying",
@@ -498,8 +529,10 @@ func TestRecoverInterruptedHashedNoopResyncsBeforeJournalClear(t *testing.T) {
 				writeTestFile(t, filepath.Join(serverDir, "managed.dll"), "original")
 				writeTestFile(t, filepath.Join(stateDir, "transaction", "managed.dll"), "original")
 			}
+			candidate := GenerationRecord{ID: "candidate", LockDigest: "lock", Status: "candidate"}
 			if err := store.Save(State{
 				SchemaVersion: schemaVersion,
+				Candidate:     &candidate,
 				Transaction: &TransactionJournal{
 					GenerationID: "candidate",
 					Phase:        "applying",
@@ -534,8 +567,10 @@ func TestRecoverInterruptedTransactionRejectsFIFOWithoutBlocking(t *testing.T) {
 	if err := unix.Mkfifo(target, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	candidate := GenerationRecord{ID: "candidate", LockDigest: "lock", Status: "candidate"}
 	if err := store.Save(State{
 		SchemaVersion: schemaVersion,
+		Candidate:     &candidate,
 		Transaction: &TransactionJournal{
 			GenerationID: "candidate",
 			Phase:        "applying",
@@ -566,6 +601,335 @@ func TestRecoverInterruptedTransactionRejectsFIFOWithoutBlocking(t *testing.T) {
 	info, err := os.Lstat(target)
 	if err != nil || info.Mode()&os.ModeNamedPipe == 0 {
 		t.Fatalf("FIFO after recovery: info=%v err=%v", info, err)
+	}
+}
+
+func TestRecoverLegacyZeroByteStaleDeletePlaceholder(t *testing.T) {
+	serverDir := t.TempDir()
+	stateDir := filepath.Join(serverDir, ".docker-vrising")
+	store := Store{StateDir: stateDir}
+	candidate := GenerationRecord{ID: "candidate", LockDigest: "lock", Status: "candidate"}
+	quarantinePath := "generations/candidate/rollback/quarantine/0000.displaced"
+	tombstonePath := "generations/candidate/rollback/quarantine/0000.tombstone"
+	livePath := filepath.Join(serverDir, "stale.dll")
+	writeTestFile(t, livePath, "")
+	writeTestFile(t, filepath.Join(stateDir, filepath.FromSlash(quarantinePath)), "original")
+	if err := store.Save(State{
+		SchemaVersion: schemaVersion,
+		Candidate:     &candidate,
+		Transaction: &TransactionJournal{
+			GenerationID: candidate.ID,
+			Phase:        "applying",
+			Entries: []JournalEntry{{
+				RelativePath:   "stale.dll",
+				QuarantinePath: quarantinePath,
+				TombstonePath:  tombstonePath,
+				Existed:        true,
+				OriginalSHA256: hashBytes([]byte("original")),
+			}},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store.recoveryHook = func(stage, relativePath string) error {
+		if stage == "legacy-placeholder-converted" && relativePath == "stale.dll" {
+			return errors.New("crash after legacy conversion")
+		}
+		return nil
+	}
+
+	if err := store.RecoverInterruptedTransaction(); err == nil || !strings.Contains(err.Error(), "crash after legacy conversion") {
+		t.Fatalf("first recovery error = %v, want conversion crash", err)
+	}
+	state, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := state.Transaction.Entries[0]
+	if !entry.LegacyDeletePlaceholder || entry.TombstoneSHA256 != hashBytes(nil) {
+		t.Fatalf("converted legacy entry = %#v, want durable zero-byte placeholder metadata", entry)
+	}
+	if got := readTestFile(t, livePath); got != "" {
+		t.Fatalf("live placeholder before retry = %q, want zero bytes", got)
+	}
+	if got := readTestFile(t, filepath.Join(stateDir, filepath.FromSlash(quarantinePath))); got != "original" {
+		t.Fatalf("quarantined original before retry = %q", got)
+	}
+
+	store.recoveryHook = nil
+	if err := store.RecoverInterruptedTransaction(); err != nil {
+		t.Fatalf("second recovery error = %v", err)
+	}
+	if got := readTestFile(t, livePath); got != "original" {
+		t.Fatalf("recovered stale file = %q, want original", got)
+	}
+	for _, artifact := range []string{quarantinePath, tombstonePath} {
+		if _, err := os.Lstat(filepath.Join(stateDir, filepath.FromSlash(artifact))); !os.IsNotExist(err) {
+			t.Fatalf("artifact %s stat error = %v, want not exist", artifact, err)
+		}
+	}
+}
+
+func TestRecoverConfigSyncsLiveBeforeDeletingFallback(t *testing.T) {
+	serverDir := t.TempDir()
+	stateDir := filepath.Join(serverDir, ".docker-vrising")
+	store := Store{StateDir: stateDir}
+	candidate := GenerationRecord{ID: "candidate", LockDigest: "lock", Status: "candidate"}
+	configRelative := "BepInEx/config/BepInEx.cfg"
+	quarantinePath := "generations/candidate/rollback/quarantine/0000.displaced"
+	livePath := filepath.Join(serverDir, filepath.FromSlash(configRelative))
+	writeTestFile(t, livePath, "console=false")
+	writeTestFile(t, filepath.Join(stateDir, filepath.FromSlash(quarantinePath)), "console=true")
+	if err := store.Save(State{
+		SchemaVersion: schemaVersion,
+		Candidate:     &candidate,
+		Transaction: &TransactionJournal{
+			GenerationID: candidate.ID,
+			Phase:        "applying",
+			Config: &JournalEntry{
+				RelativePath:    configRelative,
+				QuarantinePath:  quarantinePath,
+				TombstonePath:   "generations/candidate/rollback/quarantine/0000.tombstone",
+				Existed:         true,
+				OriginalSHA256:  hashBytes([]byte("console=true")),
+				InstalledSHA256: hashBytes([]byte("console=false")),
+			},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	syncer := newFailFirstDirectorySync(t, filepath.Dir(livePath))
+	store.syncDirectory = syncer.Sync
+
+	if err := store.RecoverInterruptedTransaction(); err == nil {
+		t.Fatal("first recovery succeeded after live config parent sync failure")
+	}
+	if got := readTestFile(t, filepath.Join(stateDir, filepath.FromSlash(quarantinePath))); got != "console=true" {
+		t.Fatalf("config fallback after failed live sync = %q, want preserved", got)
+	}
+	assertTransactionRetained(t, &store)
+	if err := store.RecoverInterruptedTransaction(); err != nil {
+		t.Fatalf("second recovery error = %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(stateDir, filepath.FromSlash(quarantinePath))); !os.IsNotExist(err) {
+		t.Fatalf("config fallback after retry stat error = %v, want not exist", err)
+	}
+	if syncer.targetCalls < 2 {
+		t.Fatalf("live config parent sync calls = %d, want at least 2", syncer.targetCalls)
+	}
+}
+
+func TestRecoverCleansDuplicateOriginalQuarantine(t *testing.T) {
+	for _, replacement := range []bool{false, true} {
+		name := "stale deletion"
+		if replacement {
+			name = "replacement"
+		}
+		t.Run(name, func(t *testing.T) {
+			serverDir := t.TempDir()
+			stateDir := filepath.Join(serverDir, ".docker-vrising")
+			store := Store{StateDir: stateDir}
+			candidate := GenerationRecord{ID: "candidate", LockDigest: "lock", Status: "candidate"}
+			quarantinePath := "generations/candidate/rollback/quarantine/0000.displaced"
+			livePath := filepath.Join(serverDir, "managed.dll")
+			writeTestFile(t, livePath, "original")
+			before, err := os.Stat(livePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeTestFile(t, filepath.Join(stateDir, filepath.FromSlash(quarantinePath)), "original")
+			entry := JournalEntry{
+				RelativePath:   "managed.dll",
+				QuarantinePath: quarantinePath,
+				TombstonePath:  "generations/candidate/rollback/quarantine/0000.tombstone",
+				Existed:        true,
+				OriginalSHA256: hashBytes([]byte("original")),
+			}
+			if replacement {
+				entry.InstalledSHA256 = hashBytes([]byte("candidate"))
+				entry.TombstoneSHA256 = entry.InstalledSHA256
+			}
+			if err := store.Save(State{
+				SchemaVersion: schemaVersion,
+				Candidate:     &candidate,
+				Transaction: &TransactionJournal{
+					GenerationID: candidate.ID,
+					Phase:        "applying",
+					Entries:      []JournalEntry{entry},
+				},
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			if err := store.RecoverInterruptedTransaction(); err != nil {
+				t.Fatalf("RecoverInterruptedTransaction() error = %v", err)
+			}
+			after, err := os.Stat(livePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !os.SameFile(before, after) || readTestFile(t, livePath) != "original" {
+				t.Fatal("recovery replaced the already-restored live original")
+			}
+			if _, err := os.Lstat(filepath.Join(stateDir, filepath.FromSlash(quarantinePath))); !os.IsNotExist(err) {
+				t.Fatalf("duplicate quarantine stat error = %v, want not exist", err)
+			}
+			assertTransactionCleared(t, &store)
+		})
+	}
+}
+
+func TestRecoverRejectsPermissiveTransactionArtifactNamespace(t *testing.T) {
+	serverDir := t.TempDir()
+	stateDir := filepath.Join(serverDir, ".docker-vrising")
+	store := Store{StateDir: stateDir}
+	candidate := GenerationRecord{ID: "candidate", LockDigest: "lock", Status: "candidate"}
+	quarantinePath := "generations/candidate/rollback/quarantine/0000.displaced"
+	livePath := filepath.Join(serverDir, "managed.dll")
+	writeTestFile(t, livePath, "candidate")
+	writeTestFile(t, filepath.Join(stateDir, filepath.FromSlash(quarantinePath)), "original")
+	if err := store.Save(State{
+		SchemaVersion: schemaVersion,
+		Candidate:     &candidate,
+		Transaction: &TransactionJournal{
+			GenerationID: candidate.ID,
+			Phase:        "applying",
+			Entries: []JournalEntry{{
+				RelativePath:    "managed.dll",
+				BackupPath:      "generations/candidate/rollback/managed.dll",
+				QuarantinePath:  quarantinePath,
+				TombstonePath:   "generations/candidate/rollback/quarantine/0000.tombstone",
+				Existed:         true,
+				OriginalSHA256:  hashBytes([]byte("original")),
+				InstalledSHA256: hashBytes([]byte("candidate")),
+				TombstoneSHA256: hashBytes([]byte("candidate")),
+			}},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	artifactDir := filepath.Dir(filepath.Join(stateDir, filepath.FromSlash(quarantinePath)))
+	if err := os.Chmod(artifactDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.RecoverInterruptedTransaction(); err == nil {
+		t.Fatal("recovery accepted a transaction artifact namespace not protected as mode 0700")
+	}
+	if got := readTestFile(t, livePath); got != "candidate" {
+		t.Fatalf("live file after rejected namespace = %q, want candidate", got)
+	}
+	if got := readTestFile(t, filepath.Join(stateDir, filepath.FromSlash(quarantinePath))); got != "original" {
+		t.Fatalf("quarantine after rejected namespace = %q, want original", got)
+	}
+}
+
+func TestRecoverValidatesCompleteJournalBeforeMutation(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func([]JournalEntry) []JournalEntry
+	}{
+		{
+			name: "noncanonical artifact",
+			mutate: func(entries []JournalEntry) []JournalEntry {
+				entries[0].QuarantinePath = "generations/candidate/rollback/quarantine/operator.displaced"
+				return entries
+			},
+		},
+		{
+			name: "reserved artifact",
+			mutate: func(entries []JournalEntry) []JournalEntry {
+				entries[0].QuarantinePath = "package-lock.json"
+				return entries
+			},
+		},
+		{
+			name: "artifact live-path collision",
+			mutate: func(entries []JournalEntry) []JournalEntry {
+				entries[0].QuarantinePath = "BepInEx/core/core.dll"
+				return entries
+			},
+		},
+		{
+			name: "duplicate artifact",
+			mutate: func(entries []JournalEntry) []JournalEntry {
+				entries[1].QuarantinePath = entries[0].QuarantinePath
+				return entries
+			},
+		},
+		{
+			name: "artifact alias",
+			mutate: func(entries []JournalEntry) []JournalEntry {
+				entries[0].QuarantinePath = "generations/candidate/rollback/quarantine/../quarantine/0000.displaced"
+				return entries
+			},
+		},
+		{
+			name:   "candidate mismatch",
+			mutate: func(entries []JournalEntry) []JournalEntry { return entries },
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			serverDir := t.TempDir()
+			stateDir := filepath.Join(serverDir, ".docker-vrising")
+			store := Store{StateDir: stateDir}
+			candidateID := "candidate"
+			transactionID := candidateID
+			if tt.name == "candidate mismatch" {
+				transactionID = "other"
+			}
+			entries := []JournalEntry{
+				canonicalReplacementEntry(candidateID, 0, "one.dll"),
+				canonicalReplacementEntry(candidateID, 1, "two.dll"),
+			}
+			entries = tt.mutate(entries)
+			candidate := GenerationRecord{ID: candidateID, LockDigest: "lock", Status: "candidate"}
+			for _, entry := range entries {
+				writeTestFile(t, filepath.Join(serverDir, filepath.FromSlash(entry.RelativePath)), "candidate")
+				writeTestFile(t, filepath.Join(stateDir, filepath.FromSlash(entry.BackupPath)), "original")
+			}
+			if err := store.Save(State{
+				SchemaVersion: schemaVersion,
+				Candidate:     &candidate,
+				Transaction: &TransactionJournal{
+					GenerationID: transactionID,
+					Phase:        "applying",
+					Entries:      entries,
+				},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				if entry.QuarantinePath == "state.json" {
+					continue
+				}
+				writeTestFile(t, filepath.Join(stateDir, filepath.FromSlash(entry.QuarantinePath)), "original")
+			}
+
+			if err := store.RecoverInterruptedTransaction(); err == nil {
+				t.Fatal("recovery accepted malicious transaction journal")
+			}
+			for _, relativePath := range []string{"one.dll", "two.dll"} {
+				if got := readTestFile(t, filepath.Join(serverDir, relativePath)); got != "candidate" {
+					t.Fatalf("live %s after rejected journal = %q, want candidate", relativePath, got)
+				}
+			}
+		})
+	}
+}
+
+func canonicalReplacementEntry(candidateID string, index int, relativePath string) JournalEntry {
+	artifactBase := fmt.Sprintf("generations/%s/rollback/quarantine/%04d", candidateID, index)
+	return JournalEntry{
+		RelativePath:    relativePath,
+		BackupPath:      fmt.Sprintf("generations/%s/rollback/%s", candidateID, relativePath),
+		QuarantinePath:  artifactBase + ".displaced",
+		TombstonePath:   artifactBase + ".tombstone",
+		Existed:         true,
+		OriginalSHA256:  hashBytes([]byte("original")),
+		InstalledSHA256: hashBytes([]byte("candidate")),
+		TombstoneSHA256: hashBytes([]byte("candidate")),
 	}
 }
 
