@@ -798,6 +798,139 @@ func TestPromoteAdvancesActiveAndPreviousGeneration(t *testing.T) {
 	}
 }
 
+func TestValidateManagedPackageLockRequiresExactFivePackageGraph(t *testing.T) {
+	manager := newTestModManager(t)
+	staged := stageTestGeneration(t, manager, managedArchiveContents{bepInEx: defaultBepInExEntries("strict")})
+
+	tests := []struct {
+		name   string
+		change func(*PackageLock)
+	}{
+		{
+			name: "missing package",
+			change: func(lock *PackageLock) {
+				lock.Packages = lock.Packages[:len(lock.Packages)-1]
+			},
+		},
+		{
+			name: "invalid archive digest",
+			change: func(lock *PackageLock) {
+				lock.Packages[0].SHA256 = "not-a-sha256"
+			},
+		},
+		{
+			name: "noncanonical order",
+			change: func(lock *PackageLock) {
+				lock.Packages[0], lock.Packages[1] = lock.Packages[1], lock.Packages[0]
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			lock := clonePackageLock(staged.Lock)
+			tt.change(&lock)
+			lock.Digest = PackageLockDigest(lock)
+			if err := validateManagedPackageLock(lock); err == nil {
+				t.Fatalf("validateManagedPackageLock() accepted %s", tt.name)
+			}
+		})
+	}
+}
+
+func TestValidateActiveGenerationChecksPersistedManifestAndOverlay(t *testing.T) {
+	t.Run("valid", func(t *testing.T) {
+		manager := newTestModManager(t)
+		staged := stageTestGeneration(t, manager, managedArchiveContents{bepInEx: defaultBepInExEntries("valid")})
+		record := staged.Record
+		record.Status = "active"
+
+		got, err := manager.ValidateActive(t.Context(), record, staged.Lock)
+		if err != nil {
+			t.Fatalf("ValidateActive() error = %v", err)
+		}
+		if got.Record != record || !samePackageLock(got.Lock, staged.Lock) || !sameManagedManifest(got.Manifest, staged.Manifest) {
+			t.Fatalf("ValidateActive() = %#v, want persisted active generation", got)
+		}
+	})
+
+	for _, tt := range []struct {
+		name   string
+		change func(t *testing.T, staged StagedGeneration)
+	}{
+		{
+			name: "corrupt overlay",
+			change: func(t *testing.T, staged StagedGeneration) {
+				writeTestFile(t, filepath.Join(staged.Dir, "winhttp.dll"), "corrupt")
+			},
+		},
+		{
+			name: "unexpected overlay file",
+			change: func(t *testing.T, staged StagedGeneration) {
+				writeTestFile(t, filepath.Join(staged.Dir, "unexpected.dll"), "untracked")
+			},
+		},
+		{
+			name: "missing manifest",
+			change: func(t *testing.T, staged StagedGeneration) {
+				if err := os.Remove(filepath.Join(filepath.Dir(staged.Dir), managedManifestName)); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "missing package lock",
+			change: func(t *testing.T, staged StagedGeneration) {
+				if err := os.Remove(filepath.Join(filepath.Dir(staged.Dir), managedLockName)); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			manager := newTestModManager(t)
+			staged := stageTestGeneration(t, manager, managedArchiveContents{bepInEx: defaultBepInExEntries(tt.name)})
+			record := staged.Record
+			record.Status = "active"
+			tt.change(t, staged)
+
+			if _, err := manager.ValidateActive(t.Context(), record, staged.Lock); err == nil {
+				t.Fatalf("ValidateActive() accepted %s", tt.name)
+			}
+		})
+	}
+}
+
+func TestDiscardRemovesOnlyUnreferencedStagedGeneration(t *testing.T) {
+	t.Run("unreferenced", func(t *testing.T) {
+		manager := newTestModManager(t)
+		staged := stageTestGeneration(t, manager, managedArchiveContents{bepInEx: defaultBepInExEntries("discard")})
+
+		if err := manager.Discard(t.Context(), staged); err != nil {
+			t.Fatalf("Discard() error = %v", err)
+		}
+		if _, err := os.Stat(filepath.Dir(staged.Dir)); !os.IsNotExist(err) {
+			t.Fatalf("discarded generation stat error = %v, want not exist", err)
+		}
+	})
+
+	t.Run("referenced", func(t *testing.T) {
+		manager := newTestModManager(t)
+		staged := stageTestGeneration(t, manager, managedArchiveContents{bepInEx: defaultBepInExEntries("referenced")})
+		active := staged.Record
+		active.Status = "active"
+		if err := manager.Store.Save(State{SchemaVersion: schemaVersion, Active: &active}); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := manager.Discard(t.Context(), staged); err == nil {
+			t.Fatal("Discard() removed a referenced generation")
+		}
+		if _, err := os.Stat(filepath.Dir(staged.Dir)); err != nil {
+			t.Fatalf("referenced generation was removed: %v", err)
+		}
+	})
+}
+
 func TestPromotionRetainsFailedEvidenceUntilLaterSuccess(t *testing.T) {
 	manager := newTestModManager(t)
 	first := stageTestGeneration(t, manager, managedArchiveContents{
@@ -967,6 +1100,86 @@ func TestPromotionRestartCompletesPendingCleanup(t *testing.T) {
 	if state.Promotion != nil || len(state.PendingCleanup) != 0 || state.Active == nil || state.Active.ID != third.Record.ID ||
 		state.Previous == nil || state.Previous.ID != second.Record.ID {
 		t.Fatalf("state after restart cleanup = %#v", state)
+	}
+}
+
+func TestCommitPromotionReportsRecoveryRequiredAtDurableBoundaries(t *testing.T) {
+	for _, failureStage := range []string{"lock-written", "state-written"} {
+		t.Run(failureStage, func(t *testing.T) {
+			manager := newTestModManager(t)
+			first := stageTestGeneration(t, manager, managedArchiveContents{bepInEx: defaultBepInExEntries("first")})
+			applyAndPromote(t, manager, first)
+			second := stageTestGeneration(t, manager, managedArchiveContents{bepInEx: defaultBepInExEntries("second")})
+			if err := manager.Apply(t.Context(), second); err != nil {
+				t.Fatal(err)
+			}
+			manager.promotionHook = func(stage string) error {
+				if stage == failureStage {
+					return errors.New("injected promotion failure")
+				}
+				return nil
+			}
+
+			outcome, err := manager.CommitPromotion(t.Context(), second)
+			if err == nil || outcome != PromotionRecoveryRequired {
+				t.Fatalf("CommitPromotion() = %v, %v, want recovery required", outcome, err)
+			}
+
+			restarted := &ModManager{ServerDir: manager.ServerDir, GenerationsDir: manager.GenerationsDir, Store: manager.Store}
+			outcome, err = restarted.RecoverPromotion(t.Context())
+			if err != nil || outcome != PromotionCommitted {
+				t.Fatalf("RecoverPromotion() = %v, %v, want committed", outcome, err)
+			}
+			state, err := manager.Store.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			lock, err := manager.Store.LoadPackageLock()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state.Active == nil || state.Active.ID != second.Record.ID || state.Candidate != nil || state.Transaction != nil ||
+				state.Promotion != nil || !samePackageLock(lock, second.Lock) {
+				t.Fatalf("recovered promotion state = %#v, lock = %#v", state, lock)
+			}
+		})
+	}
+}
+
+func TestCommitPromotionIntentWriteFailureIsExplicitlyRecoverable(t *testing.T) {
+	manager := newTestModManager(t)
+	first := stageTestGeneration(t, manager, managedArchiveContents{bepInEx: defaultBepInExEntries("first")})
+	applyAndPromote(t, manager, first)
+	second := stageTestGeneration(t, manager, managedArchiveContents{bepInEx: defaultBepInExEntries("second")})
+	if err := manager.Apply(t.Context(), second); err != nil {
+		t.Fatal(err)
+	}
+	manager.Store.beforeWrite = func(name string) error {
+		if name == "state.json" {
+			return errors.New("injected promotion intent failure")
+		}
+		return nil
+	}
+
+	outcome, err := manager.CommitPromotion(t.Context(), second)
+	if err == nil || outcome != PromotionRecoveryRequired {
+		t.Fatalf("CommitPromotion() = %v, %v, want recovery required", outcome, err)
+	}
+	manager.Store.beforeWrite = nil
+	if err := manager.Store.RecoverInterruptedTransaction(); err != nil {
+		t.Fatalf("RecoverInterruptedTransaction() error = %v", err)
+	}
+	state, err := manager.Store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := manager.Store.LoadPackageLock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Active == nil || state.Active.ID != first.Record.ID || state.Failed == nil || state.Failed.ID != second.Record.ID ||
+		state.Candidate != nil || state.Transaction != nil || !samePackageLock(lock, first.Lock) {
+		t.Fatalf("rolled-back ambiguous intent state = %#v, lock = %#v", state, lock)
 	}
 }
 

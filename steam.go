@@ -85,6 +85,15 @@ func (s *SteamClient) InstalledBuild() (SteamBuild, error) {
 	return build, nil
 }
 
+func (s *SteamClient) ValidateInstalled(expected SteamBuild) (SteamBuild, error) {
+	expected.Branch = selectedSteamBranch(expected.Branch)
+	installed, err := s.validateUpdatedInstallation(expected)
+	if err != nil {
+		return SteamBuild{}, preMutationSteamError(fmt.Errorf("validate installed runtime: %w", err))
+	}
+	return installed, nil
+}
+
 func (s *SteamClient) RemoteBuild(ctx context.Context) (SteamBuild, error) {
 	if err := s.validateCommandConfiguration(ctx); err != nil {
 		return SteamBuild{}, preMutationSteamError(err)

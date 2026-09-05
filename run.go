@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"os/exec"
@@ -25,10 +26,13 @@ type archiveFetcher interface {
 }
 
 type modLifecycle interface {
+	ValidateActive(context.Context, GenerationRecord, PackageLock) (StagedGeneration, error)
 	Stage(context.Context, PackageLock, map[PackageRef]*ValidatedArchive) (StagedGeneration, error)
 	Apply(context.Context, StagedGeneration) error
 	Rollback(context.Context) error
-	Promote(context.Context, StagedGeneration) error
+	CommitPromotion(context.Context, StagedGeneration) (PromotionCommitOutcome, error)
+	RecoverPromotion(context.Context) (PromotionCommitOutcome, error)
+	Discard(context.Context, StagedGeneration) error
 }
 
 type backupCreator interface {
@@ -38,6 +42,7 @@ type backupCreator interface {
 
 type steamLifecycle interface {
 	InstalledBuild() (SteamBuild, error)
+	ValidateInstalled(SteamBuild) (SteamBuild, error)
 	RemoteBuild(context.Context) (SteamBuild, error)
 	Update(context.Context, SteamBuild) (SteamBuild, error)
 }
@@ -64,6 +69,7 @@ type Application struct {
 	Backups    backupCreator
 	Steam      steamLifecycle
 	Supervisor serverSupervisor
+	Proc       ProcInspector
 
 	stateStore     applicationStateStore
 	validateMounts func(Config) error
@@ -125,6 +131,7 @@ func newApplication(cfg Config, identity RuntimeIdentity) *Application {
 			Readiness: readiness,
 			Processes: ExecProcessFactory{Stdout: os.Stdout, Stderr: os.Stderr},
 		},
+		Proc: procFSInspector{},
 	}
 }
 
@@ -153,7 +160,20 @@ func (a *Application) Run(ctx context.Context) (returnErr error) {
 	}()
 
 	if err := store.RecoverInterruptedTransaction(); err != nil {
-		return exitFailure(exitPreflight, fmt.Errorf("recover interrupted transaction: %w", err))
+		var pending *PendingPromotionError
+		if !errors.As(err, &pending) || a.Mods == nil {
+			return exitFailure(exitPreflight, fmt.Errorf("recover interrupted transaction: %w", err))
+		}
+		outcome, recoverErr := a.Mods.RecoverPromotion(ctx)
+		if recoverErr != nil || outcome != PromotionCommitted {
+			return exitFailure(exitPreflight, errors.Join(
+				fmt.Errorf("recover pending promotion for generation %s", pending.GenerationID),
+				recoverErr,
+			))
+		}
+		if err := store.RecoverInterruptedTransaction(); err != nil {
+			return exitFailure(exitPreflight, fmt.Errorf("resume transaction recovery after promotion: %w", err))
+		}
 	}
 	state, err := store.Load()
 	if errors.Is(err, os.ErrNotExist) {
@@ -161,8 +181,16 @@ func (a *Application) Run(ctx context.Context) (returnErr error) {
 	} else if err != nil {
 		return exitFailure(exitPreflight, fmt.Errorf("load runtime state: %w", err))
 	}
+	state, err = a.fencePriorProcess(store, state)
+	if err != nil {
+		return exitFailure(exitPreflight, err)
+	}
 	installed, installedErr := a.Steam.InstalledBuild()
-	active, activeOK := a.loadActiveGeneration(store, state)
+	active := StagedGeneration{}
+	activeErr := errors.New("active generation is unavailable")
+	if a.Config.ModsEnabled {
+		active, activeErr = a.loadActiveGeneration(ctx, store, state)
+	}
 
 	selected := active
 	candidate := false
@@ -175,8 +203,11 @@ func (a *Application) Run(ctx context.Context) (returnErr error) {
 			selected = staged
 			candidate = true
 		} else {
-			if !activeOK {
-				return exitFailure(exitModUpdate, errors.New("UPDATE_MODS=false requires a canonical active package lock"))
+			if activeErr != nil {
+				return exitFailure(exitModUpdate, fmt.Errorf("UPDATE_MODS=false requires a valid active generation: %w", activeErr))
+			}
+			if err := a.validateKnownGoodSteam(state, installed, installedErr); err != nil {
+				return exitFailure(exitSteam, fmt.Errorf("UPDATE_MODS=false requires a valid recorded Steam runtime: %w", err))
 			}
 		}
 	} else {
@@ -188,6 +219,14 @@ func (a *Application) Run(ctx context.Context) (returnErr error) {
 		return err
 	}
 	if fallback {
+		if candidate {
+			cleanupCtx, cancel := a.cleanupContext(ctx)
+			discardErr := a.Mods.Discard(cleanupCtx, selected)
+			cancel()
+			if discardErr != nil {
+				return exitFailure(exitModUpdate, fmt.Errorf("discard unreferenced staged generation: %w", discardErr))
+			}
+		}
 		return a.launch(ctx, active, installed, false)
 	}
 
@@ -201,6 +240,43 @@ func (a *Application) Run(ctx context.Context) (returnErr error) {
 	}
 
 	return a.launch(ctx, selected, steamBuild, candidate)
+}
+
+func (a *Application) fencePriorProcess(store applicationStateStore, state State) (State, error) {
+	recorded := state.Runtime.Server
+	if recorded == (ProcessIdentity{}) {
+		if state.Runtime.Ready {
+			return State{}, errors.New("recorded ready runtime has no process identity")
+		}
+		return state, nil
+	}
+	if recorded.PID <= 0 || recorded.StartTicks == 0 {
+		return State{}, errors.New("recorded runtime process identity is incomplete")
+	}
+	if a.Proc == nil {
+		return State{}, errors.New("process inspector is unavailable")
+	}
+	live, err := a.Proc.Identity(recorded.PID)
+	if err == nil {
+		if live.PID != recorded.PID || live.StartTicks == 0 {
+			return State{}, fmt.Errorf("process inspector returned an invalid identity for PID %d", recorded.PID)
+		}
+		if recorded.Matches(live) {
+			return State{}, fmt.Errorf("recorded server process %d with start ticks %d is still running", recorded.PID, recorded.StartTicks)
+		}
+	}
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return State{}, fmt.Errorf("inspect recorded server process: %w", err)
+	}
+
+	state.Runtime.Server = ProcessIdentity{}
+	state.Runtime.Ready = false
+	state.Runtime.Phase = "stopped"
+	state.Runtime.UpdatedAt = a.clock()()
+	if err := store.Save(state); err != nil {
+		return State{}, fmt.Errorf("clear stale server process identity: %w", err)
+	}
+	return state, nil
 }
 
 func (a *Application) dependenciesReady() error {
@@ -235,19 +311,19 @@ func (a *Application) applicationStore() applicationStateStore {
 	return a.Store
 }
 
-func (a *Application) loadActiveGeneration(store applicationStateStore, state State) (StagedGeneration, bool) {
+func (a *Application) loadActiveGeneration(ctx context.Context, store applicationStateStore, state State) (StagedGeneration, error) {
 	if state.Active == nil {
-		return StagedGeneration{}, false
+		return StagedGeneration{}, errors.New("active generation record is missing")
 	}
 	lock, err := store.LoadPackageLock()
-	if err != nil || validateActivePackageLock(*state.Active, lock) != nil {
-		return StagedGeneration{}, false
+	if err != nil {
+		return StagedGeneration{}, fmt.Errorf("load active package lock: %w", err)
 	}
-	return StagedGeneration{
-		Record: *state.Active,
-		Dir:    filepath.Join(a.Config.StateDir, "generations", state.Active.ID),
-		Lock:   lock,
-	}, true
+	active, err := a.Mods.ValidateActive(ctx, *state.Active, lock)
+	if err != nil {
+		return StagedGeneration{}, fmt.Errorf("validate active generation: %w", err)
+	}
+	return active, nil
 }
 
 func (a *Application) stageCandidate(ctx context.Context, state State, active StagedGeneration) (StagedGeneration, error) {
@@ -326,7 +402,11 @@ func (a *Application) prepareSteam(
 		if installedErr != nil {
 			return SteamBuild{}, false, exitFailure(exitSteam, fmt.Errorf("validate installed Steam build: %w", installedErr))
 		}
-		return installed, false, nil
+		validated, err := a.Steam.ValidateInstalled(installed)
+		if err != nil {
+			return SteamBuild{}, false, exitFailure(exitSteam, err)
+		}
+		return validated, false, nil
 	}
 
 	target, err := a.Steam.RemoteBuild(ctx)
@@ -339,7 +419,11 @@ func (a *Application) prepareSteam(
 		return installed, true, nil
 	}
 	if installedErr == nil && installed == target {
-		return installed, false, nil
+		validated, err := a.Steam.ValidateInstalled(installed)
+		if err != nil {
+			return SteamBuild{}, false, exitFailure(exitSteam, err)
+		}
+		return validated, false, nil
 	}
 
 	if installedErr == nil && installed.BuildID != "" {
@@ -401,11 +485,11 @@ func (a *Application) recordFallback(
 	active StagedGeneration,
 	cause error,
 ) error {
-	if installedErr != nil || installed.BuildID == "" {
-		return errors.New("known-good executable is unavailable")
+	if active.Record.ID == "" {
+		return errors.New("known-good active generation is unavailable")
 	}
-	if err := validateActivePackageLock(active.Record, active.Lock); err != nil {
-		return fmt.Errorf("known-good package lock is unavailable: %w", err)
+	if err := a.validateKnownGoodSteam(state, installed, installedErr); err != nil {
+		return err
 	}
 	state.Runtime = RuntimeState{
 		Phase:      "degraded",
@@ -421,37 +505,65 @@ func (a *Application) recordFallback(
 	return nil
 }
 
+func (a *Application) validateKnownGoodSteam(state State, installed SteamBuild, installedErr error) error {
+	if installedErr != nil || installed.BuildID == "" {
+		return errors.New("known-good executable is unavailable")
+	}
+	if state.SteamBuild == "" || state.SteamBuild != installed.BuildID {
+		return fmt.Errorf("installed Steam build %q does not match recorded known-good build %q", installed.BuildID, state.SteamBuild)
+	}
+	validated, err := a.Steam.ValidateInstalled(installed)
+	if err != nil {
+		return fmt.Errorf("validate known-good Steam runtime: %w", err)
+	}
+	if validated != installed {
+		return fmt.Errorf("validated Steam runtime %#v does not match installed build %#v", validated, installed)
+	}
+	return nil
+}
+
 func (a *Application) launch(ctx context.Context, selected StagedGeneration, steam SteamBuild, candidate bool) error {
 	pruneLogs := a.pruneLogs
 	if pruneLogs == nil {
 		pruneLogs = PruneLogs
 	}
-	if err := pruneLogs(a.Config.DataDir, a.Config.LogDays, a.clock()()); err != nil {
+	if err := pruneLogs(filepath.Join(a.Config.DataDir, "logs"), a.Config.LogDays, a.clock()()); err != nil {
 		if candidate {
 			return a.rollbackCandidate(ctx, fmt.Errorf("prune server logs: %w", err))
 		}
 		return exitFailure(exitPreflight, fmt.Errorf("prune server logs: %w", err))
 	}
 
+	promotionOutcome := PromotionNotCommitted
+	var onReady func(context.Context) error
+	if candidate {
+		onReady = func(readyCtx context.Context) error {
+			outcome, err := a.Mods.CommitPromotion(readyCtx, selected)
+			promotionOutcome = outcome
+			return err
+		}
+	}
 	result, err := a.Supervisor.Run(ctx, LaunchRequest{
 		Config:      a.Config,
 		Identity:    a.Identity,
 		PackageLock: selected.Lock,
 		Generation:  selected.Record.ID,
 		SteamBuild:  steam.BuildID,
+		OnReady:     onReady,
 	})
 	if !result.Ready {
 		readinessErr := errors.Join(errors.New("server did not become ready"), err)
 		if candidate {
+			if promotionOutcome == PromotionRecoveryRequired || promotionOutcome == PromotionCommitted {
+				return exitFailure(exitReadiness, readinessErr)
+			}
 			return a.rollbackCandidate(ctx, readinessErr)
 		}
 		return exitFailure(exitReadiness, readinessErr)
 	}
 
-	if candidate {
-		if promoteErr := a.Mods.Promote(ctx, selected); promoteErr != nil {
-			return a.rollbackCandidate(ctx, fmt.Errorf("promote ready candidate: %w", promoteErr))
-		}
+	if candidate && promotionOutcome != PromotionCommitted {
+		return exitFailure(exitReadiness, errors.New("server became ready without a committed candidate promotion"))
 	}
 	if err != nil {
 		return exitFailure(exitShutdown, fmt.Errorf("supervise server shutdown: %w", err))
@@ -463,11 +575,21 @@ func (a *Application) launch(ctx context.Context, selected StagedGeneration, ste
 }
 
 func (a *Application) rollbackCandidate(ctx context.Context, cause error) error {
-	err := a.Mods.Rollback(ctx)
+	cleanupCtx, cancel := a.cleanupContext(ctx)
+	defer cancel()
+	err := a.Mods.Rollback(cleanupCtx)
 	if err != nil {
 		cause = errors.Join(cause, fmt.Errorf("rollback failed candidate: %w", err))
 	}
 	return exitFailure(exitReadiness, cause)
+}
+
+func (a *Application) cleanupContext(parent context.Context) (context.Context, context.CancelFunc) {
+	timeout := a.Config.ShutdownTimeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	return context.WithTimeout(context.WithoutCancel(parent), timeout)
 }
 
 func (a *Application) clock() func() time.Time {
@@ -488,44 +610,6 @@ func closeValidatedArchives(archives map[PackageRef]*ValidatedArchive) error {
 		}
 	}
 	return errors.Join(errs...)
-}
-
-func validateActivePackageLock(active GenerationRecord, lock PackageLock) error {
-	if active.ID == "" || active.LockDigest == "" {
-		return errors.New("active generation is incomplete")
-	}
-	if lock.SchemaVersion != schemaVersion || lock.Digest == "" || lock.Digest != active.LockDigest {
-		return errors.New("active package lock does not match the active generation")
-	}
-	if err := validateManagedRootRefs(lock.Roots); err != nil {
-		return err
-	}
-	if len(lock.Packages) == 0 || lock.Digest != PackageLockDigest(lock) {
-		return errors.New("active package lock is not canonical")
-	}
-	dependencies := make(map[PackageRef][]PackageRef, len(lock.Packages))
-	for _, pkg := range lock.Packages {
-		if pkg.Ref.Namespace == "" || pkg.Ref.Name == "" || pkg.Ref.Version == "" || !validSHA256(pkg.SHA256) {
-			return errors.New("active package lock contains an invalid package")
-		}
-		if _, duplicate := dependencies[pkg.Ref]; duplicate {
-			return errors.New("active package lock contains a duplicate package")
-		}
-		dependencies[pkg.Ref] = pkg.Dependencies
-	}
-	order, err := canonicalPackageOrder(lock.Roots, dependencies)
-	if err != nil {
-		return err
-	}
-	if len(order) != len(lock.Packages) {
-		return errors.New("active package lock contains unreachable packages")
-	}
-	for i, ref := range order {
-		if ref != lock.Packages[i].Ref {
-			return errors.New("active package lock packages are not canonical")
-		}
-	}
-	return nil
 }
 
 func validateRunMounts(cfg Config) error {

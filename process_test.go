@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -762,6 +764,271 @@ func TestSupervisorRecordsPIDAndUsesSelectedReadinessVersions(t *testing.T) {
 	ticks, _, _ := factory.wine.snapshot()
 	if ticks != 2 {
 		t.Fatalf("StartTicks calls = %d, want 2", ticks)
+	}
+}
+
+func TestSupervisorCommitsReadinessWhileWineIsAlive(t *testing.T) {
+	request, store := testLaunchRequest(t, false)
+	factory := newFakeProcessFactory()
+	callbackCalled := make(chan struct{})
+	request.OnReady = func(ctx context.Context) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		state, err := store.Load()
+		if err != nil {
+			return err
+		}
+		if state.Runtime.Ready || state.Runtime.Phase != "starting" {
+			return fmt.Errorf("runtime before readiness commit = %#v", state.Runtime)
+		}
+		ticks, _, signals := factory.wine.snapshot()
+		if ticks < 2 || len(signals) != 0 {
+			return fmt.Errorf("Wine was not live at readiness commit: ticks=%d signals=%v", ticks, signals)
+		}
+		close(callbackCalled)
+		return nil
+	}
+	supervisor := testSupervisor(store, factory)
+	outcome := runSupervisor(t, supervisor, request, factory)
+
+	select {
+	case <-callbackCalled:
+	case <-time.After(time.Second):
+		t.Fatal("readiness callback was not called")
+	}
+	waitForReadyState(t, factory)
+	select {
+	case got := <-outcome:
+		t.Fatalf("Supervisor.Run returned while ready Wine was alive: %#v", got)
+	default:
+	}
+	factory.wine.finish(0, nil)
+	got := receiveOutcome(t, outcome)
+	if got.err != nil || !got.result.Ready {
+		t.Fatalf("Run() = %#v, %v", got.result, got.err)
+	}
+}
+
+func TestSupervisorRechecksWineAfterReadinessCallback(t *testing.T) {
+	request, store := testLaunchRequest(t, false)
+	factory := newFakeProcessFactory()
+	request.OnReady = func(context.Context) error {
+		factory.wine.finish(47, nil)
+		return nil
+	}
+	supervisor := testSupervisor(store, factory)
+
+	got := receiveOutcome(t, runSupervisor(t, supervisor, request, factory))
+	if got.result.Ready {
+		t.Fatal("Ready = true after Wine exited during readiness callback")
+	}
+	if got.err == nil || !strings.Contains(got.err.Error(), "before readiness") {
+		t.Fatalf("Run() error = %v, want post-callback liveness failure", got.err)
+	}
+	state, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Runtime.Ready {
+		t.Fatalf("runtime = %#v after Wine exited during readiness callback", state.Runtime)
+	}
+}
+
+func TestSupervisorReadinessCallbackFailureStopsWineWithoutReadyCommit(t *testing.T) {
+	request, store := testLaunchRequest(t, false)
+	factory := newFakeProcessFactory()
+	factory.wine.exitOn[syscall.SIGTERM] = 0
+	want := errors.New("promotion commit failed")
+	request.OnReady = func(context.Context) error { return want }
+	supervisor := testSupervisor(store, factory)
+
+	got := receiveOutcome(t, runSupervisor(t, supervisor, request, factory))
+	if !errors.Is(got.err, want) {
+		t.Fatalf("Run() error = %v, want readiness callback failure", got.err)
+	}
+	if got.result.Ready {
+		t.Fatal("Ready = true after readiness callback failure")
+	}
+	_, _, signals := factory.wine.snapshot()
+	if !slices.Equal(signals, []os.Signal{syscall.SIGTERM}) {
+		t.Fatalf("Wine signals = %v, want TERM", signals)
+	}
+	state, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Runtime.Ready || state.Runtime.Phase != "stopped" {
+		t.Fatalf("runtime after callback failure = %#v", state.Runtime)
+	}
+}
+
+func TestSupervisorStoppedSavePreservesCallbackRecoveryState(t *testing.T) {
+	request, store := testLaunchRequest(t, false)
+	factory := newFakeProcessFactory()
+	factory.wine.exitOn[syscall.SIGTERM] = 0
+	request.OnReady = func(context.Context) error {
+		state, err := store.Load()
+		if err != nil {
+			return err
+		}
+		state.Promotion = &PromotionJournal{GenerationID: "pending", Lock: PackageLock{Digest: strings.Repeat("a", 64)}}
+		if err := store.Save(state); err != nil {
+			return err
+		}
+		return errors.New("promotion requires recovery")
+	}
+	supervisor := testSupervisor(store, factory)
+
+	got := receiveOutcome(t, runSupervisor(t, supervisor, request, factory))
+	if got.err == nil {
+		t.Fatal("Run() succeeded after callback recovery failure")
+	}
+	state, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Promotion == nil || state.Promotion.GenerationID != "pending" || state.Runtime.Phase != "stopped" {
+		t.Fatalf("stopped recovery state = %#v", state)
+	}
+}
+
+func TestSupervisorReadySavePreservesCallbackState(t *testing.T) {
+	request, store := testLaunchRequest(t, false)
+	factory := newFakeProcessFactory()
+	request.OnReady = func(context.Context) error {
+		state, err := store.Load()
+		if err != nil {
+			return err
+		}
+		state.Active = &GenerationRecord{ID: "committed", LockDigest: strings.Repeat("a", 64), Status: "active"}
+		state.Candidate = nil
+		state.Transaction = nil
+		return store.Save(state)
+	}
+	supervisor := testSupervisor(store, factory)
+	outcome := runSupervisor(t, supervisor, request, factory)
+	waitForReadyState(t, factory)
+
+	state, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Active == nil || state.Active.ID != "committed" || state.Candidate != nil || state.Transaction != nil {
+		t.Fatalf("state after ready save = %#v, callback commit was clobbered", state)
+	}
+	factory.wine.finish(0, nil)
+	if got := receiveOutcome(t, outcome); got.err != nil {
+		t.Fatalf("Run() error = %v", got.err)
+	}
+}
+
+func TestSupervisorReadyRecordsKnownGoodSteamBuild(t *testing.T) {
+	request, store := testLaunchRequest(t, false)
+	if err := store.Save(State{SchemaVersion: schemaVersion, SteamBuild: "old-build"}); err != nil {
+		t.Fatal(err)
+	}
+	factory := newFakeProcessFactory()
+	supervisor := testSupervisor(store, factory)
+	outcome := runSupervisor(t, supervisor, request, factory)
+	waitForReadyState(t, factory)
+
+	state, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.SteamBuild != request.SteamBuild {
+		t.Fatalf("recorded known-good Steam build = %q, want %q", state.SteamBuild, request.SteamBuild)
+	}
+	factory.wine.finish(0, nil)
+	if got := receiveOutcome(t, outcome); got.err != nil {
+		t.Fatalf("Run() error = %v", got.err)
+	}
+}
+
+func TestSupervisorReadySaveFailureDoesNotReportReady(t *testing.T) {
+	request, store := testLaunchRequest(t, false)
+	factory := newFakeProcessFactory()
+	factory.wine.exitOn[syscall.SIGTERM] = 0
+	want := errors.New("ready state write failed")
+	writes := 0
+	store.beforeWrite = func(name string) error {
+		if name == "state.json" {
+			writes++
+			if writes == 2 {
+				return want
+			}
+		}
+		return nil
+	}
+	supervisor := testSupervisor(store, factory)
+
+	got := receiveOutcome(t, runSupervisor(t, supervisor, request, factory))
+	if !errors.Is(got.err, want) {
+		t.Fatalf("Run() error = %v, want ready persistence failure", got.err)
+	}
+	if got.result.Ready {
+		t.Fatal("Ready = true when the ready state was not durably persisted")
+	}
+}
+
+func TestSupervisorPreservesDegradedRuntimeAcrossLifecycle(t *testing.T) {
+	request, store := testLaunchRequest(t, false)
+	reason := strings.Repeat("remote metadata unavailable; ", 20)
+	if err := store.Save(State{
+		SchemaVersion: schemaVersion,
+		Runtime: RuntimeState{
+			Phase:      "degraded",
+			Degraded:   true,
+			Reason:     reason,
+			Generation: request.Generation,
+			SteamBuild: request.SteamBuild,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	factory := newFakeProcessFactory()
+	supervisor := testSupervisor(store, factory)
+	var output bytes.Buffer
+	supervisor.Readiness.Output = &output
+	starting := make(chan RuntimeState, 1)
+	supervisor.waitReadiness = func(context.Context, ReadinessMonitor, ExpectedReadiness) error {
+		state, err := store.Load()
+		if err != nil {
+			return err
+		}
+		starting <- state.Runtime
+		return nil
+	}
+	outcome := runSupervisor(t, supervisor, request, factory)
+
+	gotStarting := <-starting
+	if !gotStarting.Degraded || gotStarting.Reason != reason || gotStarting.Phase != "starting" {
+		t.Fatalf("starting degraded runtime = %#v", gotStarting)
+	}
+	waitForReadyState(t, factory)
+	ready, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ready.Runtime.Degraded || ready.Runtime.Reason != reason || ready.Runtime.Phase != "ready" || !ready.Runtime.Ready {
+		t.Fatalf("ready degraded runtime = %#v", ready.Runtime)
+	}
+	warning := output.String()
+	if !strings.HasPrefix(warning, "warning: starting degraded server: ") || len(warning) > 200 {
+		t.Fatalf("degraded warning = %q, length %d", warning, len(warning))
+	}
+
+	factory.wine.finish(0, nil)
+	if got := receiveOutcome(t, outcome); got.err != nil {
+		t.Fatalf("Run() error = %v", got.err)
+	}
+	stopped, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !stopped.Runtime.Degraded || stopped.Runtime.Reason != reason || stopped.Runtime.Phase != "stopped" || stopped.Runtime.Ready {
+		t.Fatalf("stopped degraded runtime = %#v", stopped.Runtime)
 	}
 }
 

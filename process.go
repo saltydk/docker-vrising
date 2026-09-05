@@ -49,6 +49,7 @@ type LaunchRequest struct {
 	PackageLock PackageLock
 	Generation  string
 	SteamBuild  string
+	OnReady     func(context.Context) error
 }
 
 type RunResult struct {
@@ -190,10 +191,15 @@ func (s *Supervisor) Run(ctx context.Context, request LaunchRequest) (result Run
 			returnErr = errors.Join(returnErr, s.stopProcess(xvfb, request.Config.ShutdownTimeout))
 		}
 		if runtimeRecorded {
-			state.Runtime.Phase = "stopped"
-			state.Runtime.Ready = false
-			state.Runtime.UpdatedAt = now()
-			returnErr = errors.Join(returnErr, wrapError("save stopped runtime state", s.Store.Save(state)))
+			latest, err := s.Store.Load()
+			if err != nil {
+				returnErr = errors.Join(returnErr, fmt.Errorf("load stopped runtime state: %w", err))
+			} else {
+				latest.Runtime.Phase = "stopped"
+				latest.Runtime.Ready = false
+				latest.Runtime.UpdatedAt = now()
+				returnErr = errors.Join(returnErr, wrapError("save stopped runtime state", s.Store.Save(latest)))
+			}
 		}
 	}()
 
@@ -246,17 +252,19 @@ func (s *Supervisor) Run(ctx context.Context, request LaunchRequest) (result Run
 	if err := wine.recordStartTicks("Wine"); err != nil {
 		return RunResult{}, err
 	}
-	state.Runtime = RuntimeState{
-		Phase:      "starting",
-		Server:     ProcessIdentity{PID: wine.process.PID(), StartTicks: wine.startTicks},
-		Generation: request.Generation,
-		SteamBuild: request.SteamBuild,
-		UpdatedAt:  now(),
-	}
+	state.Runtime.Phase = "starting"
+	state.Runtime.Ready = false
+	state.Runtime.Server = ProcessIdentity{PID: wine.process.PID(), StartTicks: wine.startTicks}
+	state.Runtime.Generation = request.Generation
+	state.Runtime.SteamBuild = request.SteamBuild
+	state.Runtime.UpdatedAt = now()
 	if err := s.Store.Save(state); err != nil {
 		return RunResult{}, fmt.Errorf("save starting runtime state: %w", err)
 	}
 	runtimeRecorded = true
+	if state.Runtime.Degraded && s.Readiness.Output != nil {
+		fmt.Fprintf(s.Readiness.Output, "warning: starting degraded server: %s\n", shortLogReason(state.Runtime.Reason))
+	}
 
 	monitor := *s.Readiness
 	monitor.ServerLog = serverLog
@@ -309,16 +317,44 @@ func (s *Supervisor) Run(ctx context.Context, request LaunchRequest) (result Run
 				result.ExitCode = wine.result.exitCode
 				return result, errors.Join(err, returnErr)
 			}
-			result.Ready = true
+			if request.OnReady != nil {
+				if err := request.OnReady(runCtx); err != nil {
+					cancelRun()
+					returnErr = s.stopWine(ctx, wine, syscall.SIGTERM, request.Config.ShutdownTimeout, wineEnv)
+					result.ExitCode = wine.result.exitCode
+					return result, errors.Join(fmt.Errorf("commit server readiness: %w", err), returnErr)
+				}
+				if err := xvfb.verifyAlive("Xvfb"); err != nil {
+					cancelRun()
+					returnErr = s.stopWine(ctx, wine, syscall.SIGTERM, request.Config.ShutdownTimeout, wineEnv)
+					result.ExitCode = wine.result.exitCode
+					return result, errors.Join(err, returnErr)
+				}
+				if err := wine.verifyAlive("Wine"); err != nil {
+					cancelRun()
+					returnErr = s.stopWine(ctx, wine, syscall.SIGTERM, request.Config.ShutdownTimeout, wineEnv)
+					result.ExitCode = wine.result.exitCode
+					return result, errors.Join(err, returnErr)
+				}
+			}
+			state, err = s.Store.Load()
+			if err != nil {
+				cancelRun()
+				returnErr = s.stopWine(ctx, wine, syscall.SIGTERM, request.Config.ShutdownTimeout, wineEnv)
+				result.ExitCode = wine.result.exitCode
+				return result, errors.Join(fmt.Errorf("reload runtime state after readiness commit: %w", err), returnErr)
+			}
 			state.Runtime.Phase = "ready"
 			state.Runtime.Ready = true
 			state.Runtime.UpdatedAt = now()
+			state.SteamBuild = request.SteamBuild
 			if err := s.Store.Save(state); err != nil {
 				cancelRun()
 				returnErr = s.stopWine(ctx, wine, syscall.SIGTERM, request.Config.ShutdownTimeout, wineEnv)
 				result.ExitCode = wine.result.exitCode
 				return result, errors.Join(fmt.Errorf("save ready runtime state: %w", err), returnErr)
 			}
+			result.Ready = true
 			readinessResults = nil
 		case received := <-signalChannel:
 			if received != syscall.SIGTERM && received != os.Interrupt {

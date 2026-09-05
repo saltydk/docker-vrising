@@ -121,13 +121,25 @@ func (f *recordingArchiveFetcher) assertClosed(t *testing.T) {
 
 type recordingModLifecycle struct {
 	recorder         *runRecorder
+	validateErr      error
 	stageErr         error
 	applyErr         error
 	promoteErr       error
+	promoteOutcome   PromotionCommitOutcome
+	rollbackCtxErr   error
+	rollbackDeadline bool
+	discardErr       error
 	corruptStageLock bool
 	staged           StagedGeneration
 	stageLock        PackageLock
 	archives         map[PackageRef]*ValidatedArchive
+}
+
+func (m *recordingModLifecycle) ValidateActive(_ context.Context, record GenerationRecord, lock PackageLock) (StagedGeneration, error) {
+	if m.validateErr != nil {
+		return StagedGeneration{}, m.validateErr
+	}
+	return StagedGeneration{Record: record, Lock: lock}, nil
 }
 
 func (m *recordingModLifecycle) Stage(_ context.Context, lock PackageLock, archives map[PackageRef]*ValidatedArchive) (StagedGeneration, error) {
@@ -153,8 +165,10 @@ func (m *recordingModLifecycle) Apply(_ context.Context, staged StagedGeneration
 	return m.applyErr
 }
 
-func (m *recordingModLifecycle) Rollback(context.Context) error {
+func (m *recordingModLifecycle) Rollback(ctx context.Context) error {
 	m.recorder.add("rollback")
+	m.rollbackCtxErr = ctx.Err()
+	_, m.rollbackDeadline = ctx.Deadline()
 	return nil
 }
 
@@ -162,6 +176,25 @@ func (m *recordingModLifecycle) Promote(_ context.Context, staged StagedGenerati
 	m.recorder.add("promote")
 	m.staged = staged
 	return m.promoteErr
+}
+
+func (m *recordingModLifecycle) CommitPromotion(_ context.Context, staged StagedGeneration) (PromotionCommitOutcome, error) {
+	m.recorder.add("promote")
+	m.staged = staged
+	outcome := m.promoteOutcome
+	if outcome == PromotionNotCommitted && m.promoteErr == nil {
+		outcome = PromotionCommitted
+	}
+	return outcome, m.promoteErr
+}
+
+func (m *recordingModLifecycle) RecoverPromotion(context.Context) (PromotionCommitOutcome, error) {
+	return PromotionNotCommitted, nil
+}
+
+func (m *recordingModLifecycle) Discard(context.Context, StagedGeneration) error {
+	m.recorder.add("discard")
+	return m.discardErr
 }
 
 type recordingBackupCreator struct {
@@ -186,6 +219,8 @@ type recordingSteamLifecycle struct {
 	remoteErr    error
 	updated      SteamBuild
 	updateErr    error
+	validateErr  error
+	validated    []SteamBuild
 }
 
 func (s *recordingSteamLifecycle) InstalledBuild() (SteamBuild, error) {
@@ -202,24 +237,56 @@ func (s *recordingSteamLifecycle) Update(_ context.Context, _ SteamBuild) (Steam
 	return s.updated, s.updateErr
 }
 
-type recordingServerSupervisor struct {
-	recorder *runRecorder
-	store    *recordingRunStore
-	result   RunResult
-	err      error
-	request  LaunchRequest
+func (s *recordingSteamLifecycle) ValidateInstalled(expected SteamBuild) (SteamBuild, error) {
+	s.validated = append(s.validated, expected)
+	if s.validateErr != nil {
+		return SteamBuild{}, s.validateErr
+	}
+	return expected, nil
 }
 
-func (s *recordingServerSupervisor) Run(_ context.Context, request LaunchRequest) (RunResult, error) {
+type recordingServerSupervisor struct {
+	recorder     *runRecorder
+	store        *recordingRunStore
+	result       RunResult
+	err          error
+	request      LaunchRequest
+	beforeReturn func()
+}
+
+func (s *recordingServerSupervisor) Run(ctx context.Context, request LaunchRequest) (RunResult, error) {
 	s.recorder.add("launch")
-	if !s.store.held {
+	if s.store != nil && !s.store.held {
 		return RunResult{}, errors.New("lifetime lock released before launch")
 	}
 	s.request = request
 	if s.result.Ready {
+		s.recorder.add("readiness")
+		if request.Generation == "candidate" && request.OnReady == nil {
+			return RunResult{}, errors.New("candidate launch has no readiness commit")
+		}
+		if request.OnReady != nil {
+			if err := request.OnReady(ctx); err != nil {
+				return RunResult{}, err
+			}
+		}
 		s.recorder.add("ready")
 	}
+	if s.beforeReturn != nil {
+		s.beforeReturn()
+	}
 	return s.result, s.err
+}
+
+type recordingProcInspector struct {
+	identity ProcessIdentity
+	err      error
+	pids     []int
+}
+
+func (p *recordingProcInspector) Identity(pid int) (ProcessIdentity, error) {
+	p.pids = append(p.pids, pid)
+	return p.identity, p.err
 }
 
 type runFixture struct {
@@ -278,6 +345,8 @@ func newRunFixture(t *testing.T) *runFixture {
 		KindredVersion:      "latest",
 		SatisvamporyVersion: "latest",
 		BackupRetention:     3,
+		StartupTimeout:      time.Minute,
+		ShutdownTimeout:     time.Minute,
 		LogDays:             7,
 		Branch:              "public",
 	}
@@ -316,7 +385,7 @@ func TestRunFirstInstallSuccess(t *testing.T) {
 		"mounts", "lock", "recover", "resolve",
 		"fetch:KindredCommands", "fetch:Satisvampory", "stage",
 		"remote-build", "backup", "steam-update", "apply",
-		"prune-logs", "launch", "ready", "promote", "unlock",
+		"prune-logs", "launch", "readiness", "promote", "ready", "unlock",
 	}
 	if !slices.Equal(fixture.recorder.events, wantEvents) {
 		t.Fatalf("events = %q, want %q", fixture.recorder.events, wantEvents)
@@ -330,6 +399,123 @@ func TestRunFirstInstallSuccess(t *testing.T) {
 		t.Fatalf("launch package lock = %#v, staged lock = %#v", got, fixture.mods.stageLock)
 	}
 	fixture.archives.assertClosed(t)
+}
+
+func TestRunRejectsRecordedLiveProcessBeforeMutation(t *testing.T) {
+	fixture := newRunFixture(t)
+	recorded := ProcessIdentity{PID: 4242, StartTicks: 987654}
+	store := installRealRunState(t, fixture, State{
+		SchemaVersion: schemaVersion,
+		Runtime:       RuntimeState{Phase: "ready", Ready: true, Server: recorded},
+	})
+	proc := &recordingProcInspector{identity: recorded}
+	fixture.app.Proc = proc
+
+	err := fixture.app.Run(t.Context())
+	assertRunExitCode(t, err, exitPreflight)
+
+	if !slices.Equal(proc.pids, []int{recorded.PID}) {
+		t.Fatalf("inspected PIDs = %v, want %d", proc.pids, recorded.PID)
+	}
+	assertNoEvent(t, fixture.recorder.events, "resolve")
+	assertNoEvent(t, fixture.recorder.events, "remote-build")
+	assertNoEvent(t, fixture.recorder.events, "launch")
+	state, loadErr := store.Load()
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if state.Runtime.Server != recorded {
+		t.Fatalf("live runtime identity = %#v, want preserved %#v", state.Runtime.Server, recorded)
+	}
+}
+
+func TestRunRejectsActualRecordedCurrentProcess(t *testing.T) {
+	fixture := newRunFixture(t)
+	inspector := procFSInspector{}
+	recorded, err := inspector.Identity(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	installRealRunState(t, fixture, State{
+		SchemaVersion: schemaVersion,
+		Runtime:       RuntimeState{Phase: "ready", Ready: true, Server: recorded},
+	})
+	fixture.app.Proc = inspector
+
+	err = fixture.app.Run(t.Context())
+	assertRunExitCode(t, err, exitPreflight)
+	assertNoEvent(t, fixture.recorder.events, "resolve")
+	assertNoEvent(t, fixture.recorder.events, "remote-build")
+}
+
+func TestRunClearsReusedRecordedProcessBeforeMutation(t *testing.T) {
+	fixture := newRunFixture(t)
+	fixture.app.Config.ModsEnabled = false
+	fixture.app.Config.UpdateGame = false
+	recorded := ProcessIdentity{PID: 4242, StartTicks: 987654}
+	store := installRealRunState(t, fixture, State{
+		SchemaVersion: schemaVersion,
+		Runtime:       RuntimeState{Phase: "ready", Ready: true, Server: recorded},
+	})
+	fixture.app.Proc = &recordingProcInspector{identity: ProcessIdentity{PID: recorded.PID, StartTicks: recorded.StartTicks + 1}}
+
+	if err := fixture.app.Run(t.Context()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	state, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Runtime.Server != (ProcessIdentity{}) || state.Runtime.Ready || state.Runtime.Phase != "stopped" {
+		t.Fatalf("cleared stale runtime = %#v", state.Runtime)
+	}
+	assertEventBefore(t, fixture.recorder.events, "prune-logs", "launch")
+}
+
+func TestRunPreservesRecordedProcessWhenInspectionIsInconclusive(t *testing.T) {
+	fixture := newRunFixture(t)
+	recorded := ProcessIdentity{PID: 4242, StartTicks: 987654}
+	store := installRealRunState(t, fixture, State{
+		SchemaVersion: schemaVersion,
+		Runtime:       RuntimeState{Phase: "ready", Ready: true, Server: recorded},
+	})
+	fixture.app.Proc = &recordingProcInspector{}
+
+	err := fixture.app.Run(t.Context())
+	assertRunExitCode(t, err, exitPreflight)
+	state, loadErr := store.Load()
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if state.Runtime.Server != recorded || !state.Runtime.Ready {
+		t.Fatalf("inconclusive inspection changed runtime = %#v", state.Runtime)
+	}
+	assertNoEvent(t, fixture.recorder.events, "resolve")
+}
+
+func TestRunClearsDeadRecordedProcessBeforeMutation(t *testing.T) {
+	fixture := newRunFixture(t)
+	fixture.app.Config.ModsEnabled = false
+	fixture.app.Config.UpdateGame = false
+	recorded := ProcessIdentity{PID: 4242, StartTicks: 987654}
+	store := installRealRunState(t, fixture, State{
+		SchemaVersion: schemaVersion,
+		Runtime:       RuntimeState{Phase: "starting", Server: recorded},
+	})
+	fixture.app.Proc = &recordingProcInspector{err: os.ErrNotExist}
+
+	if err := fixture.app.Run(t.Context()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	state, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Runtime.Server != (ProcessIdentity{}) || state.Runtime.Phase != "stopped" {
+		t.Fatalf("cleared dead runtime = %#v", state.Runtime)
+	}
 }
 
 func TestRunFirstInstallAcceptsMissingState(t *testing.T) {
@@ -365,6 +551,7 @@ func TestRunRemoteOutageUsesKnownGoodBeforeMutation(t *testing.T) {
 	fixture := newRunFixture(t)
 	activeLock := canonicalTestLock(fixture.resolver.graph, "b")
 	fixture.store.state.Active = &GenerationRecord{ID: "active", LockDigest: activeLock.Digest, Status: "active"}
+	fixture.store.state.SteamBuild = fixture.steam.installed.BuildID
 	fixture.store.lock = activeLock
 	fixture.store.lockErr = nil
 	fixture.steam.remoteErr = errors.New("steam metadata unavailable")
@@ -377,7 +564,7 @@ func TestRunRemoteOutageUsesKnownGoodBeforeMutation(t *testing.T) {
 	wantEvents := []string{
 		"mounts", "lock", "recover", "resolve",
 		"fetch:KindredCommands", "fetch:Satisvampory", "stage",
-		"remote-build", "prune-logs", "launch", "ready", "unlock",
+		"remote-build", "discard", "prune-logs", "launch", "readiness", "ready", "unlock",
 	}
 	if !slices.Equal(fixture.recorder.events, wantEvents) {
 		t.Fatalf("events = %q, want %q", fixture.recorder.events, wantEvents)
@@ -392,6 +579,23 @@ func TestRunRemoteOutageUsesKnownGoodBeforeMutation(t *testing.T) {
 		t.Fatal("remote outage did not persist degraded runtime state")
 	}
 	fixture.archives.assertClosed(t)
+}
+
+func TestRunFallbackDiscardsUnreferencedCandidate(t *testing.T) {
+	fixture := newRunFixture(t)
+	activeLock := canonicalTestLock(fixture.resolver.graph, "b")
+	fixture.store.state.Active = &GenerationRecord{ID: "active", LockDigest: activeLock.Digest, Status: "active"}
+	fixture.store.state.SteamBuild = fixture.steam.installed.BuildID
+	fixture.store.lock = activeLock
+	fixture.store.lockErr = nil
+	fixture.steam.remoteErr = errors.New("steam metadata unavailable")
+
+	if err := fixture.app.Run(t.Context()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	assertEventBefore(t, fixture.recorder.events, "stage", "discard")
+	assertEventBefore(t, fixture.recorder.events, "discard", "launch")
 }
 
 func TestRunRemoteOutageWithoutKnownGoodUsesSteamExit(t *testing.T) {
@@ -470,6 +674,7 @@ func TestRunBackupFailureSkipsSteamAndUsesKnownGood(t *testing.T) {
 	fixture := newRunFixture(t)
 	activeLock := canonicalTestLock(fixture.resolver.graph, "b")
 	fixture.store.state.Active = &GenerationRecord{ID: "active", LockDigest: activeLock.Digest, Status: "active"}
+	fixture.store.state.SteamBuild = fixture.steam.installed.BuildID
 	fixture.store.lock = activeLock
 	fixture.store.lockErr = nil
 	fixture.backups.err = errors.New("backup disk full")
@@ -506,6 +711,7 @@ func TestRunSteamFailureAfterMutationFailsClosed(t *testing.T) {
 	fixture := newRunFixture(t)
 	activeLock := canonicalTestLock(fixture.resolver.graph, "b")
 	fixture.store.state.Active = &GenerationRecord{ID: "active", LockDigest: activeLock.Digest, Status: "active"}
+	fixture.store.state.SteamBuild = fixture.steam.installed.BuildID
 	fixture.store.lock = activeLock
 	fixture.store.lockErr = nil
 	fixture.steam.updateErr = &SteamPostMutationError{Err: errors.New("validation failed")}
@@ -547,7 +753,8 @@ func TestRunPromotesCandidateOnlyAfterReadiness(t *testing.T) {
 		t.Fatalf("Run() error = %v", err)
 	}
 
-	assertEventBefore(t, fixture.recorder.events, "ready", "promote")
+	assertEventBefore(t, fixture.recorder.events, "readiness", "promote")
+	assertEventBefore(t, fixture.recorder.events, "promote", "ready")
 	if fixture.mods.staged.Record.ID != "candidate" {
 		t.Fatalf("promoted generation = %q, want candidate", fixture.mods.staged.Record.ID)
 	}
@@ -569,18 +776,32 @@ func TestRunLaunchesTheCanonicalSelectedLock(t *testing.T) {
 func TestRunPromotionFailureRollsBackCandidate(t *testing.T) {
 	fixture := newRunFixture(t)
 	fixture.mods.promoteErr = errors.New("promotion journal unavailable")
+	fixture.mods.promoteOutcome = PromotionNotCommitted
 
 	err := fixture.app.Run(t.Context())
 	assertRunExitCode(t, err, exitReadiness)
 
-	assertEventBefore(t, fixture.recorder.events, "ready", "promote")
+	assertEventBefore(t, fixture.recorder.events, "readiness", "promote")
 	assertEventBefore(t, fixture.recorder.events, "promote", "rollback")
+}
+
+func TestRunPromotionRecoveryRequiredDoesNotRollbackCandidate(t *testing.T) {
+	fixture := newRunFixture(t)
+	fixture.mods.promoteErr = errors.New("promotion lock was written before failure")
+	fixture.mods.promoteOutcome = PromotionRecoveryRequired
+
+	err := fixture.app.Run(t.Context())
+	assertRunExitCode(t, err, exitReadiness)
+
+	assertEventBefore(t, fixture.recorder.events, "readiness", "promote")
+	assertNoEvent(t, fixture.recorder.events, "rollback")
 }
 
 func TestRunFailedCandidateRestoresPreviousGeneration(t *testing.T) {
 	fixture := newRunFixture(t)
 	activeLock := canonicalTestLock(fixture.resolver.graph, "b")
 	fixture.store.state.Active = &GenerationRecord{ID: "active", LockDigest: activeLock.Digest, Status: "active"}
+	fixture.store.state.SteamBuild = fixture.steam.installed.BuildID
 	fixture.store.lock = activeLock
 	fixture.store.lockErr = nil
 	fixture.supervisor.result = RunResult{}
@@ -609,6 +830,24 @@ func TestRunFailedFirstCandidateRemainsFailedClosed(t *testing.T) {
 		t.Fatalf("rollback count = %d, want 1", got)
 	}
 	assertNoEvent(t, fixture.recorder.events, "promote")
+}
+
+func TestRunFailedCandidateRollsBackWithBoundedUncancelledContext(t *testing.T) {
+	fixture := newRunFixture(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	fixture.supervisor.result = RunResult{}
+	fixture.supervisor.err = context.Canceled
+	fixture.supervisor.beforeReturn = cancel
+
+	err := fixture.app.Run(ctx)
+	assertRunExitCode(t, err, exitReadiness)
+
+	if fixture.mods.rollbackCtxErr != nil {
+		t.Fatalf("Rollback() context error = %v, want live cleanup context", fixture.mods.rollbackCtxErr)
+	}
+	if !fixture.mods.rollbackDeadline {
+		t.Fatal("Rollback() context has no cleanup deadline")
+	}
 }
 
 func TestRunRejectsPreviouslyFailedLockWithoutRetry(t *testing.T) {
@@ -647,6 +886,26 @@ func TestRunModsDisabledSkipsThunderstore(t *testing.T) {
 	}
 }
 
+func TestRunPrunesCurrentServerLogDirectory(t *testing.T) {
+	fixture := newRunFixture(t)
+	fixture.app.Config.ModsEnabled = false
+	fixture.app.Config.UpdateGame = false
+	var gotDir string
+	fixture.app.pruneLogs = func(dir string, _ int, _ time.Time) error {
+		gotDir = dir
+		return nil
+	}
+
+	if err := fixture.app.Run(t.Context()); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	wantDir := filepath.Join(fixture.app.Config.DataDir, "logs")
+	if gotDir != wantDir {
+		t.Fatalf("PruneLogs() directory = %q, want %q", gotDir, wantDir)
+	}
+}
+
 func TestRunModsDisabledStillRequiresBackupDependencyForUpdates(t *testing.T) {
 	fixture := newRunFixture(t)
 	fixture.app.Config.ModsEnabled = false
@@ -675,6 +934,7 @@ func TestRunUpdateModsFalseRequiresExistingLock(t *testing.T) {
 		fixture.app.Config.UpdateGame = false
 		activeLock := canonicalTestLock(fixture.resolver.graph, "b")
 		fixture.store.state.Active = &GenerationRecord{ID: "active", LockDigest: activeLock.Digest, Status: "active"}
+		fixture.store.state.SteamBuild = fixture.steam.installed.BuildID
 		fixture.store.lock = activeLock
 		fixture.store.lockErr = nil
 
@@ -692,6 +952,67 @@ func TestRunUpdateModsFalseRequiresExistingLock(t *testing.T) {
 	})
 }
 
+func TestRunFallbackRequiresDurablyRecordedSteamBuild(t *testing.T) {
+	fixture := newRunFixture(t)
+	activeLock := canonicalTestLock(fixture.resolver.graph, "b")
+	fixture.store.state.Active = &GenerationRecord{ID: "active", LockDigest: activeLock.Digest, Status: "active"}
+	fixture.store.state.SteamBuild = "different-build"
+	fixture.store.lock = activeLock
+	fixture.store.lockErr = nil
+	fixture.steam.remoteErr = errors.New("steam metadata unavailable")
+
+	err := fixture.app.Run(t.Context())
+	assertRunExitCode(t, err, exitSteam)
+	assertNoEvent(t, fixture.recorder.events, "launch")
+}
+
+func TestRunFallbackRequiresValidatedSteamRuntime(t *testing.T) {
+	fixture := newRunFixture(t)
+	activeLock := canonicalTestLock(fixture.resolver.graph, "b")
+	fixture.store.state.Active = &GenerationRecord{ID: "active", LockDigest: activeLock.Digest, Status: "active"}
+	fixture.store.state.SteamBuild = fixture.steam.installed.BuildID
+	fixture.store.lock = activeLock
+	fixture.store.lockErr = nil
+	fixture.steam.remoteErr = errors.New("steam metadata unavailable")
+	fixture.steam.validateErr = errors.New("steam_appid.txt is missing")
+
+	err := fixture.app.Run(t.Context())
+	assertRunExitCode(t, err, exitSteam)
+	assertNoEvent(t, fixture.recorder.events, "launch")
+}
+
+func TestRunUpdateModsFalseRequiresValidatedActiveGeneration(t *testing.T) {
+	fixture := newRunFixture(t)
+	fixture.app.Config.UpdateMods = false
+	activeLock := canonicalTestLock(fixture.resolver.graph, "b")
+	fixture.store.state.Active = &GenerationRecord{ID: "active", LockDigest: activeLock.Digest, Status: "active"}
+	fixture.store.state.SteamBuild = fixture.steam.installed.BuildID
+	fixture.store.lock = activeLock
+	fixture.store.lockErr = nil
+	fixture.mods.validateErr = errors.New("active overlay digest mismatch")
+
+	err := fixture.app.Run(t.Context())
+	assertRunExitCode(t, err, exitModUpdate)
+	assertNoEvent(t, fixture.recorder.events, "remote-build")
+	assertNoEvent(t, fixture.recorder.events, "launch")
+}
+
+func TestRunUpdateModsFalseRequiresValidatedSteamRuntime(t *testing.T) {
+	fixture := newRunFixture(t)
+	fixture.app.Config.UpdateMods = false
+	activeLock := canonicalTestLock(fixture.resolver.graph, "b")
+	fixture.store.state.Active = &GenerationRecord{ID: "active", LockDigest: activeLock.Digest, Status: "active"}
+	fixture.store.state.SteamBuild = fixture.steam.installed.BuildID
+	fixture.store.lock = activeLock
+	fixture.store.lockErr = nil
+	fixture.steam.validateErr = errors.New("V Rising executable is missing")
+
+	err := fixture.app.Run(t.Context())
+	assertRunExitCode(t, err, exitSteam)
+	assertNoEvent(t, fixture.recorder.events, "remote-build")
+	assertNoEvent(t, fixture.recorder.events, "launch")
+}
+
 func TestRunPreservesServerExitStatus(t *testing.T) {
 	fixture := newRunFixture(t)
 	fixture.supervisor.result = RunResult{Ready: true, ExitCode: 42}
@@ -699,7 +1020,7 @@ func TestRunPreservesServerExitStatus(t *testing.T) {
 	err := fixture.app.Run(t.Context())
 	assertRunExitCode(t, err, 42)
 
-	assertEventBefore(t, fixture.recorder.events, "ready", "promote")
+	assertEventBefore(t, fixture.recorder.events, "promote", "ready")
 }
 
 func TestRunClosesPartialArchiveSet(t *testing.T) {
@@ -734,6 +1055,18 @@ func canonicalTestLock(graph ResolvedGraph, digestByte string) PackageLock {
 	}
 	lock.Digest = PackageLockDigest(lock)
 	return lock
+}
+
+func installRealRunState(t *testing.T, fixture *runFixture, state State) *Store {
+	t.Helper()
+	store := &Store{StateDir: fixture.app.Config.StateDir}
+	if err := store.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	fixture.app.Store = store
+	fixture.app.stateStore = nil
+	fixture.supervisor.store = nil
+	return store
 }
 
 func assertRunExitCode(t *testing.T, err error, want int) {

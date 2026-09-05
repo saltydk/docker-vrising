@@ -1189,6 +1189,7 @@ func TestPruneLogsDeletesOnlyOwnedExpiredServerLogs(t *testing.T) {
 	for _, name := range []string{
 		"20260828-1200-VRisingServer.log",
 		"20260828-120000-VRisingServer.log",
+		"VRisingServer-20260828T120000.000000000Z-000001.log",
 	} {
 		writeDatedLog(t, root, name, old)
 	}
@@ -1198,6 +1199,9 @@ func TestPruneLogsDeletesOnlyOwnedExpiredServerLogs(t *testing.T) {
 		"20260828-1200-user.log",
 		"BepInEx.log",
 		"backup-20260828-1200-VRisingServer.log",
+		"VRisingServer-20260901T120000.000000000Z-000002.log",
+		"VRisingServer-20260828T120000.000000000Z-00001.log",
+		"VRisingServer-20260828T120000.000000000Z-000003.log.extra",
 	} {
 		writeDatedLog(t, root, name, recent)
 	}
@@ -1211,7 +1215,11 @@ func TestPruneLogsDeletesOnlyOwnedExpiredServerLogs(t *testing.T) {
 	if err := PruneLogs(root, 7, now); err != nil {
 		t.Fatalf("PruneLogs() error = %v", err)
 	}
-	for _, name := range []string{"20260828-1200-VRisingServer.log", "20260828-120000-VRisingServer.log"} {
+	for _, name := range []string{
+		"20260828-1200-VRisingServer.log",
+		"20260828-120000-VRisingServer.log",
+		"VRisingServer-20260828T120000.000000000Z-000001.log",
+	} {
 		if _, err := os.Lstat(filepath.Join(root, name)); !os.IsNotExist(err) {
 			t.Errorf("expired owned log %q stat error = %v, want not exist", name, err)
 		}
@@ -1222,6 +1230,9 @@ func TestPruneLogsDeletesOnlyOwnedExpiredServerLogs(t *testing.T) {
 		"20260828-1200-user.log",
 		"BepInEx.log",
 		"backup-20260828-1200-VRisingServer.log",
+		"VRisingServer-20260901T120000.000000000Z-000002.log",
+		"VRisingServer-20260828T120000.000000000Z-00001.log",
+		"VRisingServer-20260828T120000.000000000Z-000003.log.extra",
 		"20260828-1300-VRisingServer.log",
 	} {
 		if _, err := os.Lstat(filepath.Join(root, name)); err != nil {
@@ -1230,6 +1241,15 @@ func TestPruneLogsDeletesOnlyOwnedExpiredServerLogs(t *testing.T) {
 	}
 	if got, err := os.ReadFile(external); err != nil || string(got) != "preserve\n" {
 		t.Fatalf("external symlink target = %q, %v", got, err)
+	}
+}
+
+func TestPruneLogsMissingDirectoryIsNoop(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "logs")
+	now := time.Date(2026, time.September, 5, 12, 0, 0, 0, time.UTC)
+
+	if err := PruneLogs(root, 7, now); err != nil {
+		t.Fatalf("PruneLogs() missing directory error = %v", err)
 	}
 }
 

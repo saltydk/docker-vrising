@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"strings"
 	"sync"
@@ -715,8 +716,8 @@ func shortLogReason(line string) string {
 	return line[:maximum] + "..."
 }
 
-func PruneLogs(dataDir string, days int, now time.Time) error {
-	return pruneLogsWithHooks(dataDir, days, now, pruneTestHooks{})
+func PruneLogs(logDir string, days int, now time.Time) error {
+	return pruneLogsWithHooks(logDir, days, now, pruneTestHooks{})
 }
 
 type pruneTestHooks struct {
@@ -724,15 +725,18 @@ type pruneTestHooks struct {
 	syncDirectory func(int) error
 }
 
-func pruneLogsWithHooks(dataDir string, days int, now time.Time, hooks pruneTestHooks) error {
+func pruneLogsWithHooks(logDir string, days int, now time.Time, hooks pruneTestHooks) error {
 	if days < 1 || days > maxLogDays {
 		return fmt.Errorf("log retention must be between 1 and %d days", maxLogDays)
 	}
-	root, err := openDirectoryPath(dataDir, false)
+	root, err := openDirectoryPath(logDir, false)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("open log directory: %w", err)
 	}
-	directory := os.NewFile(uintptr(root), dataDir)
+	directory := os.NewFile(uintptr(root), logDir)
 	defer directory.Close()
 	entries, err := directory.ReadDir(-1)
 	if err != nil {
@@ -810,5 +814,26 @@ func ownedServerLogName(name string) bool {
 			return true
 		}
 	}
-	return false
+	const prefix = "VRisingServer-"
+	const suffix = ".log"
+	if !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, suffix) {
+		return false
+	}
+	identity := strings.TrimSuffix(strings.TrimPrefix(name, prefix), suffix)
+	separator := strings.LastIndexByte(identity, '-')
+	if separator < 0 {
+		return false
+	}
+	timestamp := identity[:separator]
+	sequence := identity[separator+1:]
+	if len(sequence) < 6 {
+		return false
+	}
+	for _, digit := range sequence {
+		if digit < '0' || digit > '9' {
+			return false
+		}
+	}
+	_, err := time.ParseInLocation("20060102T150405.000000000Z", timestamp, time.UTC)
+	return err == nil
 }

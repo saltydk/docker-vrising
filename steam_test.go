@@ -38,6 +38,41 @@ func TestParseInstalledBuild(t *testing.T) {
 	}
 }
 
+func TestValidateInstalledRequiresCompleteRuntime(t *testing.T) {
+	tests := []struct {
+		name       string
+		executable bool
+		appID      string
+		expected   SteamBuild
+		wantErr    bool
+	}{
+		{name: "valid", executable: true, appID: steamRuntimeAppID, expected: testSteamBuild("public")},
+		{name: "missing executable", appID: steamRuntimeAppID, expected: testSteamBuild("public"), wantErr: true},
+		{name: "wrong runtime app ID", executable: true, appID: steamAppID, expected: testSteamBuild("public"), wantErr: true},
+		{
+			name:       "recorded build mismatch",
+			executable: true,
+			appID:      steamRuntimeAppID,
+			expected:   SteamBuild{BuildID: "other", DepotManifest: steamTestDepotManifest, Branch: publicBranch},
+			wantErr:    true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := newTestSteamClient(t, nil)
+			installSteamFixture(t, client, publicBranch, tt.executable, tt.appID)
+
+			got, err := client.ValidateInstalled(tt.expected)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ValidateInstalled() = %#v, %v, wantErr %t", got, err, tt.wantErr)
+			}
+			if !tt.wantErr && got != tt.expected {
+				t.Fatalf("ValidateInstalled() = %#v, want %#v", got, tt.expected)
+			}
+		})
+	}
+}
+
 func TestSteamInstalledManifestRejectsAmbiguousVDF(t *testing.T) {
 	fixture := string(readSteamFixture(t, "appmanifest-installed.acf"))
 	tests := []struct {

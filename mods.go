@@ -46,6 +46,14 @@ type StagedGeneration struct {
 	Lock     PackageLock
 }
 
+type PromotionCommitOutcome uint8
+
+const (
+	PromotionNotCommitted PromotionCommitOutcome = iota
+	PromotionCommitted
+	PromotionRecoveryRequired
+)
+
 type ModManager struct {
 	ServerDir      string
 	GenerationsDir string
@@ -56,6 +64,40 @@ type ModManager struct {
 	applyFileHook         func(string) error
 	promotionHook         func(string) error
 	namespaceHook         func(string, string) error
+}
+
+func (m *ModManager) ValidateActive(ctx context.Context, record GenerationRecord, lock PackageLock) (StagedGeneration, error) {
+	if err := ctx.Err(); err != nil {
+		return StagedGeneration{}, err
+	}
+	if err := m.validate(); err != nil {
+		return StagedGeneration{}, err
+	}
+	if record.ID == "" || record.Status != "active" || record.LockDigest == "" || record.LockDigest != lock.Digest {
+		return StagedGeneration{}, fmt.Errorf("active generation record does not match its package lock")
+	}
+	if err := validateManagedPackageLock(lock); err != nil {
+		return StagedGeneration{}, fmt.Errorf("validate active package lock: %w", err)
+	}
+	manifest, err := m.loadManagedManifest(record.ID)
+	if err != nil {
+		return StagedGeneration{}, fmt.Errorf("load active managed manifest: %w", err)
+	}
+	staged := StagedGeneration{
+		Record:   record,
+		Dir:      filepath.Join(m.GenerationsDir, record.ID, overlayDirectory),
+		Manifest: manifest,
+		Lock:     clonePackageLock(lock),
+	}
+	_, _, generationRoot, err := m.openAndValidateStaged(staged)
+	if err != nil {
+		return StagedGeneration{}, err
+	}
+	defer unix.Close(generationRoot)
+	if err := m.verifyStagedOverlay(generationRoot, manifest); err != nil {
+		return StagedGeneration{}, err
+	}
+	return staged, nil
 }
 
 func (m *ModManager) Apply(ctx context.Context, staged StagedGeneration) error {
@@ -310,42 +352,78 @@ func (m *ModManager) Rollback(ctx context.Context) error {
 }
 
 func (m *ModManager) Promote(ctx context.Context, staged StagedGeneration) error {
+	_, err := m.CommitPromotion(ctx, staged)
+	return err
+}
+
+func (m *ModManager) CommitPromotion(ctx context.Context, staged StagedGeneration) (PromotionCommitOutcome, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return PromotionNotCommitted, err
 	}
 	if err := m.validate(); err != nil {
-		return err
+		return PromotionNotCommitted, err
 	}
 	_, lock, generationRoot, err := m.openAndValidateStaged(staged)
 	if err != nil {
-		return err
+		return PromotionNotCommitted, err
 	}
 	if err := unix.Close(generationRoot); err != nil {
-		return fmt.Errorf("close staged generation: %w", err)
+		return PromotionNotCommitted, fmt.Errorf("close staged generation: %w", err)
 	}
 
 	state, err := m.Store.Load()
 	if err != nil {
-		return fmt.Errorf("load mod state for promotion: %w", err)
+		return PromotionNotCommitted, fmt.Errorf("load mod state for promotion: %w", err)
 	}
 	if state.Candidate == nil || state.Candidate.ID != staged.Record.ID || state.Candidate.LockDigest != staged.Record.LockDigest {
-		return fmt.Errorf("staged generation is not the current candidate")
+		return PromotionNotCommitted, fmt.Errorf("staged generation is not the current candidate")
 	}
 	if state.Transaction == nil || state.Transaction.GenerationID != staged.Record.ID || state.Transaction.Phase != "applied" {
-		return fmt.Errorf("candidate generation has not completed apply")
+		return PromotionNotCommitted, fmt.Errorf("candidate generation has not completed apply")
 	}
 	if state.Promotion != nil {
-		return fmt.Errorf("another generation promotion is already pending")
+		return PromotionRecoveryRequired, fmt.Errorf("another generation promotion is already pending")
 	}
 	if _, err := m.Store.transactionArtifacts(state); err != nil {
-		return fmt.Errorf("validate promotion transaction: %w", err)
+		return PromotionNotCommitted, fmt.Errorf("validate promotion transaction: %w", err)
 	}
 	state.Promotion = &PromotionJournal{GenerationID: staged.Record.ID, Lock: clonePackageLock(lock)}
 	state.PendingCleanup = cleanupGenerationIDs(state.Previous, state.Failed)
 	if err := m.Store.Save(state); err != nil {
-		return fmt.Errorf("persist generation promotion intent: %w", err)
+		return PromotionRecoveryRequired, fmt.Errorf("persist generation promotion intent: %w", err)
 	}
-	return m.reconcilePromotion(ctx)
+	if err := m.reconcilePromotion(ctx); err != nil {
+		return PromotionRecoveryRequired, err
+	}
+	return PromotionCommitted, nil
+}
+
+func (m *ModManager) RecoverPromotion(ctx context.Context) (PromotionCommitOutcome, error) {
+	if err := ctx.Err(); err != nil {
+		return PromotionRecoveryRequired, err
+	}
+	if err := m.validate(); err != nil {
+		return PromotionRecoveryRequired, err
+	}
+	state, err := m.Store.Load()
+	if err != nil {
+		return PromotionRecoveryRequired, fmt.Errorf("load promotion state: %w", err)
+	}
+	if state.Promotion == nil {
+		return PromotionNotCommitted, nil
+	}
+	generationID := state.Promotion.GenerationID
+	if err := m.reconcilePromotion(ctx); err != nil {
+		return PromotionRecoveryRequired, fmt.Errorf("reconcile promotion: %w", err)
+	}
+	state, err = m.Store.Load()
+	if err != nil {
+		return PromotionRecoveryRequired, fmt.Errorf("load reconciled promotion state: %w", err)
+	}
+	if state.Promotion != nil || state.Active == nil || state.Active.ID != generationID {
+		return PromotionRecoveryRequired, fmt.Errorf("promotion reconciliation did not commit generation %s", generationID)
+	}
+	return PromotionCommitted, nil
 }
 
 func (m *ModManager) reconcilePromotion(ctx context.Context) error {
@@ -478,6 +556,36 @@ func (m *ModManager) removeGeneration(generationID string) error {
 		return err
 	}
 	return unix.Fsync(root)
+}
+
+func (m *ModManager) Discard(ctx context.Context, staged StagedGeneration) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := m.validate(); err != nil {
+		return err
+	}
+	if staged.Record.ID == "" {
+		return fmt.Errorf("staged generation ID is empty")
+	}
+	if _, err := relativePathParts(staged.Record.ID); err != nil {
+		return fmt.Errorf("invalid staged generation ID: %w", err)
+	}
+	wantDir := filepath.Join(m.GenerationsDir, staged.Record.ID, overlayDirectory)
+	if filepath.Clean(staged.Dir) != wantDir {
+		return fmt.Errorf("staged generation directory does not match its record")
+	}
+	state, err := m.Store.Load()
+	if err != nil {
+		return fmt.Errorf("load mod state before discard: %w", err)
+	}
+	if generationIsReferenced(state, staged.Record.ID) {
+		return fmt.Errorf("generation %s is still referenced", staged.Record.ID)
+	}
+	if err := m.removeGeneration(staged.Record.ID); err != nil {
+		return fmt.Errorf("remove unreferenced generation %s: %w", staged.Record.ID, err)
+	}
+	return nil
 }
 
 func (m *ModManager) Stage(ctx context.Context, lock PackageLock, archives map[PackageRef]*ValidatedArchive) (staged StagedGeneration, err error) {
@@ -747,6 +855,14 @@ func (m *ModManager) openAndValidateStaged(staged StagedGeneration) (ManagedMani
 }
 
 func (m *ModManager) verifyStagedOverlay(generationRoot int, manifest ManagedManifest) error {
+	expected := managedFilesByPath(manifest.Files)
+	overlay, err := unix.Openat(generationRoot, overlayDirectory, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return fmt.Errorf("open staged overlay: %w", err)
+	}
+	if err := verifyOverlayInventory(overlay, "", expected); err != nil {
+		return err
+	}
 	for _, file := range manifest.Files {
 		data, mode, err := readFileAt(generationRoot, overlayDirectory+"/"+file.RelativePath)
 		if err != nil {
@@ -754,6 +870,51 @@ func (m *ModManager) verifyStagedOverlay(generationRoot int, manifest ManagedMan
 		}
 		if hashBytes(data) != file.SHA256 || mode.Perm() != file.Mode.Perm() {
 			return fmt.Errorf("staged managed file %s does not match its manifest", file.RelativePath)
+		}
+	}
+	return nil
+}
+
+func verifyOverlayInventory(directoryFD int, relativeDir string, expected map[string]ManagedFile) error {
+	directory := os.NewFile(uintptr(directoryFD), relativeDir)
+	entries, err := directory.Readdirnames(-1)
+	if err != nil {
+		directory.Close()
+		return fmt.Errorf("read staged overlay directory %s: %w", relativeDir, err)
+	}
+	defer directory.Close()
+	for _, name := range entries {
+		relativePath := filepath.Join(relativeDir, name)
+		var stat unix.Stat_t
+		if err := unix.Fstatat(directoryFD, name, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+			return fmt.Errorf("stat staged overlay path %s: %w", relativePath, err)
+		}
+		switch stat.Mode & unix.S_IFMT {
+		case unix.S_IFREG:
+			if _, ok := expected[relativePath]; !ok {
+				return fmt.Errorf("staged overlay contains unlisted file %s", relativePath)
+			}
+		case unix.S_IFDIR:
+			prefix := relativePath + string(filepath.Separator)
+			allowed := false
+			for expectedPath := range expected {
+				if strings.HasPrefix(expectedPath, prefix) {
+					allowed = true
+					break
+				}
+			}
+			if !allowed {
+				return fmt.Errorf("staged overlay contains unlisted directory %s", relativePath)
+			}
+			child, err := unix.Openat(directoryFD, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+			if err != nil {
+				return fmt.Errorf("open staged overlay directory %s: %w", relativePath, err)
+			}
+			if err := verifyOverlayInventory(child, relativePath, expected); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("staged overlay path %s is not a regular file or directory", relativePath)
 		}
 	}
 	return nil
@@ -1245,30 +1406,13 @@ func (m *ModManager) validate() error {
 }
 
 func validateManagedArchiveSet(lock PackageLock, archives map[PackageRef]*ValidatedArchive) error {
-	if lock.SchemaVersion != schemaVersion {
-		return fmt.Errorf("package lock schema version %d is unsupported", lock.SchemaVersion)
-	}
-	if lock.Digest == "" || lock.Digest != PackageLockDigest(lock) {
-		return fmt.Errorf("package lock digest is invalid")
-	}
-	if err := validateManagedRootRefs(lock.Roots); err != nil {
+	if err := validateManagedPackageLock(lock); err != nil {
 		return err
 	}
-	if len(lock.Packages) != 5 || len(archives) != len(lock.Packages) {
-		return fmt.Errorf("managed package lock must contain exactly BepInEx, VampireCommandFramework, KindredCommands, HookDOTS API, and Satisvampory")
+	if len(archives) != len(lock.Packages) {
+		return fmt.Errorf("validated archive set does not match the managed package lock")
 	}
-	seen := make(map[string]PackageRef, len(lock.Packages))
-	dependencies := make(map[PackageRef][]PackageRef, len(lock.Packages))
 	for _, locked := range lock.Packages {
-		kind := managedPackageKind(locked.Ref)
-		if kind == "" {
-			return fmt.Errorf("locked package %s has no managed mapping", packageVersionFullName(locked.Ref))
-		}
-		if _, exists := seen[kind]; exists {
-			return fmt.Errorf("managed package lock contains duplicate %s package", kind)
-		}
-		seen[kind] = locked.Ref
-		dependencies[locked.Ref] = locked.Dependencies
 		archive, ok := archives[locked.Ref]
 		if !ok || archive == nil {
 			return fmt.Errorf("validated archive for %s is required", packageVersionFullName(locked.Ref))
@@ -1288,6 +1432,38 @@ func validateManagedArchiveSet(lock PackageLock, archives map[PackageRef]*Valida
 		if !found {
 			return fmt.Errorf("validated archive %s is outside the package lock", packageVersionFullName(ref))
 		}
+	}
+	return nil
+}
+
+func validateManagedPackageLock(lock PackageLock) error {
+	if lock.SchemaVersion != schemaVersion {
+		return fmt.Errorf("package lock schema version %d is unsupported", lock.SchemaVersion)
+	}
+	if lock.Digest == "" || lock.Digest != PackageLockDigest(lock) {
+		return fmt.Errorf("package lock digest is invalid")
+	}
+	if err := validateManagedRootRefs(lock.Roots); err != nil {
+		return err
+	}
+	if len(lock.Packages) != 5 {
+		return fmt.Errorf("managed package lock must contain exactly BepInEx, VampireCommandFramework, KindredCommands, HookDOTS API, and Satisvampory")
+	}
+	seen := make(map[string]PackageRef, len(lock.Packages))
+	dependencies := make(map[PackageRef][]PackageRef, len(lock.Packages))
+	for _, locked := range lock.Packages {
+		if locked.FullName != packageVersionFullName(locked.Ref) || locked.DownloadURL == "" || locked.FileSize <= 0 || !validSHA256(locked.SHA256) {
+			return fmt.Errorf("locked package %s metadata is invalid", packageVersionFullName(locked.Ref))
+		}
+		kind := managedPackageKind(locked.Ref)
+		if kind == "" {
+			return fmt.Errorf("locked package %s has no managed mapping", packageVersionFullName(locked.Ref))
+		}
+		if _, exists := seen[kind]; exists {
+			return fmt.Errorf("managed package lock contains duplicate %s package", kind)
+		}
+		seen[kind] = locked.Ref
+		dependencies[locked.Ref] = locked.Dependencies
 	}
 	for _, kind := range []string{"bepinex", "vcf", "kindred", "hookdots", "satisvampory"} {
 		if _, ok := seen[kind]; !ok {
