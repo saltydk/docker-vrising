@@ -36,7 +36,7 @@ type LockedPackage struct {
 
 type PackageLock struct {
 	SchemaVersion int
-	Root          PackageRef
+	Roots         []PackageRef
 	Packages      []LockedPackage
 	Digest        string
 	ResolvedAt    time.Time

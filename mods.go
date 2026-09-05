@@ -516,7 +516,15 @@ func (m *ModManager) Stage(ctx context.Context, lock PackageLock, archives map[P
 		return StagedGeneration{}, fmt.Errorf("open generation: %w", err)
 	}
 	defer unix.Close(generationRoot)
-	for _, directory := range []string{overlayDirectory, ".metadata", ".extract-bepinex", ".extract-vcf", ".extract-kindred"} {
+	for _, directory := range []string{
+		overlayDirectory,
+		".metadata",
+		".extract-bepinex",
+		".extract-vcf",
+		".extract-kindred",
+		".extract-hookdots",
+		".extract-satisvampory",
+	} {
 		if err := ensureDirectoryAt(generationRoot, directory); err != nil {
 			return StagedGeneration{}, fmt.Errorf("create generation directory %s: %w", directory, err)
 		}
@@ -535,8 +543,19 @@ func (m *ModManager) Stage(ctx context.Context, lock PackageLock, archives map[P
 	if err != nil {
 		return StagedGeneration{}, fmt.Errorf("extract KindredCommands archive: %w", err)
 	}
+	hookDOTSResult, err := ExtractArchive(archives[hookDOTSPackageRef(lock)], filepath.Join(generationPath, ".extract-hookdots"), ExtractPlugin)
+	if err != nil {
+		return StagedGeneration{}, fmt.Errorf("extract HookDOTS API archive: %w", err)
+	}
+	satisvamporyResult, err := ExtractArchive(archives[satisvamporyPackageRef(lock)], filepath.Join(generationPath, ".extract-satisvampory"), ExtractPlugin)
+	if err != nil {
+		return StagedGeneration{}, fmt.Errorf("extract Satisvampory archive: %w", err)
+	}
 
-	files := make([]ManagedFile, 0, len(bepInExResult.Files)+len(vcfResult.Files)+len(kindredResult.Files))
+	files := make([]ManagedFile, 0,
+		len(bepInExResult.Files)+len(vcfResult.Files)+len(kindredResult.Files)+
+			len(hookDOTSResult.Files)+len(satisvamporyResult.Files),
+	)
 	for _, relativePath := range bepInExResult.Files {
 		if err := ctx.Err(); err != nil {
 			return StagedGeneration{}, err
@@ -585,6 +604,18 @@ func (m *ModManager) Stage(ctx context.Context, lock PackageLock, archives map[P
 				"NetTopologySuite.dll": true,
 			},
 		},
+		{
+			label:      "HookDOTS API",
+			extractDir: ".extract-hookdots",
+			result:     hookDOTSResult,
+			allowed:    map[string]bool{"HookDOTS.API.dll": true},
+		},
+		{
+			label:      "Satisvampory",
+			extractDir: ".extract-satisvampory",
+			result:     satisvamporyResult,
+			allowed:    map[string]bool{"Satisvampory.dll": true},
+		},
 	}
 	for _, plugin := range pluginInputs {
 		seen := make(map[string]bool, len(plugin.result.Files))
@@ -632,7 +663,13 @@ func (m *ModManager) Stage(ctx context.Context, lock PackageLock, archives map[P
 	if err := writeGenerationJSON(generationRoot, managedLockName, lock); err != nil {
 		return StagedGeneration{}, fmt.Errorf("persist generation lock: %w", err)
 	}
-	for _, extraction := range []string{".extract-bepinex", ".extract-vcf", ".extract-kindred"} {
+	for _, extraction := range []string{
+		".extract-bepinex",
+		".extract-vcf",
+		".extract-kindred",
+		".extract-hookdots",
+		".extract-satisvampory",
+	} {
 		if err := removeTreeAt(generationRoot, extraction); err != nil {
 			return StagedGeneration{}, fmt.Errorf("remove staging extraction %s: %w", extraction, err)
 		}
@@ -1059,7 +1096,7 @@ func sameManagedManifest(left, right ManagedManifest) bool {
 }
 
 func samePackageLock(left, right PackageLock) bool {
-	if left.SchemaVersion != right.SchemaVersion || left.Root != right.Root || left.Digest != right.Digest ||
+	if left.SchemaVersion != right.SchemaVersion || !samePackageRefs(left.Roots, right.Roots) || left.Digest != right.Digest ||
 		!left.ResolvedAt.Equal(right.ResolvedAt) || len(left.Packages) != len(right.Packages) {
 		return false
 	}
@@ -1214,11 +1251,11 @@ func validateManagedArchiveSet(lock PackageLock, archives map[PackageRef]*Valida
 	if lock.Digest == "" || lock.Digest != PackageLockDigest(lock) {
 		return fmt.Errorf("package lock digest is invalid")
 	}
-	if lock.Root.Namespace != "odjit" || lock.Root.Name != "KindredCommands" {
-		return fmt.Errorf("package lock root must be odjit/KindredCommands")
+	if err := validateManagedRootRefs(lock.Roots); err != nil {
+		return err
 	}
-	if len(lock.Packages) != 3 || len(archives) != len(lock.Packages) {
-		return fmt.Errorf("managed package lock must contain exactly BepInEx, VampireCommandFramework, and KindredCommands")
+	if len(lock.Packages) != 5 || len(archives) != len(lock.Packages) {
+		return fmt.Errorf("managed package lock must contain exactly BepInEx, VampireCommandFramework, KindredCommands, HookDOTS API, and Satisvampory")
 	}
 	seen := make(map[string]PackageRef, len(lock.Packages))
 	for _, locked := range lock.Packages {
@@ -1250,13 +1287,13 @@ func validateManagedArchiveSet(lock PackageLock, archives map[PackageRef]*Valida
 			return fmt.Errorf("validated archive %s is outside the package lock", packageVersionFullName(ref))
 		}
 	}
-	for _, kind := range []string{"bepinex", "vcf", "kindred"} {
+	for _, kind := range []string{"bepinex", "vcf", "kindred", "hookdots", "satisvampory"} {
 		if _, ok := seen[kind]; !ok {
 			return fmt.Errorf("managed package lock is missing %s", kind)
 		}
 	}
-	if seen["kindred"] != lock.Root {
-		return fmt.Errorf("package lock root does not match locked KindredCommands")
+	if seen["kindred"] != lock.Roots[0] || seen["satisvampory"] != lock.Roots[1] {
+		return fmt.Errorf("package lock roots do not match locked root packages")
 	}
 	return nil
 }
@@ -1269,6 +1306,10 @@ func managedPackageKind(ref PackageRef) string {
 		return "vcf"
 	case ref.Namespace == "odjit" && ref.Name == "KindredCommands":
 		return "kindred"
+	case ref.Namespace == "cheesasaurus" && ref.Name == "HookDOTS_API":
+		return "hookdots"
+	case ref.Namespace == "Team_GreenEye" && ref.Name == "Satisvampory":
+		return "satisvampory"
 	default:
 		return ""
 	}
@@ -1284,6 +1325,14 @@ func vcfPackageRef(lock PackageLock) PackageRef {
 
 func kindredPackageRef(lock PackageLock) PackageRef {
 	return packageRefForKind(lock, "kindred")
+}
+
+func hookDOTSPackageRef(lock PackageLock) PackageRef {
+	return packageRefForKind(lock, "hookdots")
+}
+
+func satisvamporyPackageRef(lock PackageLock) PackageRef {
+	return packageRefForKind(lock, "satisvampory")
 }
 
 func packageRefForKind(lock PackageLock, kind string) PackageRef {
@@ -1309,6 +1358,7 @@ func sameLockedPackage(left, right LockedPackage) bool {
 }
 
 func clonePackageLock(lock PackageLock) PackageLock {
+	lock.Roots = append([]PackageRef(nil), lock.Roots...)
 	lock.Packages = append([]LockedPackage(nil), lock.Packages...)
 	for i := range lock.Packages {
 		lock.Packages[i] = cloneLockedPackage(lock.Packages[i])
@@ -1409,6 +1459,8 @@ func requireManagedRuntimeFiles(files []ManagedFile) error {
 		"BepInEx/plugins/saltydk-managed/VampireCommandFramework.dll",
 		"BepInEx/plugins/saltydk-managed/KindredCommands.dll",
 		"BepInEx/plugins/saltydk-managed/NetTopologySuite.dll",
+		"BepInEx/plugins/saltydk-managed/HookDOTS.API.dll",
+		"BepInEx/plugins/saltydk-managed/Satisvampory.dll",
 	} {
 		if _, ok := paths[required]; !ok {
 			return fmt.Errorf("staged generation is missing required managed file %s", required)

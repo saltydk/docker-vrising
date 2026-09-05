@@ -12,9 +12,11 @@ import (
 )
 
 var (
-	bepInExPackage = PackageRef{Namespace: "BepInEx", Name: "BepInExPack_V_Rising", Version: "1.733.2"}
-	vcfPackage     = PackageRef{Namespace: "deca", Name: "VampireCommandFramework", Version: "0.10.4"}
-	kindredPackage = PackageRef{Namespace: "odjit", Name: "KindredCommands", Version: "2.5.8"}
+	bepInExPackage      = PackageRef{Namespace: "BepInEx", Name: "BepInExPack_V_Rising", Version: "1.733.2"}
+	vcfPackage          = PackageRef{Namespace: "deca", Name: "VampireCommandFramework", Version: "0.10.4"}
+	kindredPackage      = PackageRef{Namespace: "odjit", Name: "KindredCommands", Version: "2.5.8"}
+	hookDOTSPackage     = PackageRef{Namespace: "cheesasaurus", Name: "HookDOTS_API", Version: "1.1.1"}
+	satisvamporyPackage = PackageRef{Namespace: "Team_GreenEye", Name: "Satisvampory", Version: "1.0.85"}
 )
 
 func TestStageMapsBepInExAndPluginFiles(t *testing.T) {
@@ -35,6 +37,8 @@ func TestStageMapsBepInExAndPluginFiles(t *testing.T) {
 			{name: "KindredCommands.dll", body: "kindred"},
 			{name: "NetTopologySuite.dll", body: "topology"},
 		},
+		hookDOTS:     []zipEntry{{name: "HookDOTS.API.dll", body: "hookdots"}},
+		satisvampory: []zipEntry{{name: "plugins/Satisvampory.dll", body: "satisvampory"}},
 	})
 
 	staged, err := manager.Stage(t.Context(), lock, archives)
@@ -52,6 +56,8 @@ func TestStageMapsBepInExAndPluginFiles(t *testing.T) {
 		"BepInEx/plugins/saltydk-managed/VampireCommandFramework.dll": "vcf",
 		"BepInEx/plugins/saltydk-managed/KindredCommands.dll":         "kindred",
 		"BepInEx/plugins/saltydk-managed/NetTopologySuite.dll":        "topology",
+		"BepInEx/plugins/saltydk-managed/HookDOTS.API.dll":            "hookdots",
+		"BepInEx/plugins/saltydk-managed/Satisvampory.dll":            "satisvampory",
 	}
 	if got := manifestPaths(staged.Manifest); !reflect.DeepEqual(got, sortedMapKeys(wantFiles)) {
 		t.Fatalf("staged manifest paths = %v, want %v", got, sortedMapKeys(wantFiles))
@@ -84,6 +90,26 @@ func TestStageAlwaysIncludesNetTopologySuite(t *testing.T) {
 	_, err := manager.Stage(t.Context(), lock, archives)
 	if err == nil || !strings.Contains(err.Error(), "NetTopologySuite.dll") {
 		t.Fatalf("Stage() error = %v, want missing NetTopologySuite.dll rejection", err)
+	}
+}
+
+func TestStageRequiresHookDOTSAndSatisvamporyDLLs(t *testing.T) {
+	tests := []struct {
+		name     string
+		contents managedArchiveContents
+	}{
+		{name: "HookDOTS", contents: managedArchiveContents{hookDOTS: []zipEntry{{name: "README.md", body: "docs"}}}},
+		{name: "Satisvampory", contents: managedArchiveContents{satisvampory: []zipEntry{{name: "README.md", body: "docs"}}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			manager := newTestModManager(t)
+			lock, archives := newManagedArchiveSet(t, tt.contents)
+			_, err := manager.Stage(t.Context(), lock, archives)
+			if err == nil {
+				t.Fatal("Stage() accepted an archive missing its required plugin DLL")
+			}
+		})
 	}
 }
 
@@ -126,6 +152,29 @@ func TestStageRejectsUnmappedPluginDLL(t *testing.T) {
 	_, err := manager.Stage(t.Context(), lock, archives)
 	if err == nil || !strings.Contains(err.Error(), "Unexpected.dll") {
 		t.Fatalf("Stage() error = %v, want unmapped plugin DLL rejection", err)
+	}
+}
+
+func TestStageRejectsPartialOrUnorderedManagedRoots(t *testing.T) {
+	tests := []struct {
+		name  string
+		roots []PackageRef
+	}{
+		{name: "partial", roots: []PackageRef{kindredPackage}},
+		{name: "duplicate", roots: []PackageRef{kindredPackage, kindredPackage}},
+		{name: "unordered", roots: []PackageRef{satisvamporyPackage, kindredPackage}},
+		{name: "unexpected", roots: []PackageRef{kindredPackage, vcfPackage}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			manager := newTestModManager(t)
+			lock, archives := newManagedArchiveSet(t, managedArchiveContents{})
+			lock.Roots = append([]PackageRef(nil), tt.roots...)
+			lock.Digest = PackageLockDigest(lock)
+			if _, err := manager.Stage(t.Context(), lock, archives); err == nil {
+				t.Fatal("Stage() accepted an invalid managed root set")
+			}
+		})
 	}
 }
 
@@ -1056,9 +1105,11 @@ func TestApplyDoesNotFollowManagedDirectorySymlink(t *testing.T) {
 }
 
 type managedArchiveContents struct {
-	bepInEx []zipEntry
-	vcf     []zipEntry
-	kindred []zipEntry
+	bepInEx      []zipEntry
+	vcf          []zipEntry
+	kindred      []zipEntry
+	hookDOTS     []zipEntry
+	satisvampory []zipEntry
 }
 
 func newManagedArchiveSet(t *testing.T, contents managedArchiveContents) (PackageLock, map[PackageRef]*ValidatedArchive) {
@@ -1075,25 +1126,37 @@ func newManagedArchiveSet(t *testing.T, contents managedArchiveContents) (Packag
 			{name: "NetTopologySuite.dll", body: "topology"},
 		}
 	}
+	if contents.hookDOTS == nil {
+		contents.hookDOTS = []zipEntry{{name: "HookDOTS.API.dll", body: "hookdots"}}
+	}
+	if contents.satisvampory == nil {
+		contents.satisvampory = []zipEntry{{name: "plugins/Satisvampory.dll", body: "satisvampory"}}
+	}
 
 	bepInEx := fetchArchiveBytesForMods(t, bepInExPackage, nil, contents.bepInEx)
 	vcf := fetchArchiveBytesForMods(t, vcfPackage, []PackageRef{bepInExPackage}, contents.vcf)
 	kindred := fetchArchiveBytesForMods(t, kindredPackage, []PackageRef{bepInExPackage, vcfPackage}, contents.kindred)
+	hookDOTS := fetchArchiveBytesForMods(t, hookDOTSPackage, []PackageRef{bepInExPackage}, contents.hookDOTS)
+	satisvampory := fetchArchiveBytesForMods(t, satisvamporyPackage, []PackageRef{bepInExPackage, vcfPackage, hookDOTSPackage}, contents.satisvampory)
 	archives := map[PackageRef]*ValidatedArchive{
-		bepInExPackage: bepInEx,
-		vcfPackage:     vcf,
-		kindredPackage: kindred,
+		bepInExPackage:      bepInEx,
+		vcfPackage:          vcf,
+		kindredPackage:      kindred,
+		hookDOTSPackage:     hookDOTS,
+		satisvamporyPackage: satisvampory,
 	}
 	for _, archive := range archives {
 		t.Cleanup(func() { _ = archive.Close() })
 	}
 	lock := PackageLock{
 		SchemaVersion: schemaVersion,
-		Root:          kindredPackage,
+		Roots:         []PackageRef{kindredPackage, satisvamporyPackage},
 		Packages: []LockedPackage{
 			bepInEx.LockedPackage(),
 			vcf.LockedPackage(),
 			kindred.LockedPackage(),
+			hookDOTS.LockedPackage(),
+			satisvampory.LockedPackage(),
 		},
 	}
 	lock.Digest = PackageLockDigest(lock)

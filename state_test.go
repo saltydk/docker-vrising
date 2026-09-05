@@ -68,7 +68,10 @@ func TestStorePackageLockSaveIsAtomicAndRoundTrips(t *testing.T) {
 	store := Store{StateDir: stateDir}
 	want := PackageLock{
 		SchemaVersion: 1,
-		Root:          PackageRef{Namespace: "odjit", Name: "KindredCommands", Version: "2.5.8"},
+		Roots: []PackageRef{
+			{Namespace: "odjit", Name: "KindredCommands", Version: "2.5.8"},
+			{Namespace: "Team_GreenEye", Name: "Satisvampory", Version: "1.0.85"},
+		},
 		Packages: []LockedPackage{{
 			Ref:          PackageRef{Namespace: "BepInEx", Name: "BepInExPack_V_Rising", Version: "1.733.2"},
 			FullName:     "BepInEx-BepInExPack_V_Rising-1.733.2",
@@ -242,6 +245,20 @@ func TestStoreRejectsUnknownPackageLockSchemaVersion(t *testing.T) {
 
 	if _, err := (&Store{StateDir: stateDir}).LoadPackageLock(); err == nil {
 		t.Fatal("LoadPackageLock() succeeded for an unknown schema version")
+	}
+}
+
+func TestStoreRejectsUnpublishedSingleRootPackageLock(t *testing.T) {
+	stateDir := t.TempDir()
+	if err := os.Chmod(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	data := `{"SchemaVersion":1,"Root":{"Namespace":"odjit","Name":"KindredCommands","Version":"2.5.8"},"Packages":[]}`
+	if err := os.WriteFile(filepath.Join(stateDir, "package-lock.json"), []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (&Store{StateDir: stateDir}).LoadPackageLock(); err == nil {
+		t.Fatal("LoadPackageLock() accepted unpublished single-root state")
 	}
 }
 

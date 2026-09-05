@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build and verify a drop-in Docker Hub image that updates the V Rising dedicated server and installs the newest compatible KindredCommands dependency graph safely on every restart.
+**Goal:** Build and verify a drop-in Docker Hub image that updates the V Rising dedicated server and installs the newest compatible KindredCommands and Satisvampory dependency graphs safely on every restart.
 
 **Architecture:** A flat Go 1.27 control-plane binary runs beneath tini and owns configuration, durable update state, Thunderstore resolution, archive validation, save snapshots, SteamCMD execution, managed mod activation, health, and Wine/Xvfb supervision. Existing game and save mounts remain in place; mod changes are journaled and reversible, while an in-place Steam mutation fails closed if validation cannot complete.
 
@@ -15,7 +15,9 @@
 - Target Linux AMD64 only.
 - Keep /mnt/vrising/server and /mnt/vrising/persistentdata unchanged.
 - Preserve existing saves, settings, and server files during migration.
-- Resolve the newest KindredCommands root, then install exact recursive dependency versions from its manifest.
+- Resolve the newest KindredCommands and Satisvampory roots independently,
+  merge their exact recursive dependency graphs, and reject conflicts before
+  downloading archives.
 - Never independently upgrade VCF, BepInEx, or another transitive dependency.
 - Run game and mod downloads at container startup; do not embed or redistribute them in the image.
 - Use clean-room code; do not copy the unlicensed TrueOsiris implementation.
@@ -25,6 +27,12 @@
 - Use DOCKERHUB_USERNAME and DOCKERHUB_TOKEN as GitHub Actions secrets.
 - Publish only linux/amd64 images to saltydk/vrising.
 - Every commit must use a Conventional Commit subject.
+
+## Non-goals
+
+- A general-purpose Thunderstore mod manager.
+- Independent dependency upgrades that override either root manifest.
+- Partial activation of only one managed root.
 
 ---
 
@@ -89,6 +97,7 @@ func TestLoadConfigDefaults(t *testing.T) {
         cfg.DataDir != "/mnt/vrising/persistentdata" ||
         !cfg.UpdateGame || !cfg.UpdateMods || !cfg.ModsEnabled ||
         cfg.KindredVersion != "latest" ||
+        cfg.SatisvamporyVersion != "latest" ||
         cfg.BackupRetention != 3 ||
         cfg.StartupTimeout != 30*time.Minute ||
         cfg.ShutdownTimeout != 120*time.Second ||
@@ -117,7 +126,8 @@ func TestLoadConfigNativeValuesWinOverLegacyAliases(t *testing.T) {
 
 Add rejection cases for non-boolean values, zero/negative durations,
 BACKUP_RETENTION below one, only one of PUID/PGID, non-numeric IDs, and a
-KINDRED_COMMANDS_VERSION value other than latest or three numeric components.
+KINDRED_COMMANDS_VERSION or SATISVAMPORY_VERSION values other than latest or
+three numeric components.
 
 - [ ] **Step 2: Run the tests and confirm the red state**
 
@@ -150,6 +160,7 @@ type Config struct {
     UpdateMods      bool
     ModsEnabled     bool
     KindredVersion  string
+    SatisvamporyVersion string
     BackupRetention int
     StartupTimeout  time.Duration
     ShutdownTimeout time.Duration
@@ -260,7 +271,7 @@ type LockedPackage struct {
 
 type PackageLock struct {
     SchemaVersion int
-    Root          PackageRef
+    Roots         []PackageRef
     Packages      []LockedPackage
     Digest        string
     ResolvedAt    time.Time
@@ -343,13 +354,17 @@ git commit -m "feat: add durable runtime state"
 - Create: **thunderstore_test.go**
 - Create: **testdata/thunderstore/kindred-package.json**
 - Create: **testdata/thunderstore/kindred-2.5.8.json**
+- Create: **testdata/thunderstore/satisvampory-package.json**
+- Create: **testdata/thunderstore/satisvampory-1.0.85.json**
+- Create: **testdata/thunderstore/hookdots-package.json**
+- Create: **testdata/thunderstore/hookdots-1.1.1.json**
 - Create: **testdata/thunderstore/vcf-0.10.4.json**
 - Create: **testdata/thunderstore/bepinex-1.733.2.json**
 
 **Interfaces:**
 
 - Consumes: **PackageRef** and **HTTPDoer**.
-- Produces: **Thunderstore.Resolve(ctx, RootSelection) (ResolvedGraph, error)**.
+- Produces: **Thunderstore.Resolve(ctx, []RootSelection) (ResolvedGraph, error)**.
 
 ~~~go
 type HTTPDoer interface {
@@ -360,10 +375,11 @@ type HTTPDoer interface {
 - [ ] **Step 1: Write failing resolver tests**
 
 ~~~go
-func TestResolveLatestKindredUsesExactDeclaredDependencies(t *testing.T)
-func TestResolvePinnedKindredSkipsLatestEndpoint(t *testing.T)
+func TestResolveLatestManagedRootsUsesExactMergedDependencies(t *testing.T)
+func TestResolvePinnedManagedRootsSkipLatestEndpoints(t *testing.T)
 func TestResolveDeduplicatesBepInEx(t *testing.T)
 func TestResolveRejectsConflictingExactVersions(t *testing.T)
+func TestResolveRejectsConflictAcrossManagedRoots(t *testing.T)
 func TestResolveRejectsDependencyCycle(t *testing.T)
 func TestResolveRejectsInactivePackage(t *testing.T)
 func TestResolveRetriesTransientMetadataFailure(t *testing.T)
@@ -371,8 +387,9 @@ func TestPackageLockDigestIsStableAcrossResponseOrder(t *testing.T)
 func TestParseDependencyRejectsMalformedReference(t *testing.T)
 ~~~
 
-The expected order is BepInEx 1.733.2, VCF 0.10.4, KindredCommands 2.5.8.
-Assert that VCF's package-level latest endpoint is never requested.
+The expected order is BepInEx 1.733.2, VCF 0.10.4, KindredCommands 2.5.8,
+HookDOTS API 1.1.1, and Satisvampory 1.0.85. Assert that VCF and HookDOTS
+package-level latest endpoints are never requested.
 
 - [ ] **Step 2: Confirm failure**
 
@@ -389,6 +406,7 @@ Use:
 ~~~text
 Latest root:
 https://thunderstore.io/api/experimental/package/odjit/KindredCommands/
+https://thunderstore.io/api/experimental/package/Team_GreenEye/Satisvampory/
 
 Exact version:
 https://thunderstore.io/api/experimental/package/{namespace}/{name}/{version}/
@@ -413,7 +431,7 @@ type ResolvedPackage struct {
 }
 
 type ResolvedGraph struct {
-    Root     PackageRef
+    Roots    []PackageRef
     Packages []ResolvedPackage
 }
 
@@ -423,10 +441,13 @@ type Thunderstore struct {
 }
 ~~~
 
-Parse dependency strings with one anchored expression accepting namespace,
-name, and a three-component numeric version. Traverse with visiting/visited
-sets, reject a second version for one namespace/name, and topologically sort
-dependencies before dependants. Require HTTP 200, JSON content, active
+Validate exactly the ordered KindredCommands and Satisvampory roots and allow
+latest only for those identities. Resolve latest independently, then parse
+dependency strings with one anchored expression accepting namespace, name, and
+a three-component numeric version. Traverse the merged graph with shared
+visiting/visited and identity-version sets, reject a second version for one
+namespace/name across either root, and topologically sort dependencies before
+dependants. Require HTTP 200, JSON content, active
 versions, positive sizes, HTTPS downloads, and response/request identity match.
 Retry 429 and 5xx metadata responses at most three times with one- and
 two-second delays; do not retry other 4xx responses. Build the package
@@ -441,7 +462,7 @@ go test -race -run 'TestResolve|TestPackageLock|TestParseDependency' ./...
 go test -race ./...
 ~~~
 
-Expected: all tests pass with the exact three-package closure.
+Expected: all tests pass with the exact five-package merged closure.
 
 - [ ] **Step 5: Commit**
 
@@ -524,7 +545,9 @@ Reject absolute/empty/escaping names, backslashes after normalization, duplicate
 destinations, and non-regular/non-directory modes. Extract create-exclusive at
 0600 and set final files 0644. Verify manifest identity, version, and exact
 dependencies before extraction. Require one BepInExPack_V_Rising wrapper;
-plugin archives expose only root DLLs to the mod installer.
+plugin archives expose DLLs only at archive root or directly below one
+plugins/ subtree. Flatten that subtree and reject deeper layouts, non-DLL
+payloads there, and duplicate flattened destination names.
 
 - [ ] **Step 4: Verify**
 
@@ -629,9 +652,9 @@ doorstop_config.ini, winhttp.dll, dotnet/**, BepInEx/core/**, and
 BepInEx/patchers/**. Create BepInEx/config/BepInEx.cfg only when absent, then
 set Logging.Console Enabled to false with a narrow section-aware edit.
 
-Place VampireCommandFramework.dll, KindredCommands.dll, and NetTopologySuite.dll
-below BepInEx/plugins/saltydk-managed. Reject additional plugin DLLs unless they
-belong to the exact locked graph and have an explicit tested mapping.
+Place VampireCommandFramework.dll, KindredCommands.dll, NetTopologySuite.dll,
+HookDOTS.API.dll, and Satisvampory.dll below
+BepInEx/plugins/saltydk-managed. Reject missing or additional plugin DLLs.
 
 - [ ] **Step 4: Implement journaled apply, rollback, and promotion**
 
@@ -949,9 +972,10 @@ git commit -m "feat: add runtime identity management"
 - [ ] **Step 1: Write failing readiness and health tests**
 
 ~~~go
-func TestReadinessRequiresServerBepInExVCFAndKindred(t *testing.T)
+func TestReadinessRequiresServerBepInExVCFKindredAndSatisvampory(t *testing.T)
 func TestReadinessRejectsFatalBepInExOutput(t *testing.T)
 func TestReadinessRequiresExpectedKindredVersion(t *testing.T)
+func TestReadinessRequiresExpectedSatisvamporyVersion(t *testing.T)
 func TestReadinessTimesOut(t *testing.T)
 func TestHealthRejectsMissingProcess(t *testing.T)
 func TestHealthRejectsReusedPID(t *testing.T)
@@ -961,8 +985,8 @@ func TestPruneLogsNeverTraversesSubdirectories(t *testing.T)
 ~~~
 
 Fixtures contain V Rising startup completion, BepInEx chainloader completion,
-VCF load evidence, and
-"Plugin aa.odjit.KindredCommands version 2.5.8 is loaded!".
+VCF load evidence, "Plugin aa.odjit.KindredCommands version 2.5.8 is loaded!",
+and "Satisvampory 1.0.85 (Satisvampory) ready.".
 
 - [ ] **Step 2: Confirm failure**
 
@@ -976,8 +1000,9 @@ Expected: compilation fails because readiness and health types are absent.
 
 ~~~go
 type ExpectedReadiness struct {
-    KindredVersion string
-    RequireMods    bool
+    KindredVersion       string
+    SatisvamporyVersion string
+    RequireMods          bool
 }
 
 type ReadinessMonitor struct {
@@ -1021,6 +1046,30 @@ Expected: all tests pass and watchers exit under race detection.
 git add logs.go logs_test.go health.go health_test.go testdata/logs
 git commit -m "feat: add server readiness health"
 ~~~
+
+### Task 9A: Add Satisvampory as a second compatible root
+
+**Files:**
+
+- Modify: **config.go**, **config_test.go**, **state.go**, **state_test.go**
+- Modify: **thunderstore.go**, **thunderstore_test.go**, **archive.go**, **archive_test.go**
+- Modify: **mods.go**, **mods_test.go**, **logs.go**, **logs_test.go**
+- Create: Satisvampory and HookDOTS fixtures below **testdata/thunderstore/**
+- Modify: **testdata/logs/** and this design/plan documentation
+
+Resolve `odjit/KindredCommands` and `Team_GreenEye/Satisvampory` independently,
+then merge their exact graphs before any archive download. The fixed acceptance
+fixture is Satisvampory 1.0.85 with BepInEx 1.733.2, VCF 0.10.4, and HookDOTS
+API 1.1.1; HookDOTS itself requires BepInEx 1.733.2. The final ordered roots are
+KindredCommands then Satisvampory, and `MODS_ENABLED` controls both.
+
+Stage exactly `VampireCommandFramework.dll`, `KindredCommands.dll`,
+`NetTopologySuite.dll`, `HookDOTS.API.dll`, and `Satisvampory.dll` in the
+managed plugin subtree. Readiness requires both exact root versions, including
+the marker `Satisvampory <version> (Satisvampory) ready.`.
+
+Verify with focused tests, repeated readiness tests under the race detector,
+the full race suite, `make check`, and `git diff --check`.
 
 ### Task 10: Supervise Xvfb and Wine with exact process ownership
 
@@ -1179,7 +1228,7 @@ Expected: compilation fails because Application is absent.
 
 ~~~go
 type graphResolver interface {
-    Resolve(context.Context, RootSelection) (ResolvedGraph, error)
+    Resolve(context.Context, []RootSelection) (ResolvedGraph, error)
 }
 
 type archiveFetcher interface {
@@ -1228,7 +1277,8 @@ Implement exactly:
 2. In Application.Run, validate both mounts and acquire the lifetime lock.
 3. Recover interrupted managed-file work.
 4. Load installed Steam and active mod state.
-5. Resolve, fetch, validate, and stage the requested mod graph.
+5. Resolve both requested roots into one exact graph, then fetch, validate, and
+   stage the complete candidate without partial root updates.
 6. Query remote Steam metadata; skip update and backup when already current.
 7. Back up before a changed build.
 8. Update and validate Steam in place.
@@ -1385,7 +1435,7 @@ Create one mktemp directory with trap cleanup and assert:
 2. Offline restart uses degraded known-good state.
 3. Corrupt mod bytes never change active files.
 4. Interrupted apply recovers on restart.
-5. MODS_ENABLED=false preserves cache, generations, and config.
+5. MODS_ENABLED=false disables both roots and preserves cache, generations, and config.
 6. TERM exits within SHUTDOWN_TIMEOUT and leaves no child.
 ~~~
 
@@ -1403,9 +1453,10 @@ Expected: syntax passes; the test fails because fakes are not wired.
 - [ ] **Step 3: Add fixture target and fake tools**
 
 Each fake records argv and implements only its scenario. Fake SteamCMD writes
-appmanifest_1829350.acf and VRisingServer.exe. Fake Wine emits server/BepInEx
-readiness, records TERM, and exits cleanly. Fake Xvfb writes a display number to
-displayfd and remains alive. Overlay fakes only in Docker target **fixture**.
+appmanifest_1829350.acf and VRisingServer.exe. Fake Wine emits server/BepInEx,
+VCF, exact KindredCommands, and exact Satisvampory readiness, records TERM, and
+exits cleanly. Fake Xvfb writes a display number to displayfd and remains alive.
+Overlay fakes only in Docker target **fixture**.
 
 - [ ] **Step 4: Verify**
 
@@ -1565,8 +1616,8 @@ time, disk, and transient-memory expectations; every variable/default; native
 VR_ precedence; newest-compatible graph semantics; lock/state inspection;
 pre-mutation fallback versus post-Steam fail-closed behavior; backup/manual
 restore; emergency MODS_ENABLED=false, UPDATE_GAME=false, UPDATE_MODS=false,
-and exact Kindred pinning; health/log paths; Linux AMD64 scope; runtime-download
-licensing; and:
+and exact KindredCommands and Satisvampory pinning; health/log paths; Linux
+AMD64 scope; runtime-download licensing; and:
 
 ~~~bash
 docker compose pull
@@ -1649,8 +1700,9 @@ Expected: every command exits zero.
 make live-acceptance IMAGE=saltydk/vrising:local MODE=fresh
 ~~~
 
-Expected: current Steam installs, exact BepInEx/VCF/Kindred loads, health becomes
-healthy, shutdown is clean, and offline restart uses known-good cache.
+Expected: current Steam installs, exact BepInEx/VCF/KindredCommands/HookDOTS/
+Satisvampory loads, health becomes healthy, shutdown is clean, and offline
+restart uses the complete known-good cache.
 
 - [ ] **Step 3: Rehearse migration on the deployment host**
 

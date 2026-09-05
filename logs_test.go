@@ -17,7 +17,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func TestReadinessRequiresServerBepInExVCFAndKindred(t *testing.T) {
+func TestReadinessRequiresServerBepInExVCFKindredAndSatisvampory(t *testing.T) {
 	root := t.TempDir()
 	serverLog := filepath.Join(root, "server.log")
 	bepInExLog := filepath.Join(root, "bepinex.log")
@@ -37,7 +37,7 @@ func TestReadinessRequiresServerBepInExVCFAndKindred(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	result := waitForReadiness(monitor, ctx, ExpectedReadiness{RequireMods: true, KindredVersion: "2.5.8"})
+	result := waitForReadiness(monitor, ctx, expectedModReadiness("2.5.8", "1.0.85"))
 
 	appendUntilObserved(t, serverLog, output.server, result)
 	appendUntilObserved(t, bepInExLog, output.bepinex, result)
@@ -64,7 +64,7 @@ func TestReadinessRejectsFatalBepInExOutput(t *testing.T) {
 	monitor := ReadinessMonitor{ServerLog: serverLog, BepInExLog: bepInExLog, Output: output, PollEvery: 2 * time.Millisecond}
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	result := waitForReadiness(monitor, ctx, ExpectedReadiness{RequireMods: true, KindredVersion: "2.5.8"})
+	result := waitForReadiness(monitor, ctx, expectedModReadiness("2.5.8", "1.0.85"))
 	appendUntilObserved(t, serverLog, output.server, result)
 	appendUntilObserved(t, bepInExLog, output.bepinex, result)
 	appendLog(t, serverLog, readLogFixture(t, "server-ready.log"))
@@ -94,7 +94,7 @@ func TestReadinessFinalBarrierRejectsCrossFileFatalAfterReadyEvidence(t *testing
 	monitor := ReadinessMonitor{ServerLog: serverLog, BepInExLog: bepInExLog, Output: output, PollEvery: 2 * time.Millisecond}
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	result := waitForReadiness(monitor, ctx, ExpectedReadiness{RequireMods: true, KindredVersion: "2.5.8"})
+	result := waitForReadiness(monitor, ctx, expectedModReadiness("2.5.8", "1.0.85"))
 	appendUntilObserved(t, serverLog, observed.server, result)
 	appendUntilObserved(t, bepInExLog, observed.bepinex, result)
 	appendLog(t, bepInExLog, readLogFixture(t, "bepinex-ready.log"))
@@ -153,7 +153,7 @@ func TestReadinessFinalBarrierDrainsBoundedBacklogBeforeReady(t *testing.T) {
 	monitor := ReadinessMonitor{ServerLog: serverLog, BepInExLog: bepInExLog, Output: output, PollEvery: 2 * time.Millisecond}
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	result := waitForReadiness(monitor, ctx, ExpectedReadiness{RequireMods: true, KindredVersion: "2.5.8"})
+	result := waitForReadiness(monitor, ctx, expectedModReadiness("2.5.8", "1.0.85"))
 	appendUntilObserved(t, serverLog, output.server, result)
 	appendUntilObserved(t, bepInExLog, output.bepinex, result)
 	appendLog(t, serverLog, readLogFixture(t, "server-ready.log"))
@@ -181,7 +181,7 @@ func TestReadinessDrainsRotatedOldBacklogBeforeAdoptingReplacement(t *testing.T)
 	monitor := ReadinessMonitor{ServerLog: serverLog, BepInExLog: bepInExLog, Output: output, PollEvery: 2 * time.Millisecond}
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	result := waitForReadiness(monitor, ctx, ExpectedReadiness{RequireMods: true, KindredVersion: "2.5.8"})
+	result := waitForReadiness(monitor, ctx, expectedModReadiness("2.5.8", "1.0.85"))
 	appendUntilObserved(t, serverLog, output.server, result)
 	appendUntilObserved(t, bepInExLog, output.bepinex, result)
 	appendLog(t, serverLog, readLogFixture(t, "server-ready.log"))
@@ -343,7 +343,7 @@ func TestReadinessFinalBarrierRejectsServerFatalAfterModReadyEvidence(t *testing
 	monitor := ReadinessMonitor{ServerLog: serverLog, BepInExLog: bepInExLog, Output: output, PollEvery: 2 * time.Millisecond}
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	result := waitForReadiness(monitor, ctx, ExpectedReadiness{RequireMods: true, KindredVersion: "2.5.8"})
+	result := waitForReadiness(monitor, ctx, expectedModReadiness("2.5.8", "1.0.85"))
 	appendUntilObserved(t, serverLog, observed.server, result)
 	appendUntilObserved(t, bepInExLog, observed.bepinex, result)
 	appendLog(t, serverLog, readLogFixture(t, "server-ready.log"))
@@ -370,7 +370,7 @@ func TestReadinessRequiresExpectedKindredVersion(t *testing.T) {
 	monitor := ReadinessMonitor{ServerLog: serverLog, BepInExLog: bepInExLog, Output: output, PollEvery: 2 * time.Millisecond}
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	result := waitForReadiness(monitor, ctx, ExpectedReadiness{RequireMods: true, KindredVersion: "2.5.9"})
+	result := waitForReadiness(monitor, ctx, expectedModReadiness("2.5.9", "1.0.85"))
 	appendUntilObserved(t, serverLog, output.server, result)
 	appendUntilObserved(t, bepInExLog, output.bepinex, result)
 	appendLog(t, serverLog, readLogFixture(t, "server-ready.log"))
@@ -387,6 +387,34 @@ func TestReadinessRequiresExpectedKindredVersion(t *testing.T) {
 	}
 }
 
+func TestReadinessRequiresExpectedSatisvamporyVersion(t *testing.T) {
+	root := t.TempDir()
+	serverLog := filepath.Join(root, "server.log")
+	bepInExLog := filepath.Join(root, "bepinex.log")
+	writeLog(t, serverLog, "prior run\n")
+	writeLog(t, bepInExLog, "prior run\n")
+
+	output := newReadinessOutput()
+	monitor := ReadinessMonitor{ServerLog: serverLog, BepInExLog: bepInExLog, Output: output, PollEvery: 2 * time.Millisecond}
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	result := waitForReadiness(monitor, ctx, expectedModReadiness("2.5.8", "1.0.86"))
+	appendUntilObserved(t, serverLog, output.server, result)
+	appendUntilObserved(t, bepInExLog, output.bepinex, result)
+	appendLog(t, serverLog, readLogFixture(t, "server-ready.log"))
+	appendLog(t, bepInExLog, readLogFixture(t, "bepinex-ready.log"))
+
+	select {
+	case err := <-result:
+		t.Fatalf("Wait() returned for the wrong Satisvampory version: %v", err)
+	case <-time.After(40 * time.Millisecond):
+	}
+	appendLog(t, bepInExLog, "[Info :Satisvampory] Satisvampory 1.0.86 (Satisvampory) ready.\n")
+	if err := <-result; err != nil {
+		t.Fatalf("Wait() error = %v; output = %q", err, output.String())
+	}
+}
+
 func TestReadinessTimesOut(t *testing.T) {
 	root := t.TempDir()
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Millisecond)
@@ -396,7 +424,7 @@ func TestReadinessTimesOut(t *testing.T) {
 		BepInExLog: filepath.Join(root, "bepinex.log"),
 		Output:     io.Discard,
 		PollEvery:  2 * time.Millisecond,
-	}).Wait(ctx, ExpectedReadiness{RequireMods: true, KindredVersion: "2.5.8"})
+	}).Wait(ctx, expectedModReadiness("2.5.8", "1.0.85"))
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Wait() error = %v, want deadline exceeded", err)
 	}
@@ -563,7 +591,7 @@ func TestReadinessClosesInitializedLogsWhenSetupFails(t *testing.T) {
 	before := countOpenPath(t, serverLog)
 	err := (ReadinessMonitor{ServerLog: serverLog, BepInExLog: bepInExDirectory}).Wait(
 		t.Context(),
-		ExpectedReadiness{RequireMods: true, KindredVersion: "2.5.8"},
+		expectedModReadiness("2.5.8", "1.0.85"),
 	)
 	if err == nil {
 		t.Fatal("Wait() succeeded with a directory as the BepInEx log")
@@ -599,7 +627,7 @@ func TestReadinessHandlesTruncationAndRotation(t *testing.T) {
 	monitor := ReadinessMonitor{ServerLog: serverLog, BepInExLog: bepInExLog, Output: output, PollEvery: 2 * time.Millisecond}
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	result := waitForReadiness(monitor, ctx, ExpectedReadiness{RequireMods: true, KindredVersion: "2.5.8"})
+	result := waitForReadiness(monitor, ctx, expectedModReadiness("2.5.8", "1.0.85"))
 	appendUntilObserved(t, serverLog, output.server, result)
 	appendUntilObserved(t, bepInExLog, output.bepinex, result)
 
@@ -614,7 +642,9 @@ func TestReadinessHandlesTruncationAndRotation(t *testing.T) {
 	if err := os.Rename(bepInExLog, bepInExLog+".previous"); err != nil {
 		t.Fatal(err)
 	}
-	writeLog(t, bepInExLog, "Plugin aa.odjit.KindredCommands version 2.5.8 is loaded!\n")
+	writeLog(t, bepInExLog,
+		"Plugin aa.odjit.KindredCommands version 2.5.8 is loaded!\n"+
+			"Satisvampory 1.0.85 (Satisvampory) ready.\n")
 
 	if err := <-result; err != nil {
 		t.Fatalf("Wait() error = %v; output = %q", err, output.String())
@@ -649,14 +679,16 @@ func TestReadinessDrainsAppendDuringRotationHandoff(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
-	result := waitForReadiness(monitor, ctx, ExpectedReadiness{RequireMods: true, KindredVersion: "2.5.8"})
+	result := waitForReadiness(monitor, ctx, expectedModReadiness("2.5.8", "1.0.85"))
 	appendUntilObserved(t, serverLog, output.server, result)
 	appendUntilObserved(t, bepInExLog, output.bepinex, result)
 	appendLog(t, serverLog, readLogFixture(t, "server-ready.log"))
 	if err := os.Rename(bepInExLog, previousBepInExLog); err != nil {
 		t.Fatal(err)
 	}
-	writeLog(t, bepInExLog, "Plugin aa.odjit.KindredCommands version 2.5.8 is loaded!\n")
+	writeLog(t, bepInExLog,
+		"Plugin aa.odjit.KindredCommands version 2.5.8 is loaded!\n"+
+			"Satisvampory 1.0.85 (Satisvampory) ready.\n")
 
 	if err := <-result; err != nil {
 		t.Fatalf("Wait() error = %v; output = %q", err, output.String())
@@ -1440,6 +1472,14 @@ func waitForReadiness(monitor ReadinessMonitor, ctx context.Context, expected Ex
 		result <- monitor.Wait(ctx, expected)
 	}()
 	return result
+}
+
+func expectedModReadiness(kindredVersion, satisvamporyVersion string) ExpectedReadiness {
+	return ExpectedReadiness{
+		RequireMods:         true,
+		KindredVersion:      kindredVersion,
+		SatisvamporyVersion: satisvamporyVersion,
+	}
 }
 
 func appendUntilObserved(t *testing.T, path string, observed <-chan struct{}, result <-chan error) {

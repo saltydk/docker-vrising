@@ -41,7 +41,7 @@ type ResolvedPackage struct {
 }
 
 type ResolvedGraph struct {
-	Root     PackageRef
+	Roots    []PackageRef
 	Packages []ResolvedPackage
 }
 
@@ -68,14 +68,18 @@ type packageResponse struct {
 	Latest    packageMetadata `json:"latest"`
 }
 
-func (t *Thunderstore) Resolve(ctx context.Context, selection RootSelection) (ResolvedGraph, error) {
-	if err := validateRootSelection(selection); err != nil {
+func (t *Thunderstore) Resolve(ctx context.Context, selections []RootSelection) (ResolvedGraph, error) {
+	orderedSelections, err := validateRootSelections(selections)
+	if err != nil {
 		return ResolvedGraph{}, err
 	}
 
-	root, err := t.resolveRoot(ctx, selection)
-	if err != nil {
-		return ResolvedGraph{}, err
+	roots := make([]PackageRef, len(orderedSelections))
+	for i, selection := range orderedSelections {
+		roots[i], err = t.resolveRoot(ctx, selection)
+		if err != nil {
+			return ResolvedGraph{}, err
+		}
 	}
 
 	resolver := graphResolver{
@@ -84,21 +88,73 @@ func (t *Thunderstore) Resolve(ctx context.Context, selection RootSelection) (Re
 		visited:      make(map[PackageRef]bool),
 		versions:     make(map[string]string),
 	}
-	if err := resolver.visit(ctx, root); err != nil {
-		return ResolvedGraph{}, err
+	for _, root := range roots {
+		if err := resolver.visit(ctx, root); err != nil {
+			return ResolvedGraph{}, err
+		}
 	}
-	return ResolvedGraph{Root: root, Packages: resolver.packages}, nil
+	return ResolvedGraph{Roots: roots, Packages: resolver.packages}, nil
+}
+
+var managedRootIdentities = []PackageRef{
+	{Namespace: "odjit", Name: "KindredCommands"},
+	{Namespace: "Team_GreenEye", Name: "Satisvampory"},
+}
+
+func validateRootSelections(selections []RootSelection) ([]RootSelection, error) {
+	if len(selections) != len(managedRootIdentities) {
+		return nil, fmt.Errorf("exactly odjit/KindredCommands and Team_GreenEye/Satisvampory roots are required")
+	}
+	ordered := make([]RootSelection, len(managedRootIdentities))
+	seen := make([]bool, len(managedRootIdentities))
+	for _, selection := range selections {
+		if err := validateRootSelection(selection); err != nil {
+			return nil, err
+		}
+		index := managedRootIndex(selection.Namespace, selection.Name)
+		if index < 0 {
+			return nil, fmt.Errorf("unexpected managed root %s/%s", selection.Namespace, selection.Name)
+		}
+		if seen[index] {
+			return nil, fmt.Errorf("duplicate managed root %s/%s", selection.Namespace, selection.Name)
+		}
+		seen[index] = true
+		ordered[index] = selection
+	}
+	return ordered, nil
 }
 
 func validateRootSelection(selection RootSelection) error {
 	if selection.Namespace == "" || selection.Name == "" {
 		return fmt.Errorf("root namespace and name are required")
 	}
-	if selection.Version == "latest" && (selection.Namespace != "odjit" || selection.Name != "KindredCommands") {
-		return fmt.Errorf("latest is only supported for odjit/KindredCommands")
+	if selection.Version == "latest" && managedRootIndex(selection.Namespace, selection.Name) < 0 {
+		return fmt.Errorf("latest is only supported for managed roots")
 	}
 	if selection.Version != "latest" && !semanticVersion.MatchString(selection.Version) {
 		return fmt.Errorf("root version must be latest or a semantic version")
+	}
+	return nil
+}
+
+func managedRootIndex(namespace, name string) int {
+	for i, root := range managedRootIdentities {
+		if root.Namespace == namespace && root.Name == name {
+			return i
+		}
+	}
+	return -1
+}
+
+func validateManagedRootRefs(roots []PackageRef) error {
+	if len(roots) != len(managedRootIdentities) {
+		return fmt.Errorf("exactly odjit/KindredCommands and Team_GreenEye/Satisvampory roots are required")
+	}
+	for i, root := range roots {
+		expected := managedRootIdentities[i]
+		if root.Namespace != expected.Namespace || root.Name != expected.Name || !semanticVersion.MatchString(root.Version) {
+			return fmt.Errorf("managed roots are not the expected ordered exact roots")
+		}
 	}
 	return nil
 }
@@ -335,6 +391,8 @@ func sortPackageRefs(refs []PackageRef) {
 }
 
 func PackageLockDigest(lock PackageLock) string {
+	roots := append([]PackageRef(nil), lock.Roots...)
+	sortPackageRefs(roots)
 	packages := make([]canonicalLockedPackage, len(lock.Packages))
 	for i, pkg := range lock.Packages {
 		dependencies := append([]PackageRef(nil), pkg.Dependencies...)
@@ -353,7 +411,7 @@ func PackageLockDigest(lock PackageLock) string {
 	})
 	canonical, err := json.Marshal(canonicalPackageLock{
 		SchemaVersion: lock.SchemaVersion,
-		Root:          lock.Root,
+		Roots:         roots,
 		Packages:      packages,
 	})
 	if err != nil {
@@ -365,7 +423,7 @@ func PackageLockDigest(lock PackageLock) string {
 
 type canonicalPackageLock struct {
 	SchemaVersion int                      `json:"schema_version"`
-	Root          PackageRef               `json:"root"`
+	Roots         []PackageRef             `json:"roots"`
 	Packages      []canonicalLockedPackage `json:"packages"`
 }
 

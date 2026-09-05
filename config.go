@@ -14,38 +14,40 @@ var semanticVersion = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+$`)
 const maxLogDays = 365000
 
 type Config struct {
-	ServerDir       string
-	DataDir         string
-	StateDir        string
-	UpdateGame      bool
-	UpdateMods      bool
-	ModsEnabled     bool
-	KindredVersion  string
-	BackupRetention int
-	StartupTimeout  time.Duration
-	ShutdownTimeout time.Duration
-	LogDays         int
-	Branch          string
-	PUID            *int
-	PGID            *int
-	GameEnv         map[string]string
-	BaseEnv         []string
+	ServerDir           string
+	DataDir             string
+	StateDir            string
+	UpdateGame          bool
+	UpdateMods          bool
+	ModsEnabled         bool
+	KindredVersion      string
+	SatisvamporyVersion string
+	BackupRetention     int
+	StartupTimeout      time.Duration
+	ShutdownTimeout     time.Duration
+	LogDays             int
+	Branch              string
+	PUID                *int
+	PGID                *int
+	GameEnv             map[string]string
+	BaseEnv             []string
 }
 
 func LoadConfig(env map[string]string) (Config, []string, error) {
 	cfg := Config{
-		ServerDir:       "/mnt/vrising/server",
-		DataDir:         "/mnt/vrising/persistentdata",
-		StateDir:        "/mnt/vrising/server/.docker-vrising",
-		UpdateGame:      true,
-		UpdateMods:      true,
-		ModsEnabled:     true,
-		KindredVersion:  "latest",
-		BackupRetention: 3,
-		StartupTimeout:  30 * time.Minute,
-		ShutdownTimeout: 120 * time.Second,
-		LogDays:         30,
-		GameEnv:         make(map[string]string),
+		ServerDir:           "/mnt/vrising/server",
+		DataDir:             "/mnt/vrising/persistentdata",
+		StateDir:            "/mnt/vrising/server/.docker-vrising",
+		UpdateGame:          true,
+		UpdateMods:          true,
+		ModsEnabled:         true,
+		KindredVersion:      "latest",
+		SatisvamporyVersion: "latest",
+		BackupRetention:     3,
+		StartupTimeout:      30 * time.Minute,
+		ShutdownTimeout:     120 * time.Second,
+		LogDays:             30,
+		GameEnv:             make(map[string]string),
 	}
 	warnings := []string{}
 
@@ -74,11 +76,11 @@ func LoadConfig(env map[string]string) (Config, []string, error) {
 	if cfg.ShutdownTimeout, err = durationValue(env, "SHUTDOWN_TIMEOUT", cfg.ShutdownTimeout); err != nil {
 		return Config{}, nil, err
 	}
-	if version, ok := env["KINDRED_COMMANDS_VERSION"]; ok {
-		if version != "latest" && !semanticVersion.MatchString(version) {
-			return Config{}, nil, fmt.Errorf("KINDRED_COMMANDS_VERSION must be latest or a semantic version")
-		}
-		cfg.KindredVersion = version
+	if cfg.KindredVersion, err = versionValue(env, "KINDRED_COMMANDS_VERSION", cfg.KindredVersion); err != nil {
+		return Config{}, nil, err
+	}
+	if cfg.SatisvamporyVersion, err = versionValue(env, "SATISVAMPORY_VERSION", cfg.SatisvamporyVersion); err != nil {
+		return Config{}, nil, err
 	}
 	cfg.Branch = env["BRANCH"]
 	if cfg.PUID, cfg.PGID, err = ownerValues(env); err != nil {
@@ -117,6 +119,17 @@ func LoadConfig(env map[string]string) (Config, []string, error) {
 	}
 	sort.Strings(warnings)
 	return cfg, warnings, nil
+}
+
+func versionValue(env map[string]string, name, defaultValue string) (string, error) {
+	value, ok := env[name]
+	if !ok {
+		return defaultValue, nil
+	}
+	if value != "latest" && !semanticVersion.MatchString(value) {
+		return "", fmt.Errorf("%s must be latest or a semantic version", name)
+	}
+	return value, nil
 }
 
 func boolValue(env map[string]string, name string, defaultValue bool) (bool, error) {

@@ -1006,7 +1006,6 @@ func TestExtractArchiveExtractsRootPluginDLLsAt0644(t *testing.T) {
 		zipEntry{name: "ExamplePlugin.dll", body: "plugin"},
 		zipEntry{name: "Helper.DLL", body: "helper"},
 		zipEntry{name: "README.md", body: "docs"},
-		zipEntry{name: "nested/Hidden.dll", body: "hidden"},
 	)
 	archive, err := fetchArchiveBytes(t, body, archiveTestRef, nil)
 	if err != nil {
@@ -1032,10 +1031,79 @@ func TestExtractArchiveExtractsRootPluginDLLsAt0644(t *testing.T) {
 			t.Fatalf("%s mode = %04o, want 0644", name, info.Mode().Perm())
 		}
 	}
-	for _, ignored := range []string{"manifest.json", "README.md", filepath.Join("nested", "Hidden.dll")} {
+	for _, ignored := range []string{"manifest.json", "README.md"} {
 		if _, err := os.Stat(filepath.Join(destination, ignored)); !os.IsNotExist(err) {
 			t.Fatalf("ignored path %q stat error = %v, want not exist", ignored, err)
 		}
+	}
+}
+
+func TestExtractArchiveFlattensSinglePluginsSubtree(t *testing.T) {
+	ref := PackageRef{Namespace: "Team_GreenEye", Name: "Satisvampory", Version: "1.0.85"}
+	body := packageZIP(t, ref, nil,
+		zipEntry{name: "README.md", body: "docs"},
+		zipEntry{name: "plugins/", mode: os.ModeDir | 0o755},
+		zipEntry{name: "plugins/Satisvampory.dll", body: "satisvampory"},
+	)
+	archive, err := fetchArchiveBytes(t, body, ref, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer archive.Close()
+	destination := t.TempDir()
+
+	extracted, err := ExtractArchive(archive, destination, ExtractPlugin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"Satisvampory.dll"}; extracted.Manifest != ref || !reflect.DeepEqual(extracted.Files, want) {
+		t.Fatalf("ExtractArchive() = %#v, want manifest %#v and files %v", extracted, ref, want)
+	}
+	if got := readTestFile(t, filepath.Join(destination, "Satisvampory.dll")); got != "satisvampory" {
+		t.Fatalf("flattened Satisvampory.dll = %q, want satisvampory", got)
+	}
+	if _, err := os.Lstat(filepath.Join(destination, "plugins")); !os.IsNotExist(err) {
+		t.Fatalf("plugins subtree stat error = %v, want flattened output", err)
+	}
+}
+
+func TestExtractArchiveRejectsUnexpectedPluginLayout(t *testing.T) {
+	tests := []zipEntry{
+		{name: "nested/Hidden.dll", body: "hidden"},
+		{name: "plugins", body: "not a directory"},
+		{name: "plugins/nested/Hidden.dll", body: "hidden"},
+		{name: "plugins/README.md", body: "not a DLL"},
+	}
+	for _, entry := range tests {
+		t.Run(entry.name, func(t *testing.T) {
+			body := packageZIP(t, archiveTestRef, nil,
+				zipEntry{name: "ExamplePlugin.dll", body: "plugin"},
+				entry,
+			)
+			archive, err := fetchArchiveBytes(t, body, archiveTestRef, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer archive.Close()
+			if _, err := ExtractArchive(archive, t.TempDir(), ExtractPlugin); err == nil {
+				t.Fatalf("ExtractArchive() accepted unexpected plugin entry %q", entry.name)
+			}
+		})
+	}
+}
+
+func TestExtractArchiveRejectsDuplicateFlattenedPluginDestination(t *testing.T) {
+	body := packageZIP(t, archiveTestRef, nil,
+		zipEntry{name: "ExamplePlugin.dll", body: "root"},
+		zipEntry{name: "plugins/ExamplePlugin.dll", body: "subtree"},
+	)
+	archive, err := fetchArchiveBytes(t, body, archiveTestRef, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer archive.Close()
+	if _, err := ExtractArchive(archive, t.TempDir(), ExtractPlugin); err == nil || !strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("ExtractArchive() error = %v, want duplicate flattened destination", err)
 	}
 }
 

@@ -22,8 +22,9 @@ const maxReadinessInputBytes = 1 << 20
 const maxPendingLogGenerations = 16
 
 type ExpectedReadiness struct {
-	KindredVersion string
-	RequireMods    bool
+	KindredVersion      string
+	SatisvamporyVersion string
+	RequireMods         bool
 }
 
 type ReadinessMonitor struct {
@@ -46,6 +47,7 @@ type readinessEvidence struct {
 	chainloader   bool
 	vcf           bool
 	kindred       bool
+	satisvampory  bool
 }
 
 type logBatch struct {
@@ -96,6 +98,9 @@ func (m ReadinessMonitor) Wait(ctx context.Context, expected ExpectedReadiness) 
 		}
 		if expected.KindredVersion == "" || expected.KindredVersion == "latest" || !semanticVersion.MatchString(expected.KindredVersion) {
 			return fmt.Errorf("exact Kindred version is required")
+		}
+		if expected.SatisvamporyVersion == "" || expected.SatisvamporyVersion == "latest" || !semanticVersion.MatchString(expected.SatisvamporyVersion) {
+			return fmt.Errorf("exact Satisvampory version is required")
 		}
 	}
 	pollEvery := m.PollEvery
@@ -648,6 +653,10 @@ func (e *readinessEvidence) observe(line string, expected ExpectedReadiness) {
 		"Plugin aa.odjit.KindredCommands version "+expected.KindredVersion+" is loaded!") {
 		e.kindred = true
 	}
+	if expected.SatisvamporyVersion != "" && strings.Contains(line,
+		"Satisvampory "+expected.SatisvamporyVersion+" (Satisvampory) ready.") {
+		e.satisvampory = true
+	}
 }
 
 func (e *readinessEvidence) reset(source string) {
@@ -658,13 +667,14 @@ func (e *readinessEvidence) reset(source string) {
 	e.chainloader = false
 	e.vcf = false
 	e.kindred = false
+	e.satisvampory = false
 }
 
 func (e readinessEvidence) complete(requireMods bool) bool {
 	if !e.serverStartup {
 		return false
 	}
-	return !requireMods || e.chainloader && e.vcf && e.kindred
+	return !requireMods || e.chainloader && e.vcf && e.kindred && e.satisvampory
 }
 
 func fatalReadinessLine(line string) bool {

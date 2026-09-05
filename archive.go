@@ -909,15 +909,47 @@ func selectArchiveEntries(entries []archiveEntry, policy ExtractPolicy) ([]archi
 	selected := make([]archiveEntry, 0, len(entries))
 	switch policy {
 	case ExtractPlugin:
+		seenDestinations := make(map[string]bool)
 		for _, entry := range entries {
-			if entry.isDirectory || strings.Contains(entry.archivePath, "/") || !strings.EqualFold(path.Ext(entry.archivePath), ".dll") {
+			if entry.archivePath == "manifest.json" {
 				continue
 			}
-			entry.outputPath = entry.archivePath
+			if !strings.Contains(entry.archivePath, "/") {
+				if entry.isDirectory {
+					if entry.archivePath == "plugins" {
+						continue
+					}
+					return nil, fmt.Errorf("plugin archive contains unexpected directory %q", entry.archivePath)
+				}
+				if entry.archivePath == "plugins" {
+					return nil, fmt.Errorf("plugin archive plugins entry is not a directory")
+				}
+				if !strings.EqualFold(path.Ext(entry.archivePath), ".dll") {
+					continue
+				}
+				entry.outputPath = entry.archivePath
+			} else {
+				if !strings.HasPrefix(entry.archivePath, "plugins/") {
+					return nil, fmt.Errorf("plugin archive contains unexpected layout %q", entry.archivePath)
+				}
+				name := strings.TrimPrefix(entry.archivePath, "plugins/")
+				if entry.isDirectory || name == "" || strings.Contains(name, "/") {
+					return nil, fmt.Errorf("plugin archive contains unexpected plugins layout %q", entry.archivePath)
+				}
+				if !strings.EqualFold(path.Ext(name), ".dll") {
+					return nil, fmt.Errorf("plugin archive contains non-DLL plugins payload %q", entry.archivePath)
+				}
+				entry.outputPath = name
+			}
+			destinationKey := strings.ToLower(entry.outputPath)
+			if seenDestinations[destinationKey] {
+				return nil, fmt.Errorf("duplicate plugin destination %q", entry.outputPath)
+			}
+			seenDestinations[destinationKey] = true
 			selected = append(selected, entry)
 		}
 		if len(selected) == 0 {
-			return nil, fmt.Errorf("plugin archive contains no root DLLs")
+			return nil, fmt.Errorf("plugin archive contains no DLLs at root or directly below plugins")
 		}
 	case ExtractBepInEx:
 		const wrapper = "BepInExPack_V_Rising"

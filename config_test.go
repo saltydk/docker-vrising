@@ -18,6 +18,7 @@ func TestLoadConfigDefaults(t *testing.T) {
 		cfg.DataDir != "/mnt/vrising/persistentdata" ||
 		!cfg.UpdateGame || !cfg.UpdateMods || !cfg.ModsEnabled ||
 		cfg.KindredVersion != "latest" ||
+		cfg.SatisvamporyVersion != "latest" ||
 		cfg.BackupRetention != 3 ||
 		cfg.StartupTimeout != 30*time.Minute ||
 		cfg.ShutdownTimeout != 120*time.Second ||
@@ -56,6 +57,7 @@ func TestLoadConfigRejectsInvalidValues(t *testing.T) {
 		{name: "only puid", env: map[string]string{"PUID": "1000"}},
 		{name: "non-numeric ids", env: map[string]string{"PUID": "user", "PGID": "1000"}},
 		{name: "kindred version", env: map[string]string{"KINDRED_COMMANDS_VERSION": "v1.2"}},
+		{name: "satisvampory version", env: map[string]string{"SATISVAMPORY_VERSION": "v1.2"}},
 	}
 
 	for _, tt := range tests {
@@ -96,6 +98,7 @@ func TestLoadConfigParsesValuesAndPreservesGameEnvironment(t *testing.T) {
 		"UPDATE_MODS":              "false",
 		"MODS_ENABLED":             "false",
 		"KINDRED_COMMANDS_VERSION": "1.2.3",
+		"SATISVAMPORY_VERSION":     "4.5.6",
 		"BACKUP_RETENTION":         "5",
 		"STARTUP_TIMEOUT":          "45s",
 		"SHUTDOWN_TIMEOUT":         "3m",
@@ -113,7 +116,7 @@ func TestLoadConfigParsesValuesAndPreservesGameEnvironment(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(warnings) != 1 || cfg.UpdateGame || cfg.UpdateMods || cfg.ModsEnabled ||
-		cfg.KindredVersion != "1.2.3" || cfg.BackupRetention != 5 ||
+		cfg.KindredVersion != "1.2.3" || cfg.SatisvamporyVersion != "4.5.6" || cfg.BackupRetention != 5 ||
 		cfg.StartupTimeout != 45*time.Second || cfg.ShutdownTimeout != 3*time.Minute ||
 		cfg.LogDays != 7 || cfg.Branch != "experimental" || cfg.PUID == nil ||
 		*cfg.PUID != 1000 || cfg.PGID == nil || *cfg.PGID != 1001 {

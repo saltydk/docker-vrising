@@ -14,55 +14,67 @@ import (
 
 const thunderstoreAPIPath = "/api/experimental/package/"
 
-func TestResolveLatestKindredUsesExactDeclaredDependencies(t *testing.T) {
+func TestResolveLatestManagedRootsUsesExactMergedDependencies(t *testing.T) {
 	server := newThunderstoreServer(t, fixtureResponses(t))
 	defer server.Close()
 
-	graph, err := (&Thunderstore{BaseURL: server.URL, Client: server.Client()}).Resolve(t.Context(), RootSelection{
-		Namespace: "odjit",
-		Name:      "KindredCommands",
-		Version:   "latest",
+	graph, err := (&Thunderstore{BaseURL: server.URL, Client: server.Client()}).Resolve(t.Context(), []RootSelection{
+		{Namespace: "Team_GreenEye", Name: "Satisvampory", Version: "latest"},
+		{Namespace: "odjit", Name: "KindredCommands", Version: "latest"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	wantRoot := PackageRef{Namespace: "odjit", Name: "KindredCommands", Version: "2.5.8"}
-	if graph.Root != wantRoot {
-		t.Fatalf("root = %#v, want %#v", graph.Root, wantRoot)
+	wantKindred := PackageRef{Namespace: "odjit", Name: "KindredCommands", Version: "2.5.8"}
+	wantSatisvampory := PackageRef{Namespace: "Team_GreenEye", Name: "Satisvampory", Version: "1.0.85"}
+	wantRoots := []PackageRef{wantKindred, wantSatisvampory}
+	if !reflect.DeepEqual(graph.Roots, wantRoots) {
+		t.Fatalf("roots = %#v, want %#v", graph.Roots, wantRoots)
 	}
 	assertPackageOrder(t, graph.Packages,
 		PackageRef{Namespace: "BepInEx", Name: "BepInExPack_V_Rising", Version: "1.733.2"},
 		PackageRef{Namespace: "deca", Name: "VampireCommandFramework", Version: "0.10.4"},
-		wantRoot,
+		wantKindred,
+		PackageRef{Namespace: "cheesasaurus", Name: "HookDOTS_API", Version: "1.1.1"},
+		wantSatisvampory,
 	)
-	if got := server.requests(); containsRequest(got, thunderstoreAPIPath+"deca/VampireCommandFramework/") {
-		t.Fatalf("resolver requested VCF latest endpoint: %v", got)
+	for _, path := range []string{
+		thunderstoreAPIPath + "deca/VampireCommandFramework/",
+		thunderstoreAPIPath + "cheesasaurus/HookDOTS_API/",
+	} {
+		if got := server.requests(); containsRequest(got, path) {
+			t.Fatalf("resolver requested transitive latest endpoint %s: %v", path, got)
+		}
 	}
 	if got, want := server.requests(), []string{
 		thunderstoreAPIPath + "odjit/KindredCommands/",
+		thunderstoreAPIPath + "Team_GreenEye/Satisvampory/",
 		thunderstoreAPIPath + "odjit/KindredCommands/2.5.8/",
 		thunderstoreAPIPath + "BepInEx/BepInExPack_V_Rising/1.733.2/",
 		thunderstoreAPIPath + "deca/VampireCommandFramework/0.10.4/",
+		thunderstoreAPIPath + "Team_GreenEye/Satisvampory/1.0.85/",
+		thunderstoreAPIPath + "cheesasaurus/HookDOTS_API/1.1.1/",
 	}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("requests = %v, want %v", got, want)
 	}
 }
 
-func TestResolvePinnedKindredSkipsLatestEndpoint(t *testing.T) {
+func TestResolvePinnedManagedRootsSkipLatestEndpoints(t *testing.T) {
 	server := newThunderstoreServer(t, fixtureResponses(t))
 	defer server.Close()
 
-	_, err := (&Thunderstore{BaseURL: server.URL, Client: server.Client()}).Resolve(t.Context(), RootSelection{
-		Namespace: "odjit",
-		Name:      "KindredCommands",
-		Version:   "2.5.8",
-	})
+	_, err := (&Thunderstore{BaseURL: server.URL, Client: server.Client()}).Resolve(t.Context(), managedRootSelections("2.5.8", "1.0.85"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := server.requests(); containsRequest(got, thunderstoreAPIPath+"odjit/KindredCommands/") {
-		t.Fatalf("resolver requested root latest endpoint: %v", got)
+	for _, path := range []string{
+		thunderstoreAPIPath + "odjit/KindredCommands/",
+		thunderstoreAPIPath + "Team_GreenEye/Satisvampory/",
+	} {
+		if got := server.requests(); containsRequest(got, path) {
+			t.Fatalf("resolver requested root latest endpoint %s: %v", path, got)
+		}
 	}
 }
 
@@ -70,8 +82,9 @@ func TestResolveRejectsLatestForAnotherRootBeforeRequest(t *testing.T) {
 	server := newThunderstoreServer(t, fixtureResponses(t))
 	defer server.Close()
 
-	_, err := (&Thunderstore{BaseURL: server.URL, Client: server.Client()}).Resolve(t.Context(), RootSelection{
-		Namespace: "deca", Name: "VampireCommandFramework", Version: "latest",
+	_, err := (&Thunderstore{BaseURL: server.URL, Client: server.Client()}).Resolve(t.Context(), []RootSelection{
+		{Namespace: "odjit", Name: "KindredCommands", Version: "2.5.8"},
+		{Namespace: "deca", Name: "VampireCommandFramework", Version: "latest"},
 	})
 	if err == nil || !strings.Contains(err.Error(), "latest is only supported") {
 		t.Fatalf("Resolve() error = %v, want restricted latest selection", err)
@@ -81,21 +94,51 @@ func TestResolveRejectsLatestForAnotherRootBeforeRequest(t *testing.T) {
 	}
 }
 
+func TestResolveRejectsMissingDuplicateOrUnexpectedManagedRootBeforeRequest(t *testing.T) {
+	tests := []struct {
+		name       string
+		selections []RootSelection
+	}{
+		{name: "missing", selections: managedRootSelections("2.5.8", "1.0.85")[:1]},
+		{name: "duplicate", selections: []RootSelection{
+			{Namespace: "odjit", Name: "KindredCommands", Version: "2.5.8"},
+			{Namespace: "odjit", Name: "KindredCommands", Version: "2.5.8"},
+		}},
+		{name: "unexpected", selections: []RootSelection{
+			{Namespace: "odjit", Name: "KindredCommands", Version: "2.5.8"},
+			{Namespace: "deca", Name: "VampireCommandFramework", Version: "0.10.4"},
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := newThunderstoreServer(t, fixtureResponses(t))
+			defer server.Close()
+			if _, err := (&Thunderstore{BaseURL: server.URL, Client: server.Client()}).Resolve(t.Context(), tt.selections); err == nil {
+				t.Fatal("Resolve() accepted an invalid managed root set")
+			}
+			if got := server.requests(); len(got) != 0 {
+				t.Fatalf("resolver made requests before rejecting roots: %v", got)
+			}
+		})
+	}
+}
+
 func TestResolveDeduplicatesBepInEx(t *testing.T) {
 	server := newThunderstoreServer(t, fixtureResponses(t))
 	defer server.Close()
 
-	graph, err := (&Thunderstore{BaseURL: server.URL, Client: server.Client()}).Resolve(t.Context(), RootSelection{
-		Namespace: "odjit", Name: "KindredCommands", Version: "2.5.8",
-	})
+	graph, err := (&Thunderstore{BaseURL: server.URL, Client: server.Client()}).Resolve(t.Context(), managedRootSelections("2.5.8", "1.0.85"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(graph.Packages) != 3 {
-		t.Fatalf("resolved %d packages, want 3", len(graph.Packages))
+	if len(graph.Packages) != 5 {
+		t.Fatalf("resolved %d packages, want 5", len(graph.Packages))
 	}
 	if got := countRequest(server.requests(), thunderstoreAPIPath+"BepInEx/BepInExPack_V_Rising/1.733.2/"); got != 1 {
 		t.Fatalf("BepInEx exact metadata requests = %d, want 1", got)
+	}
+	if got := countRequest(server.requests(), thunderstoreAPIPath+"deca/VampireCommandFramework/0.10.4/"); got != 1 {
+		t.Fatalf("VCF exact metadata requests = %d, want 1", got)
 	}
 }
 
@@ -103,9 +146,7 @@ func TestResolveAcceptsMetadataWithoutFileSize(t *testing.T) {
 	server := newThunderstoreServer(t, fixtureResponses(t))
 	defer server.Close()
 
-	graph, err := (&Thunderstore{BaseURL: server.URL, Client: server.Client()}).Resolve(t.Context(), RootSelection{
-		Namespace: "odjit", Name: "KindredCommands", Version: "2.5.8",
-	})
+	graph, err := (&Thunderstore{BaseURL: server.URL, Client: server.Client()}).Resolve(t.Context(), managedRootSelections("2.5.8", "1.0.85"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,9 +166,7 @@ func TestResolvePreservesReportedMetadataFileSize(t *testing.T) {
 	server := newThunderstoreServer(t, responses)
 	defer server.Close()
 
-	graph, err := (&Thunderstore{BaseURL: server.URL, Client: server.Client()}).Resolve(t.Context(), RootSelection{
-		Namespace: "odjit", Name: "KindredCommands", Version: "2.5.8",
-	})
+	graph, err := (&Thunderstore{BaseURL: server.URL, Client: server.Client()}).Resolve(t.Context(), managedRootSelections("2.5.8", "1.0.85"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,9 +184,7 @@ func TestResolveRejectsNegativeFileSize(t *testing.T) {
 	server := newThunderstoreServer(t, responses)
 	defer server.Close()
 
-	_, err := (&Thunderstore{BaseURL: server.URL, Client: server.Client()}).Resolve(t.Context(), RootSelection{
-		Namespace: "odjit", Name: "KindredCommands", Version: "2.5.8",
-	})
+	_, err := (&Thunderstore{BaseURL: server.URL, Client: server.Client()}).Resolve(t.Context(), managedRootSelections("2.5.8", "1.0.85"))
 	if err == nil || !strings.Contains(err.Error(), "negative file size") {
 		t.Fatalf("Resolve() error = %v, want negative file size", err)
 	}
@@ -162,9 +199,7 @@ func TestResolveRejectsOmittedDependenciesMetadata(t *testing.T) {
 	server := newThunderstoreServer(t, responses)
 	defer server.Close()
 
-	_, err := (&Thunderstore{BaseURL: server.URL, Client: server.Client()}).Resolve(t.Context(), RootSelection{
-		Namespace: "odjit", Name: "KindredCommands", Version: "2.5.8",
-	})
+	_, err := (&Thunderstore{BaseURL: server.URL, Client: server.Client()}).Resolve(t.Context(), managedRootSelections("2.5.8", "1.0.85"))
 	if err == nil || !strings.Contains(err.Error(), "dependencies must be a non-null JSON array") {
 		t.Fatalf("Resolve() error = %v, want omitted dependencies rejection", err)
 	}
@@ -179,9 +214,7 @@ func TestResolveRejectsNullDependenciesMetadata(t *testing.T) {
 	server := newThunderstoreServer(t, responses)
 	defer server.Close()
 
-	_, err := (&Thunderstore{BaseURL: server.URL, Client: server.Client()}).Resolve(t.Context(), RootSelection{
-		Namespace: "odjit", Name: "KindredCommands", Version: "2.5.8",
-	})
+	_, err := (&Thunderstore{BaseURL: server.URL, Client: server.Client()}).Resolve(t.Context(), managedRootSelections("2.5.8", "1.0.85"))
 	if err == nil || !strings.Contains(err.Error(), "dependencies must be a non-null JSON array") {
 		t.Fatalf("Resolve() error = %v, want null dependencies rejection", err)
 	}
@@ -198,11 +231,31 @@ func TestResolveRejectsConflictingExactVersions(t *testing.T) {
 	server := newThunderstoreServer(t, responses)
 	defer server.Close()
 
-	_, err := (&Thunderstore{BaseURL: server.URL, Client: server.Client()}).Resolve(t.Context(), RootSelection{
-		Namespace: "odjit", Name: "KindredCommands", Version: "2.5.8",
-	})
+	_, err := (&Thunderstore{BaseURL: server.URL, Client: server.Client()}).Resolve(t.Context(), managedRootSelections("2.5.8", "1.0.85"))
 	if err == nil || !strings.Contains(err.Error(), "conflicting versions") {
 		t.Fatalf("Resolve() error = %v, want conflicting versions", err)
+	}
+}
+
+func TestResolveRejectsConflictAcrossManagedRoots(t *testing.T) {
+	responses := fixtureResponses(t)
+	satisPath := thunderstoreAPIPath + "Team_GreenEye/Satisvampory/1.0.85/"
+	responses[satisPath] = changeMetadata(t, responses[satisPath], func(metadata map[string]any) {
+		metadata["dependencies"] = []string{
+			"BepInEx-BepInExPack_V_Rising-1.733.2",
+			"deca-VampireCommandFramework-0.11.0",
+			"cheesasaurus-HookDOTS_API-1.1.1",
+		}
+	})
+	server := newThunderstoreServer(t, responses)
+	defer server.Close()
+
+	_, err := (&Thunderstore{BaseURL: server.URL, Client: server.Client()}).Resolve(t.Context(), managedRootSelections("2.5.8", "1.0.85"))
+	if err == nil || !strings.Contains(err.Error(), "conflicting versions") {
+		t.Fatalf("Resolve() error = %v, want cross-root conflicting versions", err)
+	}
+	if got := server.requests(); containsRequest(got, thunderstoreAPIPath+"deca/VampireCommandFramework/0.11.0/") {
+		t.Fatalf("resolver requested metadata after detecting cross-root conflict: %v", got)
 	}
 }
 
@@ -215,9 +268,7 @@ func TestResolveRejectsDependencyCycle(t *testing.T) {
 	server := newThunderstoreServer(t, responses)
 	defer server.Close()
 
-	_, err := (&Thunderstore{BaseURL: server.URL, Client: server.Client()}).Resolve(t.Context(), RootSelection{
-		Namespace: "odjit", Name: "KindredCommands", Version: "2.5.8",
-	})
+	_, err := (&Thunderstore{BaseURL: server.URL, Client: server.Client()}).Resolve(t.Context(), managedRootSelections("2.5.8", "1.0.85"))
 	if err == nil || !strings.Contains(err.Error(), "cycle") {
 		t.Fatalf("Resolve() error = %v, want dependency cycle", err)
 	}
@@ -232,9 +283,7 @@ func TestResolveRejectsInactivePackage(t *testing.T) {
 	server := newThunderstoreServer(t, responses)
 	defer server.Close()
 
-	_, err := (&Thunderstore{BaseURL: server.URL, Client: server.Client()}).Resolve(t.Context(), RootSelection{
-		Namespace: "odjit", Name: "KindredCommands", Version: "2.5.8",
-	})
+	_, err := (&Thunderstore{BaseURL: server.URL, Client: server.Client()}).Resolve(t.Context(), managedRootSelections("2.5.8", "1.0.85"))
 	if err == nil || !strings.Contains(err.Error(), "inactive") {
 		t.Fatalf("Resolve() error = %v, want inactive package", err)
 	}
@@ -247,14 +296,12 @@ func TestResolveRetriesTransientMetadataFailure(t *testing.T) {
 	server.failures[rootPath] = []int{http.StatusServiceUnavailable, http.StatusTooManyRequests}
 	defer server.Close()
 
-	graph, err := (&Thunderstore{BaseURL: server.URL, Client: server.Client()}).Resolve(t.Context(), RootSelection{
-		Namespace: "odjit", Name: "KindredCommands", Version: "2.5.8",
-	})
+	graph, err := (&Thunderstore{BaseURL: server.URL, Client: server.Client()}).Resolve(t.Context(), managedRootSelections("2.5.8", "1.0.85"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(graph.Packages) != 3 {
-		t.Fatalf("resolved %d packages, want 3", len(graph.Packages))
+	if len(graph.Packages) != 5 {
+		t.Fatalf("resolved %d packages, want 5", len(graph.Packages))
 	}
 	if got := countRequest(server.requests(), rootPath); got != 3 {
 		t.Fatalf("root metadata requests = %d, want 3", got)
@@ -265,10 +312,13 @@ func TestPackageLockDigestIsStableAcrossResponseOrder(t *testing.T) {
 	bepinex := LockedPackage{Ref: PackageRef{Namespace: "BepInEx", Name: "BepInExPack_V_Rising", Version: "1.733.2"}, FullName: "BepInEx-BepInExPack_V_Rising-1.733.2", DownloadURL: "https://thunderstore.io/package/download/BepInEx/BepInExPack_V_Rising/1.733.2/", FileSize: 33503624}
 	vcf := LockedPackage{Ref: PackageRef{Namespace: "deca", Name: "VampireCommandFramework", Version: "0.10.4"}, FullName: "deca-VampireCommandFramework-0.10.4", DownloadURL: "https://thunderstore.io/package/download/deca/VampireCommandFramework/0.10.4/", FileSize: 45335, Dependencies: []PackageRef{bepinex.Ref}}
 	kindred := LockedPackage{Ref: PackageRef{Namespace: "odjit", Name: "KindredCommands", Version: "2.5.8"}, FullName: "odjit-KindredCommands-2.5.8", DownloadURL: "https://thunderstore.io/package/download/odjit/KindredCommands/2.5.8/", FileSize: 1384283, Dependencies: []PackageRef{vcf.Ref, bepinex.Ref}}
+	hookDOTS := LockedPackage{Ref: PackageRef{Namespace: "cheesasaurus", Name: "HookDOTS_API", Version: "1.1.1"}, FullName: "cheesasaurus-HookDOTS_API-1.1.1", DownloadURL: "https://thunderstore.io/package/download/cheesasaurus/HookDOTS_API/1.1.1/", FileSize: 23046, Dependencies: []PackageRef{bepinex.Ref}}
+	satisvampory := LockedPackage{Ref: PackageRef{Namespace: "Team_GreenEye", Name: "Satisvampory", Version: "1.0.85"}, FullName: "Team_GreenEye-Satisvampory-1.0.85", DownloadURL: "https://thunderstore.io/package/download/Team_GreenEye/Satisvampory/1.0.85/", FileSize: 133704, Dependencies: []PackageRef{bepinex.Ref, vcf.Ref, hookDOTS.Ref}}
 
-	first := PackageLock{SchemaVersion: schemaVersion, Root: kindred.Ref, Packages: []LockedPackage{bepinex, vcf, kindred}}
-	second := PackageLock{SchemaVersion: schemaVersion, Root: kindred.Ref, Packages: []LockedPackage{kindred, bepinex, vcf}}
-	second.Packages[0].Dependencies = []PackageRef{bepinex.Ref, vcf.Ref}
+	first := PackageLock{SchemaVersion: schemaVersion, Roots: []PackageRef{kindred.Ref, satisvampory.Ref}, Packages: []LockedPackage{bepinex, vcf, kindred, hookDOTS, satisvampory}}
+	second := PackageLock{SchemaVersion: schemaVersion, Roots: []PackageRef{satisvampory.Ref, kindred.Ref}, Packages: []LockedPackage{satisvampory, hookDOTS, kindred, bepinex, vcf}}
+	second.Packages[0].Dependencies = []PackageRef{hookDOTS.Ref, vcf.Ref, bepinex.Ref}
+	second.Packages[2].Dependencies = []PackageRef{bepinex.Ref, vcf.Ref}
 
 	if got, want := PackageLockDigest(first), PackageLockDigest(second); got != want {
 		t.Fatalf("PackageLockDigest() = %q, want stable digest %q", got, want)
@@ -332,8 +382,19 @@ func fixtureResponses(t *testing.T) map[string][]byte {
 	return map[string][]byte{
 		thunderstoreAPIPath + "odjit/KindredCommands/":                readFixture(t, "kindred-package.json"),
 		thunderstoreAPIPath + "odjit/KindredCommands/2.5.8/":          readFixture(t, "kindred-2.5.8.json"),
+		thunderstoreAPIPath + "Team_GreenEye/Satisvampory/":           readFixture(t, "satisvampory-package.json"),
+		thunderstoreAPIPath + "Team_GreenEye/Satisvampory/1.0.85/":    readFixture(t, "satisvampory-1.0.85.json"),
+		thunderstoreAPIPath + "cheesasaurus/HookDOTS_API/":            readFixture(t, "hookdots-package.json"),
+		thunderstoreAPIPath + "cheesasaurus/HookDOTS_API/1.1.1/":      readFixture(t, "hookdots-1.1.1.json"),
 		thunderstoreAPIPath + "deca/VampireCommandFramework/0.10.4/":  readFixture(t, "vcf-0.10.4.json"),
 		thunderstoreAPIPath + "BepInEx/BepInExPack_V_Rising/1.733.2/": readFixture(t, "bepinex-1.733.2.json"),
+	}
+}
+
+func managedRootSelections(kindredVersion, satisvamporyVersion string) []RootSelection {
+	return []RootSelection{
+		{Namespace: "odjit", Name: "KindredCommands", Version: kindredVersion},
+		{Namespace: "Team_GreenEye", Name: "Satisvampory", Version: satisvamporyVersion},
 	}
 }
 
