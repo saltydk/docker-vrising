@@ -8,6 +8,8 @@ import (
 	"reflect"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestStoreSaveIsAtomicAndRoundTrips(t *testing.T) {
@@ -326,6 +328,74 @@ func TestRecoverInterruptedTransactionRetainsJournalWhenCreatedAncestorSyncFails
 	assertTransactionRetained(t, &store)
 }
 
+func TestRecoverInterruptedTransactionResyncsParentAfterFailedDeleteSync(t *testing.T) {
+	serverDir := t.TempDir()
+	stateDir := filepath.Join(serverDir, ".docker-vrising")
+	managedPath := filepath.Join(serverDir, "BepInEx", "new.dll")
+	store := Store{StateDir: stateDir}
+
+	writeTestFile(t, managedPath, "new managed file")
+	if err := store.Save(State{
+		SchemaVersion: 1,
+		Transaction: &TransactionJournal{Entries: []JournalEntry{{
+			RelativePath: "BepInEx/new.dll",
+			Existed:      false,
+		}}},
+	}); err != nil {
+		t.Fatalf("save transaction state: %v", err)
+	}
+	syncer := newFailFirstDirectorySync(t, filepath.Dir(managedPath))
+	store.syncDirectory = syncer.Sync
+
+	if err := store.RecoverInterruptedTransaction(); err == nil {
+		t.Fatal("first RecoverInterruptedTransaction() succeeded after target parent sync failed")
+	}
+	assertTransactionRetained(t, &store)
+	if err := store.RecoverInterruptedTransaction(); err != nil {
+		t.Fatalf("second RecoverInterruptedTransaction() error = %v", err)
+	}
+	if syncer.targetCalls != 2 {
+		t.Fatalf("target parent sync calls = %d, want 2 across failed and successful attempts", syncer.targetCalls)
+	}
+	assertTransactionCleared(t, &store)
+}
+
+func TestRecoverInterruptedTransactionResyncsExistingAncestorAfterFailedCreateSync(t *testing.T) {
+	serverDir := t.TempDir()
+	stateDir := filepath.Join(serverDir, ".docker-vrising")
+	backupPath := filepath.Join(stateDir, "transaction", "managed.dll")
+	store := Store{StateDir: stateDir}
+
+	writeTestFile(t, backupPath, "original")
+	if err := store.Save(State{
+		SchemaVersion: 1,
+		Transaction: &TransactionJournal{Entries: []JournalEntry{{
+			RelativePath: "BepInEx/plugins/managed.dll",
+			BackupPath:   "transaction/managed.dll",
+			Existed:      true,
+		}}},
+	}); err != nil {
+		t.Fatalf("save transaction state: %v", err)
+	}
+	syncer := newFailFirstDirectorySync(t, serverDir)
+	store.syncDirectory = syncer.Sync
+
+	if err := store.RecoverInterruptedTransaction(); err == nil {
+		t.Fatal("first RecoverInterruptedTransaction() succeeded after created ancestor parent sync failed")
+	}
+	assertTransactionRetained(t, &store)
+	if info, err := os.Stat(filepath.Join(serverDir, "BepInEx")); err != nil || !info.IsDir() {
+		t.Fatalf("first attempt did not leave the expected created ancestor: info=%v err=%v", info, err)
+	}
+	if err := store.RecoverInterruptedTransaction(); err != nil {
+		t.Fatalf("second RecoverInterruptedTransaction() error = %v", err)
+	}
+	if syncer.targetCalls != 2 {
+		t.Fatalf("created ancestor parent sync calls = %d, want 2 across failed and successful attempts", syncer.targetCalls)
+	}
+	assertTransactionCleared(t, &store)
+}
+
 func TestProcessIdentityRejectsReusedPID(t *testing.T) {
 	recorded := ProcessIdentity{PID: 123, StartTicks: 456}
 	reused := ProcessIdentity{PID: 123, StartTicks: 789}
@@ -363,4 +433,59 @@ func assertTransactionRetained(t *testing.T, store *Store) {
 	if state.Transaction == nil {
 		t.Fatal("transaction journal was cleared before all recovery directories synced")
 	}
+}
+
+func assertTransactionCleared(t *testing.T, store *Store) {
+	t.Helper()
+	state, err := store.Load()
+	if err != nil {
+		t.Fatalf("load recovered state: %v", err)
+	}
+	if state.Transaction != nil {
+		t.Fatalf("transaction journal = %#v, want nil", state.Transaction)
+	}
+}
+
+type failFirstDirectorySync struct {
+	target      directoryIdentity
+	targetCalls int
+}
+
+func newFailFirstDirectorySync(t *testing.T, path string) *failFirstDirectorySync {
+	t.Helper()
+	return &failFirstDirectorySync{target: directoryIdentityFor(t, path)}
+}
+
+func (s *failFirstDirectorySync) Sync(fd int) error {
+	var info unix.Stat_t
+	if err := unix.Fstat(fd, &info); err != nil {
+		return err
+	}
+	if (directoryIdentity{dev: info.Dev, ino: info.Ino}) != s.target {
+		return nil
+	}
+	s.targetCalls++
+	if s.targetCalls == 1 {
+		return errors.New("injected directory sync failure")
+	}
+	return nil
+}
+
+type directoryIdentity struct {
+	dev uint64
+	ino uint64
+}
+
+func directoryIdentityFor(t *testing.T, path string) directoryIdentity {
+	t.Helper()
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatalf("open directory %s: %v", path, err)
+	}
+	defer unix.Close(fd)
+	var info unix.Stat_t
+	if err := unix.Fstat(fd, &info); err != nil {
+		t.Fatalf("stat directory %s: %v", path, err)
+	}
+	return directoryIdentity{dev: info.Dev, ino: info.Ino}
 }

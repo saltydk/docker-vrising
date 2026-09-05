@@ -306,10 +306,9 @@ func (s *Store) removeInterruptedTarget(serverDir, relativePath string) error {
 	}
 	defer unix.Close(parent)
 	if err := unix.Unlinkat(parent, name, 0); err != nil {
-		if err == unix.ENOENT {
-			return nil
+		if err != unix.ENOENT {
+			return err
 		}
-		return err
 	}
 	if err := s.syncDirectoryFD(parent); err != nil {
 		return fmt.Errorf("sync target parent: %w", err)
@@ -415,11 +414,13 @@ func openRelativeParent(root int, relativePath string, create bool, syncDirector
 				return -1, "", err
 			}
 			created = true
+			next, err = unix.Openat(parent, component, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+		}
+		if err == nil && syncDirectory != nil {
 			if err := syncDirectory(parent); err != nil {
 				unix.Close(parent)
-				return -1, "", fmt.Errorf("sync created ancestor parent: %w", err)
+				return -1, "", fmt.Errorf("sync ancestor parent: %w", err)
 			}
-			next, err = unix.Openat(parent, component, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 		}
 		unix.Close(parent)
 		if err != nil {
