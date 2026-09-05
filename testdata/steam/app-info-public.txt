@@ -1,0 +1,73 @@
+Redirecting stderr to '/state/home/Steam/logs/stderr.txt'
+Logging directory: '/state/home/Steam/logs'
+[  0%] Checking for available updates...
+[----] Verifying installation...
+Steam Console Client (c) Valve Corporation - version 1758065438
+-- type 'quit' to exit --
+Loading Steam API...OK
+
+AppID : 1829350, change number : 31319171/0, last change : Fri Sep  4 22:00:00 2026
+"1829350"
+{
+	"common"
+	{
+		"name"		"V Rising Dedicated Server"
+		"type"		"Tool"
+		"parent"		"1604030"
+		"oslist"		"windows"
+		"osarch"		"64"
+	}
+	"extended"
+	{
+		"developer"		"Stunlock Studios"
+		"homepage"		"https://playvrising.com/"
+	}
+	"config"
+	{
+		"installdir"		"VRisingDedicatedServer"
+		"launch"
+		{
+			"0"
+			{
+				"executable"		"VRisingServer.exe"
+				"type"		"default"
+				"config"
+				{
+					"oslist"		"windows"
+					"osarch"		"64"
+				}
+			}
+		}
+	}
+	"depots"
+	{
+		"baselanguages"		"english"
+		"branches"
+		{
+			"public"
+			{
+				"buildid"		"24686592"
+				"timeupdated"		"1786515518"
+			}
+		}
+		"1829351"
+		{
+			"config"
+			{
+				"oslist"		"windows"
+				"osarch"		"64"
+			}
+			"manifests"
+			{
+				"public"
+				{
+					"gid"		"1049007059193047563"
+					"size"		"6123456789"
+					"download"		"3012345678"
+				}
+			}
+		}
+	}
+}
+
+Steam>

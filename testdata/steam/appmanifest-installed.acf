@@ -1,0 +1,40 @@
+"AppState"
+{
+	"appid"		"1829350"
+	"Universe"		"1"
+	"LauncherPath"		"/state/home/Steam/ubuntu12_32/steam"
+	"name"		"V Rising Dedicated Server"
+	"StateFlags"		"4"
+	"installdir"		"VRisingDedicatedServer"
+	"LastUpdated"		"1786515518"
+	"LastPlayed"		"0"
+	"SizeOnDisk"		"6123456789"
+	"StagingSize"		"0"
+	"buildid"		"24686592"
+	"LastOwner"		"0"
+	"DownloadType"		"1"
+	"UpdateResult"		"0"
+	"BytesToDownload"		"0"
+	"BytesDownloaded"		"0"
+	"BytesToStage"		"0"
+	"BytesStaged"		"0"
+	"TargetBuildID"		"24686592"
+	"AutoUpdateBehavior"		"0"
+	"AllowOtherDownloadsWhileRunning"		"0"
+	"ScheduledAutoUpdate"		"0"
+	"InstalledDepots"
+	{
+		"1829351"
+		{
+			"manifest"		"1049007059193047563"
+			"size"		"6123456789"
+		}
+	}
+	"UserConfig"
+	{
+		"language"		"english"
+	}
+	"MountedConfig"
+	{
+	}
+}
