@@ -1,4 +1,4 @@
-.PHONY: fmt-check test vet build image check
+.PHONY: fmt-check test vet build image image-check check
 
 fmt-check:
 	@test -z "$$(gofmt -l .)"
@@ -13,6 +13,9 @@ build:
 	go build -o vrisingctl .
 
 image:
-	docker build -t docker-vrising .
+	docker buildx build --platform linux/amd64 --load -t saltydk/vrising:local .
+
+image-check: image
+	scripts/image-contract.sh saltydk/vrising:local
 
 check: fmt-check test vet

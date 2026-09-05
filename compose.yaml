@@ -1,0 +1,23 @@
+services:
+  vrising:
+    container_name: v-rising
+    image: saltydk/vrising
+    volumes:
+      - /opt/v-rising/server:/mnt/vrising/server
+      - /opt/v-rising/data:/mnt/vrising/persistentdata
+    environment:
+      TZ: "Europe/Copenhagen"
+      SERVERNAME: "Salty"
+      WINEDEBUG: "fixme-all"
+    ports:
+      - 9876:9876/udp
+      - 9877:9877/udp
+      - 25575:25575/tcp
+    restart: unless-stopped
+    networks:
+      - saltbox
+
+networks:
+  saltbox:
+    name: saltbox
+    external: true
