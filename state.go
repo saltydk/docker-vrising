@@ -70,6 +70,8 @@ type RuntimeState struct {
 type JournalEntry struct {
 	RelativePath    string
 	BackupPath      string
+	QuarantinePath  string
+	TombstonePath   string
 	Existed         bool
 	OriginalSHA256  string
 	InstalledSHA256 string
@@ -79,11 +81,20 @@ type TransactionJournal struct {
 	GenerationID string
 	Phase        string
 	Entries      []JournalEntry
+	Config       *JournalEntry
 }
 
 type PromotionJournal struct {
 	GenerationID string
 	Lock         PackageLock
+}
+
+type PendingPromotionError struct {
+	GenerationID string
+}
+
+func (e *PendingPromotionError) Error() string {
+	return fmt.Sprintf("generation %s has pending promotion intent", e.GenerationID)
 }
 
 type State struct {
@@ -103,6 +114,7 @@ type Store struct {
 	StateDir      string
 	syncDirectory func(int) error
 	beforeWrite   func(string) error
+	recoveryHook  func(string, string) error
 }
 
 func (s *Store) syncDirectoryFD(fd int) error {
@@ -186,18 +198,54 @@ func (s *Store) RecoverInterruptedTransaction() error {
 	if err != nil {
 		return fmt.Errorf("load transaction state: %w", err)
 	}
+	if state.Promotion != nil {
+		return &PendingPromotionError{GenerationID: state.Promotion.GenerationID}
+	}
 	if state.Transaction == nil {
 		return nil
 	}
 	if state.Candidate != nil && state.Candidate.ID != state.Transaction.GenerationID {
 		return fmt.Errorf("transaction generation does not match candidate")
 	}
+	journalChanged := false
+	for index := range state.Transaction.Entries {
+		entry := &state.Transaction.Entries[index]
+		if entry.OriginalSHA256 == "" && entry.InstalledSHA256 == "" {
+			continue
+		}
+		if entry.QuarantinePath == "" {
+			entry.QuarantinePath = fmt.Sprintf("transaction/names/%04d.displaced", index)
+			journalChanged = true
+		}
+		if entry.TombstonePath == "" {
+			entry.TombstonePath = fmt.Sprintf("transaction/names/%04d.tombstone", index)
+			journalChanged = true
+		}
+	}
+	if journalChanged {
+		if err := s.Save(state); err != nil {
+			return fmt.Errorf("persist recovery namespace: %w", err)
+		}
+	}
+	for _, entry := range state.Transaction.Entries {
+		if entry.OriginalSHA256 == "" && entry.InstalledSHA256 == "" {
+			continue
+		}
+		for _, relativePath := range []string{entry.QuarantinePath, entry.TombstonePath} {
+			if err := s.ensureStatePathParent(relativePath); err != nil {
+				return fmt.Errorf("prepare recovery namespace: %w", err)
+			}
+		}
+	}
 
 	serverDir := filepath.Dir(s.StateDir)
 	for _, entry := range state.Transaction.Entries {
 		if entry.OriginalSHA256 != "" || entry.InstalledSHA256 != "" {
-			if err := s.recoverObservedJournalEntry(serverDir, entry); err != nil {
+			if err := s.recoverQuarantinedJournalEntry(serverDir, entry); err != nil {
 				return fmt.Errorf("recover managed file %s: %w", entry.RelativePath, err)
+			}
+			if err := s.syncQuarantinedJournalParents(serverDir, entry); err != nil {
+				return fmt.Errorf("sync recovered managed file %s: %w", entry.RelativePath, err)
 			}
 			continue
 		}
@@ -215,6 +263,11 @@ func (s *Store) RecoverInterruptedTransaction() error {
 			return fmt.Errorf("restore interrupted managed file %s: %w", entry.RelativePath, err)
 		}
 	}
+	if state.Transaction.Config != nil {
+		if err := s.recoverConfigJournalEntry(serverDir, *state.Transaction.Config); err != nil {
+			return fmt.Errorf("recover config file %s: %w", state.Transaction.Config.RelativePath, err)
+		}
+	}
 
 	state.Transaction = nil
 	if state.Candidate != nil {
@@ -229,47 +282,347 @@ func (s *Store) RecoverInterruptedTransaction() error {
 	return nil
 }
 
-func (s *Store) recoverObservedJournalEntry(serverDir string, entry JournalEntry) error {
-	current, exists, err := snapshotFileBelow(serverDir, entry.RelativePath)
+func (s *Store) recoverQuarantinedJournalEntry(serverDir string, entry JournalEntry) error {
+	live, liveExists, err := snapshotFileBelow(serverDir, entry.RelativePath)
+	if err != nil {
+		return fmt.Errorf("inspect live path: %w", err)
+	}
+	quarantine, quarantineExists, err := snapshotFileBelow(s.StateDir, entry.QuarantinePath)
+	if err != nil {
+		return fmt.Errorf("inspect quarantine: %w", err)
+	}
+	if entry.Existed && !quarantineExists && (!liveExists || live.SHA256 != entry.OriginalSHA256) {
+		if err := s.seedOriginalQuarantine(entry); err != nil {
+			return fmt.Errorf("seed original quarantine: %w", err)
+		}
+		quarantine, quarantineExists, err = snapshotFileBelow(s.StateDir, entry.QuarantinePath)
+		if err != nil {
+			return fmt.Errorf("inspect seeded quarantine: %w", err)
+		}
+	}
+	tombstone, tombstoneExists, err := snapshotFileBelow(s.StateDir, entry.TombstonePath)
+	if err != nil {
+		return fmt.Errorf("inspect tombstone: %w", err)
+	}
+	if quarantineExists && (!entry.Existed || quarantine.SHA256 != entry.OriginalSHA256) {
+		return fmt.Errorf("quarantine contains externally changed content")
+	}
+	if tombstoneExists && (entry.InstalledSHA256 == "" || tombstone.SHA256 != entry.InstalledSHA256) {
+		return fmt.Errorf("tombstone contains externally changed content")
+	}
+
+	if !entry.Existed {
+		if quarantineExists {
+			return fmt.Errorf("new-file journal has unexpected quarantine content")
+		}
+		if tombstoneExists {
+			if liveExists {
+				return fmt.Errorf("live path appeared while candidate tombstone was retained")
+			}
+			if err := s.removeJournalArtifact(entry.TombstonePath, tombstone); err != nil {
+				return err
+			}
+			return nil
+		}
+		if !liveExists {
+			return nil
+		}
+		if live.SHA256 != entry.InstalledSHA256 {
+			return fmt.Errorf("current new file was changed externally")
+		}
+		if err := moveFileNoReplace(
+			serverDir, entry.RelativePath,
+			s.StateDir, entry.TombstonePath,
+			s.syncDirectoryFD,
+		); err != nil {
+			return fmt.Errorf("quarantine installed new file: %w", err)
+		}
+		if s.recoveryHook != nil {
+			if err := s.recoveryHook("tombstoned", entry.RelativePath); err != nil {
+				return err
+			}
+		}
+		tombstone, exists, err := snapshotFileBelow(s.StateDir, entry.TombstonePath)
+		if err != nil || !exists || tombstone.SHA256 != entry.InstalledSHA256 {
+			return fmt.Errorf("verify installed new-file tombstone")
+		}
+		if err := s.removeJournalArtifact(entry.TombstonePath, tombstone); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	if !quarantineExists {
+		if liveExists && live.SHA256 == entry.OriginalSHA256 {
+			if tombstoneExists {
+				if err := s.removeJournalArtifact(entry.TombstonePath, tombstone); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
+		return fmt.Errorf("original file is missing from both live path and quarantine")
+	}
+
+	if entry.InstalledSHA256 == "" {
+		if tombstoneExists {
+			return fmt.Errorf("stale deletion has unexpected tombstone content")
+		}
+		if liveExists {
+			return fmt.Errorf("live path appeared after stale file was quarantined")
+		}
+		return moveFileNoReplace(
+			s.StateDir, entry.QuarantinePath,
+			serverDir, entry.RelativePath,
+			s.syncDirectoryFD,
+		)
+	}
+
+	if tombstoneExists {
+		if liveExists {
+			return fmt.Errorf("live path appeared while replacement tombstone was retained")
+		}
+		if err := moveFileNoReplace(
+			s.StateDir, entry.QuarantinePath,
+			serverDir, entry.RelativePath,
+			s.syncDirectoryFD,
+		); err != nil {
+			return fmt.Errorf("restore quarantined original: %w", err)
+		}
+		if err := s.removeJournalArtifact(entry.TombstonePath, tombstone); err != nil {
+			return err
+		}
+		return nil
+	}
+	if !liveExists {
+		return moveFileNoReplace(
+			s.StateDir, entry.QuarantinePath,
+			serverDir, entry.RelativePath,
+			s.syncDirectoryFD,
+		)
+	}
+	if live.SHA256 != entry.InstalledSHA256 {
+		return fmt.Errorf("current replacement was changed externally")
+	}
+	if err := moveFileNoReplace(
+		serverDir, entry.RelativePath,
+		s.StateDir, entry.TombstonePath,
+		s.syncDirectoryFD,
+	); err != nil {
+		return fmt.Errorf("quarantine installed replacement: %w", err)
+	}
+	if s.recoveryHook != nil {
+		if err := s.recoveryHook("tombstoned", entry.RelativePath); err != nil {
+			return err
+		}
+	}
+	if err := moveFileNoReplace(
+		s.StateDir, entry.QuarantinePath,
+		serverDir, entry.RelativePath,
+		s.syncDirectoryFD,
+	); err != nil {
+		return fmt.Errorf("restore quarantined original: %w", err)
+	}
+	tombstone, exists, err := snapshotFileBelow(s.StateDir, entry.TombstonePath)
+	if err != nil || !exists || tombstone.SHA256 != entry.InstalledSHA256 {
+		return fmt.Errorf("verify replacement tombstone")
+	}
+	return s.removeJournalArtifact(entry.TombstonePath, tombstone)
+}
+
+func (s *Store) seedOriginalQuarantine(entry JournalEntry) error {
+	data, mode, err := readFileBelow(s.StateDir, entry.BackupPath)
 	if err != nil {
 		return err
 	}
-	if !entry.Existed {
-		if !exists {
-			return nil
-		}
-		if entry.InstalledSHA256 == "" || current.SHA256 != entry.InstalledSHA256 {
-			return fmt.Errorf("current file was changed externally")
-		}
-		return removeServerFile(serverDir, entry.RelativePath, current)
+	if hashBytes(data) != entry.OriginalSHA256 {
+		return fmt.Errorf("transaction backup does not match original SHA-256")
 	}
-	if entry.OriginalSHA256 == "" {
-		return fmt.Errorf("journal entry is missing original SHA-256")
+	root, err := s.openStateDirectory(false)
+	if err != nil {
+		return err
 	}
-	if exists && current.SHA256 == entry.OriginalSHA256 {
-		return nil
+	defer unix.Close(root)
+	parent, name, err := openRelativeParent(root, entry.QuarantinePath, true, s.syncDirectoryFD)
+	if err != nil {
+		return err
 	}
-	if entry.InstalledSHA256 == "" {
-		if exists {
-			return fmt.Errorf("current stale file was changed externally")
-		}
-		return s.restoreObservedJournalEntry(serverDir, entry, nil)
+	defer unix.Close(parent)
+	temporaryName, err := writeTemporaryFileAt(parent, name, data, mode)
+	if err != nil {
+		return err
 	}
-	if !exists || current.SHA256 != entry.InstalledSHA256 {
-		return fmt.Errorf("current replacement was changed externally")
+	defer unix.Unlinkat(parent, temporaryName, 0)
+	if err := unix.Renameat2(parent, temporaryName, parent, name, unix.RENAME_NOREPLACE); err != nil {
+		return err
 	}
-	return s.restoreObservedJournalEntry(serverDir, entry, &current)
+	return s.syncDirectoryFD(parent)
 }
 
-func (s *Store) restoreObservedJournalEntry(serverDir string, entry JournalEntry, expected *fileSnapshot) error {
-	data, mode, err := readFileBelow(s.StateDir, entry.BackupPath)
+func (s *Store) recoverConfigJournalEntry(serverDir string, entry JournalEntry) error {
+	live, liveExists, err := snapshotFileBelow(serverDir, entry.RelativePath)
 	if err != nil {
-		return fmt.Errorf("read transaction backup %s: %w", entry.BackupPath, err)
+		return fmt.Errorf("inspect live config: %w", err)
 	}
-	return replaceServerFile(
-		serverDir, entry.RelativePath, data, mode, expected,
-		"current file changed during recovery", "current file appeared during recovery",
-	)
+	quarantine, quarantineExists, err := snapshotFileBelow(s.StateDir, entry.QuarantinePath)
+	if err != nil {
+		return fmt.Errorf("inspect config quarantine: %w", err)
+	}
+	if quarantineExists && (!entry.Existed || quarantine.SHA256 != entry.OriginalSHA256) {
+		return fmt.Errorf("config quarantine contains externally changed content")
+	}
+	if !entry.Existed {
+		if quarantineExists {
+			return fmt.Errorf("new config has unexpected quarantine content")
+		}
+		if !liveExists {
+			return s.syncQuarantinedJournalParents(serverDir, entry)
+		}
+		if live.SHA256 != entry.InstalledSHA256 {
+			return fmt.Errorf("new config was changed externally")
+		}
+		return s.syncQuarantinedJournalParents(serverDir, entry)
+	}
+	if !quarantineExists {
+		if !liveExists || live.SHA256 != entry.OriginalSHA256 && live.SHA256 != entry.InstalledSHA256 {
+			return fmt.Errorf("config is not an observed journal state")
+		}
+		return s.syncQuarantinedJournalParents(serverDir, entry)
+	}
+	if !liveExists {
+		if err := moveFileNoReplace(
+			s.StateDir, entry.QuarantinePath,
+			serverDir, entry.RelativePath,
+			s.syncDirectoryFD,
+		); err != nil {
+			return fmt.Errorf("restore config before edit: %w", err)
+		}
+		return s.syncQuarantinedJournalParents(serverDir, entry)
+	}
+	if live.SHA256 != entry.InstalledSHA256 {
+		return fmt.Errorf("config was changed externally")
+	}
+	if err := s.removeJournalArtifact(entry.QuarantinePath, quarantine); err != nil {
+		return err
+	}
+	return s.syncQuarantinedJournalParents(serverDir, entry)
+}
+
+func (s *Store) removeJournalArtifact(relativePath string, expected fileSnapshot) error {
+	root, err := s.openStateDirectory(false)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(root)
+	parent, name, err := openRelativeParent(root, relativePath, false, nil)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(parent)
+	var named unix.Stat_t
+	if err := unix.Fstatat(parent, name, &named, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return err
+	}
+	if named.Mode&unix.S_IFMT != unix.S_IFREG || named.Dev != expected.Dev || named.Ino != expected.Ino {
+		return fmt.Errorf("journal artifact changed before removal")
+	}
+	if err := unix.Unlinkat(parent, name, 0); err != nil {
+		return err
+	}
+	return s.syncDirectoryFD(parent)
+}
+
+func (s *Store) commitTransactionArtifacts(journal *TransactionJournal) error {
+	if journal == nil {
+		return nil
+	}
+	entries := append([]JournalEntry(nil), journal.Entries...)
+	if journal.Config != nil {
+		entries = append(entries, *journal.Config)
+	}
+	for _, entry := range entries {
+		for _, artifact := range []struct {
+			path string
+			hash string
+		}{
+			{path: entry.QuarantinePath, hash: entry.OriginalSHA256},
+			{path: entry.TombstonePath, hash: entry.InstalledSHA256},
+		} {
+			if artifact.path == "" {
+				continue
+			}
+			snapshot, exists, err := snapshotFileBelow(s.StateDir, artifact.path)
+			if err != nil {
+				return err
+			}
+			if !exists {
+				if err := s.syncStatePathParent(artifact.path); err != nil {
+					return err
+				}
+				continue
+			}
+			if artifact.hash == "" || snapshot.SHA256 != artifact.hash {
+				return fmt.Errorf("transaction artifact %s contains unexpected content", artifact.path)
+			}
+			if err := s.removeJournalArtifact(artifact.path, snapshot); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Store) syncQuarantinedJournalParents(serverDir string, entry JournalEntry) error {
+	if err := s.syncJournalTargetParent(serverDir, entry.RelativePath); err != nil {
+		return err
+	}
+	for _, relativePath := range []string{entry.QuarantinePath, entry.TombstonePath} {
+		if err := s.syncStatePathParent(relativePath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) syncStatePathParent(relativePath string) error {
+	root, err := s.openStateDirectory(false)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(root)
+	parent, _, err := openRelativeParent(root, relativePath, false, nil)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(parent)
+	return s.syncDirectoryFD(parent)
+}
+
+func (s *Store) ensureStatePathParent(relativePath string) error {
+	root, err := s.openStateDirectory(false)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(root)
+	parent, _, err := openRelativeParent(root, relativePath, true, s.syncDirectoryFD)
+	if err != nil {
+		return err
+	}
+	return unix.Close(parent)
+}
+
+func (s *Store) syncJournalTargetParent(serverDir, relativePath string) error {
+	root, err := openDirectoryPath(serverDir, false)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(root)
+	parent, _, err := openRelativeParent(root, relativePath, false, nil)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(parent)
+	return s.syncDirectoryFD(parent)
 }
 
 func (s *Store) loadJSON(name string, value any) error {
@@ -370,7 +723,7 @@ func readFileBelow(rootPath, relativePath string) ([]byte, os.FileMode, error) {
 		return nil, 0, err
 	}
 	defer unix.Close(parent)
-	fd, err := unix.Openat(parent, name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	fd, err := unix.Openat(parent, name, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, 0, err
 	}

@@ -464,6 +464,111 @@ func TestRecoverInterruptedTransactionDistinguishesObservedEntryState(t *testing
 	}
 }
 
+func TestRecoverInterruptedHashedNoopResyncsBeforeJournalClear(t *testing.T) {
+	tests := []struct {
+		name   string
+		entry  JournalEntry
+		create bool
+	}{
+		{
+			name: "already absent new file",
+			entry: JournalEntry{
+				RelativePath:    "managed.dll",
+				InstalledSHA256: hashBytes([]byte("candidate")),
+			},
+		},
+		{
+			name:   "already original replacement",
+			create: true,
+			entry: JournalEntry{
+				RelativePath:    "managed.dll",
+				BackupPath:      "transaction/managed.dll",
+				Existed:         true,
+				OriginalSHA256:  hashBytes([]byte("original")),
+				InstalledSHA256: hashBytes([]byte("candidate")),
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			serverDir := t.TempDir()
+			stateDir := filepath.Join(serverDir, ".docker-vrising")
+			store := Store{StateDir: stateDir}
+			if tt.create {
+				writeTestFile(t, filepath.Join(serverDir, "managed.dll"), "original")
+				writeTestFile(t, filepath.Join(stateDir, "transaction", "managed.dll"), "original")
+			}
+			if err := store.Save(State{
+				SchemaVersion: schemaVersion,
+				Transaction: &TransactionJournal{
+					GenerationID: "candidate",
+					Phase:        "applying",
+					Entries:      []JournalEntry{tt.entry},
+				},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			syncer := newFailFirstDirectorySync(t, serverDir)
+			store.syncDirectory = syncer.Sync
+
+			if err := store.RecoverInterruptedTransaction(); err == nil {
+				t.Fatal("first recovery succeeded after managed parent sync failure")
+			}
+			assertTransactionRetained(t, &store)
+			if err := store.RecoverInterruptedTransaction(); err != nil {
+				t.Fatalf("second recovery error = %v", err)
+			}
+			if syncer.targetCalls != 2 {
+				t.Fatalf("managed parent sync calls = %d, want 2", syncer.targetCalls)
+			}
+			assertTransactionCleared(t, &store)
+		})
+	}
+}
+
+func TestRecoverInterruptedTransactionRejectsFIFOWithoutBlocking(t *testing.T) {
+	serverDir := t.TempDir()
+	stateDir := filepath.Join(serverDir, ".docker-vrising")
+	store := Store{StateDir: stateDir}
+	target := filepath.Join(serverDir, "managed.dll")
+	if err := unix.Mkfifo(target, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(State{
+		SchemaVersion: schemaVersion,
+		Transaction: &TransactionJournal{
+			GenerationID: "candidate",
+			Phase:        "applying",
+			Entries: []JournalEntry{{
+				RelativePath:    "managed.dll",
+				InstalledSHA256: hashBytes([]byte("candidate")),
+			}},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- store.RecoverInterruptedTransaction() }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("recovery accepted FIFO as a managed file")
+		}
+	case <-time.After(250 * time.Millisecond):
+		writer, err := unix.Open(target, unix.O_WRONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+		if err == nil {
+			unix.Close(writer)
+		}
+		<-done
+		t.Fatal("recovery blocked opening a FIFO")
+	}
+	info, err := os.Lstat(target)
+	if err != nil || info.Mode()&os.ModeNamedPipe == 0 {
+		t.Fatalf("FIFO after recovery: info=%v err=%v", info, err)
+	}
+}
+
 func TestRecoverInterruptedTransactionDoesNotDeleteThroughSymlink(t *testing.T) {
 	serverDir := t.TempDir()
 	stateDir := filepath.Join(serverDir, ".docker-vrising")

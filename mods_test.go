@@ -415,6 +415,174 @@ func TestApplyPreservesConfigReplacementImmediatelyBeforeEdit(t *testing.T) {
 	}
 }
 
+func TestApplyPreservesDisplacedOperatorFileWhenRestoreIsBlocked(t *testing.T) {
+	manager := newTestModManager(t)
+	first := stageTestGeneration(t, manager, managedArchiveContents{bepInEx: defaultBepInExEntries("first")})
+	applyAndPromote(t, manager, first)
+	second := stageTestGeneration(t, manager, managedArchiveContents{bepInEx: defaultBepInExEntries("second")})
+	target := filepath.Join(manager.ServerDir, "winhttp.dll")
+	manager.beforeManagedMutation = func(relativePath string) error {
+		if relativePath == "winhttp.dll" {
+			writeTestFile(t, target, "displaced operator edit")
+		}
+		return nil
+	}
+	manager.namespaceHook = func(stage, relativePath string) error {
+		if stage != "quarantined" || relativePath != "winhttp.dll" {
+			return nil
+		}
+		state, err := manager.Store.Load()
+		if err != nil {
+			return err
+		}
+		entry := journalEntryForPath(t, state, relativePath)
+		if entry.QuarantinePath == "" {
+			t.Fatal("quarantine path was not journaled before namespace mutation")
+		}
+		if got := readTestFile(t, filepath.Join(manager.Store.StateDir, filepath.FromSlash(entry.QuarantinePath))); got != "displaced operator edit" {
+			t.Fatalf("quarantined file = %q, want displaced operator edit", got)
+		}
+		writeTestFile(t, target, "concurrent live file")
+		return nil
+	}
+
+	if err := manager.Apply(t.Context(), second); err == nil {
+		t.Fatal("Apply() succeeded when displaced operator restoration was blocked")
+	}
+	state, err := manager.Store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := journalEntryForPath(t, state, "winhttp.dll")
+	if got := readTestFile(t, target); got != "concurrent live file" {
+		t.Fatalf("live file = %q, want concurrent live file preserved", got)
+	}
+	if got := readTestFile(t, filepath.Join(manager.Store.StateDir, filepath.FromSlash(entry.QuarantinePath))); got != "displaced operator edit" {
+		t.Fatalf("displaced file = %q, want operator edit preserved in quarantine", got)
+	}
+}
+
+func TestApplyStaleDeletePreservesConcurrentLiveReplacement(t *testing.T) {
+	manager := newTestModManager(t)
+	first := stageTestGeneration(t, manager, managedArchiveContents{
+		bepInEx: append(defaultBepInExEntries("first"), zipEntry{
+			name: "BepInExPack_V_Rising/BepInEx/core/stale.dll", body: "stale original",
+		}),
+	})
+	applyAndPromote(t, manager, first)
+	second := stageTestGeneration(t, manager, managedArchiveContents{bepInEx: defaultBepInExEntries("second")})
+	target := filepath.Join(manager.ServerDir, "BepInEx", "core", "stale.dll")
+	manager.namespaceHook = func(stage, relativePath string) error {
+		if stage == "quarantined" && relativePath == "BepInEx/core/stale.dll" {
+			writeTestFile(t, target, "concurrent replacement")
+		}
+		return nil
+	}
+
+	if err := manager.Apply(t.Context(), second); err == nil {
+		t.Fatal("Apply() succeeded after a concurrent stale-path replacement")
+	}
+	if got := readTestFile(t, target); got != "concurrent replacement" {
+		t.Fatalf("concurrent stale-path replacement = %q, want preserved", got)
+	}
+	state, err := manager.Store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := journalEntryForPath(t, state, "BepInEx/core/stale.dll")
+	if got := readTestFile(t, filepath.Join(manager.Store.StateDir, filepath.FromSlash(entry.QuarantinePath))); got != "stale original" {
+		t.Fatalf("quarantined stale file = %q, want original", got)
+	}
+}
+
+func TestRecoverInterruptedStaleQuarantineTransition(t *testing.T) {
+	manager := newTestModManager(t)
+	first := stageTestGeneration(t, manager, managedArchiveContents{
+		bepInEx: append(defaultBepInExEntries("first"), zipEntry{
+			name: "BepInExPack_V_Rising/BepInEx/core/stale.dll", body: "stale original",
+		}),
+	})
+	applyAndPromote(t, manager, first)
+	second := stageTestGeneration(t, manager, managedArchiveContents{bepInEx: defaultBepInExEntries("second")})
+	target := filepath.Join(manager.ServerDir, "BepInEx", "core", "stale.dll")
+	manager.namespaceHook = func(stage, relativePath string) error {
+		if stage == "quarantined" && relativePath == "BepInEx/core/stale.dll" {
+			return errors.New("crash after stale quarantine")
+		}
+		return nil
+	}
+
+	if err := manager.Apply(t.Context(), second); err == nil || !strings.Contains(err.Error(), "crash after stale quarantine") {
+		t.Fatalf("Apply() error = %v, want quarantine crash", err)
+	}
+	if _, err := os.Lstat(target); !os.IsNotExist(err) {
+		t.Fatalf("stale live path after crash stat error = %v, want not exist", err)
+	}
+	state, err := manager.Store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := journalEntryForPath(t, state, "BepInEx/core/stale.dll")
+	if got := readTestFile(t, filepath.Join(manager.Store.StateDir, filepath.FromSlash(entry.QuarantinePath))); got != "stale original" {
+		t.Fatalf("quarantined stale file = %q, want original", got)
+	}
+
+	restarted := &ModManager{ServerDir: manager.ServerDir, GenerationsDir: manager.GenerationsDir, Store: manager.Store}
+	if err := restarted.Rollback(t.Context()); err != nil {
+		t.Fatalf("Rollback() after quarantine crash error = %v", err)
+	}
+	if got := readTestFile(t, target); got != "stale original" {
+		t.Fatalf("recovered stale file = %q, want original", got)
+	}
+}
+
+func TestRollbackRecoversInterruptedCandidateTombstoneTransition(t *testing.T) {
+	manager := newTestModManager(t)
+	first := stageTestGeneration(t, manager, managedArchiveContents{bepInEx: defaultBepInExEntries("first")})
+	applyAndPromote(t, manager, first)
+	second := stageTestGeneration(t, manager, managedArchiveContents{bepInEx: defaultBepInExEntries("second")})
+	if err := manager.Apply(t.Context(), second); err != nil {
+		t.Fatal(err)
+	}
+	manager.Store.recoveryHook = func(stage, relativePath string) error {
+		if stage == "tombstoned" && relativePath == "winhttp.dll" {
+			return errors.New("crash after candidate tombstone")
+		}
+		return nil
+	}
+
+	if err := manager.Rollback(t.Context()); err == nil || !strings.Contains(err.Error(), "crash after candidate tombstone") {
+		t.Fatalf("Rollback() error = %v, want tombstone crash", err)
+	}
+	state, err := manager.Store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := journalEntryForPath(t, state, "winhttp.dll")
+	if _, err := os.Lstat(filepath.Join(manager.ServerDir, "winhttp.dll")); !os.IsNotExist(err) {
+		t.Fatalf("live candidate after tombstone crash stat error = %v, want not exist", err)
+	}
+	if got := readTestFile(t, filepath.Join(manager.Store.StateDir, filepath.FromSlash(entry.QuarantinePath))); got != "proxy-first" {
+		t.Fatalf("quarantined original = %q, want first generation", got)
+	}
+	if got := readTestFile(t, filepath.Join(manager.Store.StateDir, filepath.FromSlash(entry.TombstonePath))); got != "proxy-second" {
+		t.Fatalf("candidate tombstone = %q, want second generation", got)
+	}
+
+	manager.Store.recoveryHook = nil
+	if err := manager.Rollback(t.Context()); err != nil {
+		t.Fatalf("Rollback() retry error = %v", err)
+	}
+	if got := readTestFile(t, filepath.Join(manager.ServerDir, "winhttp.dll")); got != "proxy-first" {
+		t.Fatalf("recovered live file = %q, want first generation", got)
+	}
+	for _, artifact := range []string{entry.QuarantinePath, entry.TombstonePath} {
+		if _, err := os.Lstat(filepath.Join(manager.Store.StateDir, filepath.FromSlash(artifact))); !os.IsNotExist(err) {
+			t.Fatalf("recovered artifact %s stat error = %v, want not exist", artifact, err)
+		}
+	}
+}
+
 func TestRollbackRestoresPreviousGeneration(t *testing.T) {
 	manager := newTestModManager(t)
 	first := stageTestGeneration(t, manager, managedArchiveContents{
@@ -671,6 +839,17 @@ func TestPromotionReconcilesLockWrittenBeforeState(t *testing.T) {
 	if !samePackageLock(lock, second.Lock) {
 		t.Fatalf("lock at crash = %#v, want second lock", lock)
 	}
+	if err := manager.Store.RecoverInterruptedTransaction(); err == nil {
+		t.Fatal("Store recovery rolled back an overlay with pending promotion intent")
+	} else {
+		var pending *PendingPromotionError
+		if !errors.As(err, &pending) || pending.GenerationID != second.Record.ID {
+			t.Fatalf("Store recovery error = %v, want typed pending promotion for %s", err, second.Record.ID)
+		}
+	}
+	if got := readTestFile(t, filepath.Join(manager.ServerDir, "winhttp.dll")); got != "proxy-second" {
+		t.Fatalf("overlay after blocked Store recovery = %q, want promoted candidate preserved", got)
+	}
 
 	restarted := &ModManager{ServerDir: manager.ServerDir, GenerationsDir: manager.GenerationsDir, Store: manager.Store}
 	if err := restarted.Rollback(t.Context()); err != nil {
@@ -745,6 +924,43 @@ func TestPromotionRestartCompletesPendingCleanup(t *testing.T) {
 	if state.Promotion != nil || len(state.PendingCleanup) != 0 || state.Active == nil || state.Active.ID != third.Record.ID ||
 		state.Previous == nil || state.Previous.ID != second.Record.ID {
 		t.Fatalf("state after restart cleanup = %#v", state)
+	}
+}
+
+func TestApplyCompletesPendingPromotionCleanupBeforeNewCandidate(t *testing.T) {
+	manager := newTestModManager(t)
+	first := stageTestGeneration(t, manager, managedArchiveContents{bepInEx: defaultBepInExEntries("first")})
+	applyAndPromote(t, manager, first)
+	second := stageTestGeneration(t, manager, managedArchiveContents{bepInEx: defaultBepInExEntries("second")})
+	applyAndPromote(t, manager, second)
+	third := stageTestGeneration(t, manager, managedArchiveContents{bepInEx: defaultBepInExEntries("third")})
+	if err := manager.Apply(t.Context(), third); err != nil {
+		t.Fatal(err)
+	}
+	manager.promotionHook = func(stage string) error {
+		if stage == "state-written" {
+			return errors.New("crash before cleanup")
+		}
+		return nil
+	}
+	if err := manager.Promote(t.Context(), third); err == nil {
+		t.Fatal("Promote() succeeded despite injected cleanup crash")
+	}
+	fourth := stageTestGeneration(t, manager, managedArchiveContents{bepInEx: defaultBepInExEntries("fourth")})
+	restarted := &ModManager{ServerDir: manager.ServerDir, GenerationsDir: manager.GenerationsDir, Store: manager.Store}
+
+	if err := restarted.Apply(t.Context(), fourth); err != nil {
+		t.Fatalf("Apply() after pending promotion error = %v", err)
+	}
+	if _, err := os.Stat(first.Dir); !os.IsNotExist(err) {
+		t.Fatalf("pending cleanup generation stat error = %v, want not exist", err)
+	}
+	state, err := manager.Store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Promotion != nil || len(state.PendingCleanup) != 0 || state.Candidate == nil || state.Candidate.ID != fourth.Record.ID {
+		t.Fatalf("state after gated Apply = %#v, want completed promotion and fourth candidate", state)
 	}
 }
 
@@ -872,6 +1088,20 @@ func applyAndPromote(t *testing.T, manager *ModManager, staged StagedGeneration)
 	if err := manager.Promote(t.Context(), staged); err != nil {
 		t.Fatalf("Promote() error = %v", err)
 	}
+}
+
+func journalEntryForPath(t *testing.T, state State, relativePath string) JournalEntry {
+	t.Helper()
+	if state.Transaction == nil {
+		t.Fatal("transaction journal is nil")
+	}
+	for _, entry := range state.Transaction.Entries {
+		if entry.RelativePath == relativePath {
+			return entry
+		}
+	}
+	t.Fatalf("transaction journal has no entry for %s", relativePath)
+	return JournalEntry{}
 }
 
 func manifestPaths(manifest ManagedManifest) []string {
