@@ -396,6 +396,41 @@ func TestRecoverInterruptedTransactionResyncsExistingAncestorAfterFailedCreateSy
 	assertTransactionCleared(t, &store)
 }
 
+func TestRecoverInterruptedTransactionDoesNotLeakDescriptorsAfterFailedAncestorSync(t *testing.T) {
+	serverDir := t.TempDir()
+	stateDir := filepath.Join(serverDir, ".docker-vrising")
+	backupPath := filepath.Join(stateDir, "transaction", "managed.dll")
+	store := Store{StateDir: stateDir}
+
+	writeTestFile(t, backupPath, "original")
+	if err := os.MkdirAll(filepath.Join(serverDir, "BepInEx"), 0o700); err != nil {
+		t.Fatalf("create managed parent: %v", err)
+	}
+	if err := store.Save(State{
+		SchemaVersion: 1,
+		Transaction: &TransactionJournal{Entries: []JournalEntry{{
+			RelativePath: "BepInEx/managed.dll",
+			BackupPath:   "transaction/managed.dll",
+			Existed:      true,
+		}}},
+	}); err != nil {
+		t.Fatalf("save transaction state: %v", err)
+	}
+	store.syncDirectory = func(int) error { return errors.New("injected ancestor parent sync failure") }
+
+	before := descriptorCount(t)
+	for range 64 {
+		if err := store.RecoverInterruptedTransaction(); err == nil {
+			t.Fatal("RecoverInterruptedTransaction() succeeded after ancestor parent sync failed")
+		}
+	}
+	after := descriptorCount(t)
+	if after > before+3 {
+		t.Fatalf("open descriptor count grew from %d to %d after failed recovery attempts", before, after)
+	}
+	assertTransactionRetained(t, &store)
+}
+
 func TestProcessIdentityRejectsReusedPID(t *testing.T) {
 	recorded := ProcessIdentity{PID: 123, StartTicks: 456}
 	reused := ProcessIdentity{PID: 123, StartTicks: 789}
@@ -488,4 +523,13 @@ func directoryIdentityFor(t *testing.T, path string) directoryIdentity {
 		t.Fatalf("stat directory %s: %v", path, err)
 	}
 	return directoryIdentity{dev: info.Dev, ino: info.Ino}
+}
+
+func descriptorCount(t *testing.T) int {
+	t.Helper()
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatalf("read process descriptors: %v", err)
+	}
+	return len(entries)
 }

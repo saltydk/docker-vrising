@@ -418,6 +418,7 @@ func openRelativeParent(root int, relativePath string, create bool, syncDirector
 		}
 		if err == nil && syncDirectory != nil {
 			if err := syncDirectory(parent); err != nil {
+				unix.Close(next)
 				unix.Close(parent)
 				return -1, "", fmt.Errorf("sync ancestor parent: %w", err)
 			}
