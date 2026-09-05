@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,10 +11,11 @@ import (
 )
 
 const (
-	steamAppID   = "1829350"
-	steamDepotID = "1829351"
-	publicBranch = "public"
-	updateTries  = 3
+	steamAppID        = "1829350"
+	steamDepotID      = "1829351"
+	steamRuntimeAppID = "1604030"
+	publicBranch      = "public"
+	updateTries       = 3
 )
 
 type CommandSpec struct {
@@ -102,6 +105,9 @@ func (s *SteamClient) Update(ctx context.Context, target SteamBuild) (SteamBuild
 		return SteamBuild{}, preMutationSteamError(err)
 	}
 	target.Branch = selectedSteamBranch(target.Branch)
+	if s.Branch != publicBranch && strings.EqualFold(s.Branch, publicBranch) {
+		return SteamBuild{}, preMutationSteamError(fmt.Errorf("configured public branch must be spelled %q", publicBranch))
+	}
 	if target.BuildID == "" || target.DepotManifest == "" {
 		return SteamBuild{}, preMutationSteamError(fmt.Errorf("target Steam build metadata is incomplete"))
 	}
@@ -204,7 +210,7 @@ func (s *SteamClient) readInstalledBuild() (SteamBuild, error) {
 	if err != nil {
 		return SteamBuild{}, err
 	}
-	root, err := parseVDFRoot(manifest, "AppState")
+	root, err := parseVDFDocument(manifest, "AppState")
 	if err != nil {
 		return SteamBuild{}, err
 	}
@@ -233,17 +239,41 @@ func (s *SteamClient) readInstalledBuild() (SteamBuild, error) {
 }
 
 func parseRemoteBuild(output []byte, branch string) (SteamBuild, error) {
-	root, err := parseVDFRoot(output, steamAppID)
+	root, err := parseRemoteVDF(output, steamAppID)
 	if err != nil {
 		return SteamBuild{}, err
 	}
 	branch = selectedSteamBranch(branch)
-	buildID, err := root.pathValue("depots", "branches", branch, "buildid")
-	if err != nil || buildID == "" {
+	depots, ok := root.child("depots")
+	if !ok {
+		return SteamBuild{}, fmt.Errorf("remote depots metadata is missing")
+	}
+	branches, ok := depots.child("branches")
+	if !ok {
+		return SteamBuild{}, fmt.Errorf("remote branches metadata is missing")
+	}
+	selected, ok := branches.childExact(branch)
+	if !ok {
+		return SteamBuild{}, fmt.Errorf("remote branch %q is missing", branch)
+	}
+	buildID, ok := selected.value("buildid")
+	if !ok || buildID == "" {
 		return SteamBuild{}, fmt.Errorf("remote branch %q buildid is missing", branch)
 	}
-	depotManifest, err := root.pathValue("depots", steamDepotID, "manifests", branch, "gid")
-	if err != nil || depotManifest == "" {
+	depot, ok := depots.child(steamDepotID)
+	if !ok {
+		return SteamBuild{}, fmt.Errorf("remote depot %s metadata is missing", steamDepotID)
+	}
+	manifests, ok := depot.child("manifests")
+	if !ok {
+		return SteamBuild{}, fmt.Errorf("remote depot %s manifests are missing", steamDepotID)
+	}
+	manifest, ok := manifests.childExact(branch)
+	if !ok {
+		return SteamBuild{}, fmt.Errorf("remote branch %q depot %s manifest is missing", branch, steamDepotID)
+	}
+	depotManifest, ok := manifest.value("gid")
+	if !ok || depotManifest == "" {
 		return SteamBuild{}, fmt.Errorf("remote branch %q depot %s manifest is missing", branch, steamDepotID)
 	}
 	return SteamBuild{BuildID: buildID, DepotManifest: depotManifest, Branch: branch}, nil
@@ -257,8 +287,8 @@ func (s *SteamClient) validateUpdatedInstallation(target SteamBuild) (SteamBuild
 	if err != nil {
 		return SteamBuild{}, fmt.Errorf("read steam_appid.txt: %w", err)
 	}
-	if strings.TrimSpace(string(appID)) != steamAppID {
-		return SteamBuild{}, fmt.Errorf("steam_appid.txt does not contain %s", steamAppID)
+	if !validRuntimeSteamAppID(appID) {
+		return SteamBuild{}, fmt.Errorf("steam_appid.txt does not contain the exact runtime app ID %s", steamRuntimeAppID)
 	}
 	installed, err := s.readInstalledBuild()
 	if err != nil {
@@ -280,8 +310,17 @@ func (s *SteamClient) validateUpdatedInstallation(target SteamBuild) (SteamBuild
 	return installed, nil
 }
 
+func validRuntimeSteamAppID(content []byte) bool {
+	switch string(content) {
+	case steamRuntimeAppID, steamRuntimeAppID + "\n", steamRuntimeAppID + "\r\n":
+		return true
+	default:
+		return false
+	}
+}
+
 func requireRegularFile(path string) error {
-	info, err := os.Stat(path)
+	info, err := os.Lstat(path)
 	if err != nil {
 		return err
 	}
@@ -309,14 +348,44 @@ func steamCommandError(result CommandResult, runErr error) error {
 }
 
 func preMutationSteamError(err error) error {
-	return &SteamPreMutationError{Err: err}
+	return &SteamPreMutationError{Err: phaseNeutralSteamError(err)}
 }
 
 func postMutationSteamError(err error) error {
 	if err == nil {
 		err = fmt.Errorf("app_update failed")
 	}
-	return &SteamPostMutationError{Err: err}
+	return &SteamPostMutationError{Err: phaseNeutralSteamError(err)}
+}
+
+type opaqueSteamError struct {
+	message string
+	cause   error
+}
+
+func (e opaqueSteamError) Error() string {
+	return e.message
+}
+
+func (e opaqueSteamError) Is(target error) bool {
+	switch target.(type) {
+	case *SteamPreMutationError, *SteamPostMutationError:
+		return false
+	default:
+		return errors.Is(e.cause, target)
+	}
+}
+
+func phaseNeutralSteamError(err error) error {
+	if err == nil {
+		return opaqueSteamError{message: "unknown Steam failure"}
+	}
+	var preMutation *SteamPreMutationError
+	var postMutation *SteamPostMutationError
+	if errors.As(err, &preMutation) || errors.As(err, &postMutation) {
+		return opaqueSteamError{message: err.Error(), cause: err}
+	}
+	return err
 }
 
 type vdfNode struct {
@@ -342,6 +411,11 @@ func (n *vdfNode) child(key string) (*vdfNode, bool) {
 	return nil, false
 }
 
+func (n *vdfNode) childExact(key string) (*vdfNode, bool) {
+	child, ok := n.children[key]
+	return child, ok
+}
+
 func (n *vdfNode) pathValue(path ...string) (string, error) {
 	if len(path) == 0 {
 		return "", fmt.Errorf("empty VDF path")
@@ -361,119 +435,257 @@ func (n *vdfNode) pathValue(path ...string) (string, error) {
 	return value, nil
 }
 
-type vdfTokenKind uint8
-
-const (
-	vdfString vdfTokenKind = iota
-	vdfOpen
-	vdfClose
-)
-
-type vdfToken struct {
-	kind  vdfTokenKind
-	value string
+type vdfParser struct {
+	data     []byte
+	position int
 }
 
-func parseVDFRoot(data []byte, rootName string) (*vdfNode, error) {
-	tokens, err := tokenizeVDF(data)
+func parseVDFDocument(data []byte, rootName string) (*vdfNode, error) {
+	root, consumed, err := parseVDFPrefix(data, rootName)
 	if err != nil {
 		return nil, err
 	}
-	for i := 0; i+1 < len(tokens); i++ {
-		if tokens[i].kind != vdfString || tokens[i].value != rootName || tokens[i+1].kind != vdfOpen {
-			continue
-		}
-		position := i + 1
-		return parseVDFObject(tokens, &position)
+	if consumed != len(data) {
+		return nil, fmt.Errorf("unexpected data after VDF root %q", rootName)
 	}
-	return nil, fmt.Errorf("VDF root %q is missing", rootName)
+	return root, nil
 }
 
-func tokenizeVDF(data []byte) ([]vdfToken, error) {
-	tokens := make([]vdfToken, 0)
-	for i := 0; i < len(data); {
-		switch data[i] {
-		case '{':
-			tokens = append(tokens, vdfToken{kind: vdfOpen})
-			i++
-		case '}':
-			tokens = append(tokens, vdfToken{kind: vdfClose})
-			i++
-		case '"':
-			value, next, err := readVDFString(data, i)
-			if err != nil {
-				return nil, err
-			}
-			tokens = append(tokens, vdfToken{kind: vdfString, value: value})
-			i = next
+func parseVDFPrefix(data []byte, rootName string) (*vdfNode, int, error) {
+	parser := &vdfParser{data: data}
+	parser.skipWhitespace()
+	root, err := parser.readString()
+	if err != nil {
+		return nil, 0, fmt.Errorf("read VDF root: %w", err)
+	}
+	if root != rootName {
+		return nil, 0, fmt.Errorf("VDF root is %q, want %q", root, rootName)
+	}
+	parser.skipWhitespace()
+	node, err := parser.readObject()
+	if err != nil {
+		return nil, 0, err
+	}
+	parser.skipWhitespace()
+	return node, parser.position, nil
+}
+
+func parseRemoteVDF(output []byte, rootName string) (*vdfNode, error) {
+	rootStart, count := remoteVDFRootLine(output, rootName)
+	if count != 1 {
+		return nil, fmt.Errorf("SteamCMD output contains %d VDF roots for app %s", count, rootName)
+	}
+	if err := validateSteamWrapper(output[:rootStart], true); err != nil {
+		return nil, err
+	}
+	root, consumed, err := parseVDFPrefix(output[rootStart:], rootName)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateSteamWrapper(output[rootStart+consumed:], false); err != nil {
+		return nil, err
+	}
+	return root, nil
+}
+
+func remoteVDFRootLine(output []byte, rootName string) (int, int) {
+	want := `"` + rootName + `"`
+	rootStart := -1
+	count := 0
+	for lineStart := 0; lineStart <= len(output); {
+		lineEnd := len(output)
+		if newline := bytes.IndexByte(output[lineStart:], '\n'); newline >= 0 {
+			lineEnd = lineStart + newline
+		}
+		line := strings.TrimSuffix(string(output[lineStart:lineEnd]), "\r")
+		if strings.Trim(line, " \t") == want {
+			rootStart = lineStart
+			count++
+		}
+		if lineEnd == len(output) {
+			break
+		}
+		lineStart = lineEnd + 1
+	}
+	return rootStart, count
+}
+
+func validateSteamWrapper(data []byte, beforeRoot bool) error {
+	for _, rawLine := range strings.Split(string(data), "\n") {
+		line := strings.TrimSuffix(rawLine, "\r")
+		if strings.Trim(line, " \t") == "" {
+			continue
+		}
+		if beforeRoot && isSteamPrefixLine(line) || !beforeRoot && line == "Steam>" {
+			continue
+		}
+		return fmt.Errorf("unrecognized SteamCMD console output %q", line)
+	}
+	return nil
+}
+
+func isSteamPrefixLine(line string) bool {
+	switch line {
+	case "[  0%] Checking for available updates...",
+		"[----] Verifying installation...",
+		"-- type 'quit' to exit --",
+		"Loading Steam API...OK":
+		return true
+	}
+	if quotedConsolePath(line, "Redirecting stderr to ") || quotedConsolePath(line, "Logging directory: ") {
+		return true
+	}
+	if version, ok := strings.CutPrefix(line, "Steam Console Client (c) Valve Corporation - version "); ok {
+		return asciiDigits(version)
+	}
+	const appInfoPrefix = "AppID : " + steamAppID + ", change number : "
+	changeAndTime, ok := strings.CutPrefix(line, appInfoPrefix)
+	if !ok {
+		return false
+	}
+	change, changedAt, ok := strings.Cut(changeAndTime, ", last change : ")
+	left, right, slash := strings.Cut(change, "/")
+	return ok && slash && asciiDigits(left) && asciiDigits(right) && safeConsoleText(changedAt)
+}
+
+func quotedConsolePath(line, prefix string) bool {
+	value, ok := strings.CutPrefix(line, prefix)
+	if !ok || len(value) < 3 || value[0] != '\'' || value[len(value)-1] != '\'' {
+		return false
+	}
+	return safeConsoleText(value[1:len(value)-1]) && !strings.ContainsRune(value[1:len(value)-1], '\'')
+}
+
+func asciiDigits(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func safeConsoleText(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, character := range value {
+		if character < 0x20 || character == 0x7f || strings.ContainsRune(`"{}`, character) {
+			return false
+		}
+	}
+	return true
+}
+
+func (p *vdfParser) skipWhitespace() {
+	for p.position < len(p.data) {
+		switch p.data[p.position] {
+		case ' ', '\t', '\r', '\n':
+			p.position++
 		default:
-			i++
+			return
 		}
 	}
-	return tokens, nil
 }
 
-func readVDFString(data []byte, start int) (string, int, error) {
+func (p *vdfParser) readString() (string, error) {
+	if p.position >= len(p.data) || p.data[p.position] != '"' {
+		return "", fmt.Errorf("expected quoted string at byte %d", p.position)
+	}
+	p.position++
 	var value strings.Builder
-	for i := start + 1; i < len(data); i++ {
-		if data[i] == '"' {
-			return value.String(), i + 1, nil
+	for p.position < len(p.data) {
+		character := p.data[p.position]
+		p.position++
+		if character == '"' {
+			return value.String(), nil
 		}
-		if data[i] != '\\' {
-			value.WriteByte(data[i])
+		if character < 0x20 {
+			return "", fmt.Errorf("unescaped control byte in VDF string")
+		}
+		if character != '\\' {
+			value.WriteByte(character)
 			continue
 		}
-		if i+1 >= len(data) {
-			return "", 0, fmt.Errorf("unterminated VDF escape")
+		if p.position >= len(p.data) {
+			return "", fmt.Errorf("unterminated VDF escape")
 		}
-		i++
-		switch data[i] {
+		escaped := p.data[p.position]
+		p.position++
+		switch escaped {
 		case '"', '\\':
-			value.WriteByte(data[i])
+			value.WriteByte(escaped)
 		case 'n':
 			value.WriteByte('\n')
 		case 't':
 			value.WriteByte('\t')
 		default:
 			value.WriteByte('\\')
-			value.WriteByte(data[i])
+			value.WriteByte(escaped)
 		}
 	}
-	return "", 0, fmt.Errorf("unterminated VDF string")
+	return "", fmt.Errorf("unterminated VDF string")
 }
 
-func parseVDFObject(tokens []vdfToken, position *int) (*vdfNode, error) {
-	if *position >= len(tokens) || tokens[*position].kind != vdfOpen {
-		return nil, fmt.Errorf("VDF object opening brace is missing")
+func (p *vdfParser) readObject() (*vdfNode, error) {
+	if p.position >= len(p.data) || p.data[p.position] != '{' {
+		return nil, fmt.Errorf("expected VDF object at byte %d", p.position)
 	}
-	*position++
+	p.position++
 	node := &vdfNode{values: make(map[string]string), children: make(map[string]*vdfNode)}
-	for *position < len(tokens) {
-		if tokens[*position].kind == vdfClose {
-			*position++
+	for {
+		p.skipWhitespace()
+		if p.position >= len(p.data) {
+			return nil, fmt.Errorf("VDF object closing brace is missing")
+		}
+		if p.data[p.position] == '}' {
+			p.position++
 			return node, nil
 		}
-		if tokens[*position].kind != vdfString {
-			return nil, fmt.Errorf("VDF object key is malformed")
+		key, err := p.readString()
+		if err != nil {
+			return nil, fmt.Errorf("read VDF object key: %w", err)
 		}
-		key := tokens[*position].value
-		*position++
-		if *position >= len(tokens) {
+		if node.hasKey(key) {
+			return nil, fmt.Errorf("duplicate VDF key %q", key)
+		}
+		p.skipWhitespace()
+		if p.position >= len(p.data) {
 			return nil, fmt.Errorf("VDF value for %q is missing", key)
 		}
-		switch tokens[*position].kind {
-		case vdfString:
-			node.values[key] = tokens[*position].value
-			*position++
-		case vdfOpen:
-			child, err := parseVDFObject(tokens, position)
+		if p.data[p.position] == '"' {
+			value, err := p.readString()
+			if err != nil {
+				return nil, fmt.Errorf("read VDF value for %q: %w", key, err)
+			}
+			node.values[key] = value
+			continue
+		}
+		if p.data[p.position] == '{' {
+			child, err := p.readObject()
 			if err != nil {
 				return nil, err
 			}
 			node.children[key] = child
-		case vdfClose:
-			return nil, fmt.Errorf("VDF value for %q is missing", key)
+			continue
+		}
+		return nil, fmt.Errorf("VDF value for %q is malformed", key)
+	}
+}
+
+func (n *vdfNode) hasKey(key string) bool {
+	for candidate := range n.values {
+		if strings.EqualFold(candidate, key) {
+			return true
 		}
 	}
-	return nil, fmt.Errorf("VDF object closing brace is missing")
+	for candidate := range n.children {
+		if strings.EqualFold(candidate, key) {
+			return true
+		}
+	}
+	return false
 }

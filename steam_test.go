@@ -3,11 +3,15 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -17,7 +21,7 @@ const (
 
 func TestParseInstalledBuild(t *testing.T) {
 	client := newTestSteamClient(t, nil)
-	installSteamFixture(t, client, "public", true, "1829350")
+	installSteamFixture(t, client, "public", true, "1604030")
 
 	got, err := client.InstalledBuild()
 	if err != nil {
@@ -30,6 +34,48 @@ func TestParseInstalledBuild(t *testing.T) {
 	}
 	if got != want {
 		t.Fatalf("InstalledBuild() = %#v, want %#v", got, want)
+	}
+}
+
+func TestSteamInstalledManifestRejectsAmbiguousVDF(t *testing.T) {
+	fixture := string(readSteamFixture(t, "appmanifest-installed.acf"))
+	tests := []struct {
+		name     string
+		manifest string
+	}{
+		{
+			name: "duplicate value case variant",
+			manifest: strings.Replace(
+				fixture,
+				"\t\"buildid\"\t\t\"24686592\"",
+				"\t\"buildid\"\t\t\"24686592\"\n\t\"BUILDID\"\t\t\"24686592\"",
+				1,
+			),
+		},
+		{
+			name: "duplicate child case variant",
+			manifest: strings.Replace(
+				fixture,
+				"\t\"MountedConfig\"",
+				"\t\"userconfig\"\n\t{\n\t}\n\t\"MountedConfig\"",
+				1,
+			),
+		},
+		{name: "leading unquoted junk", manifest: "junk\n" + fixture},
+		{name: "unquoted structural junk", manifest: strings.Replace(fixture, "\"AppState\"\n", "\"AppState\" junk\n", 1)},
+		{name: "trailing structural token", manifest: fixture + "\n}\n"},
+		{name: "extra root", manifest: fixture + "\n" + fixture},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := newTestSteamClient(t, nil)
+			writeInstalledManifest(t, client, []byte(tt.manifest))
+
+			if _, err := client.InstalledBuild(); err == nil {
+				t.Fatal("InstalledBuild() accepted ambiguous or malformed VDF")
+			}
+		})
 	}
 }
 
@@ -58,13 +104,13 @@ func TestRemoteBuildSelectsConfiguredBranch(t *testing.T) {
 	output := strings.ReplaceAll(
 		string(readSteamFixture(t, "app-info-public.txt")),
 		`"public"`,
-		`"legacy-1.1"`,
+		`"Legacy-1.1"`,
 	)
 	runner := &recordingCommandRunner{results: []commandRun{{result: CommandResult{
 		Stdout: []byte(output),
 	}}}}
 	client := newTestSteamClient(t, runner)
-	client.Branch = "legacy-1.1"
+	client.Branch = "Legacy-1.1"
 
 	got, err := client.RemoteBuild(t.Context())
 	if err != nil {
@@ -73,12 +119,93 @@ func TestRemoteBuildSelectsConfiguredBranch(t *testing.T) {
 	want := SteamBuild{
 		BuildID:       steamTestBuildID,
 		DepotManifest: steamTestDepotManifest,
-		Branch:        "legacy-1.1",
+		Branch:        "Legacy-1.1",
 	}
 	if got != want {
 		t.Fatalf("RemoteBuild() = %#v, want %#v", got, want)
 	}
 	assertCommandSpecs(t, runner.specs, remoteSteamSpec(client))
+}
+
+func TestSteamRemoteBranchLookupIsCaseSensitive(t *testing.T) {
+	output := strings.ReplaceAll(
+		string(readSteamFixture(t, "app-info-public.txt")),
+		`"public"`,
+		`"Legacy-1.1"`,
+	)
+	runner := &recordingCommandRunner{results: []commandRun{{result: CommandResult{Stdout: []byte(output)}}}}
+	client := newTestSteamClient(t, runner)
+	client.Branch = "legacy-1.1"
+
+	if _, err := client.RemoteBuild(t.Context()); err == nil {
+		t.Fatal("RemoteBuild() matched a branch with different case")
+	}
+	assertCommandSpecs(t, runner.specs, remoteSteamSpec(client))
+}
+
+func TestSteamRejectsUppercasePublicBranch(t *testing.T) {
+	t.Run("remote selection", func(t *testing.T) {
+		runner := &recordingCommandRunner{results: []commandRun{{result: CommandResult{
+			Stdout: readSteamFixture(t, "app-info-public.txt"),
+		}}}}
+		client := newTestSteamClient(t, runner)
+		client.Branch = "PUBLIC"
+
+		if _, err := client.RemoteBuild(t.Context()); err == nil {
+			t.Fatal("RemoteBuild() treated configured PUBLIC as canonical public")
+		}
+		assertCommandSpecs(t, runner.specs, remoteSteamSpec(client))
+	})
+
+	t.Run("update before mutation", func(t *testing.T) {
+		runner := &recordingCommandRunner{}
+		client := newTestSteamClient(t, runner)
+		client.Branch = "PUBLIC"
+
+		_, err := client.Update(t.Context(), testSteamBuild("PUBLIC"))
+		if err == nil {
+			t.Fatal("Update() accepted configured PUBLIC")
+		}
+		var preMutation *SteamPreMutationError
+		if !errors.As(err, &preMutation) {
+			t.Fatalf("Update() error = %T %v, want *SteamPreMutationError", err, err)
+		}
+		if len(runner.specs) != 0 {
+			t.Fatalf("Update() ran commands for configured PUBLIC: %#v", runner.specs)
+		}
+	})
+}
+
+func TestSteamRemoteMetadataRejectsAmbiguousVDF(t *testing.T) {
+	fixture := string(readSteamFixture(t, "app-info-public.txt"))
+	duplicateBranch := strings.Replace(
+		fixture,
+		"\t\t\t\"public\"\n\t\t\t{\n\t\t\t\t\"buildid\"\t\t\"24686592\"\n\t\t\t\t\"timeupdated\"\t\t\"1786515518\"\n\t\t\t}",
+		"\t\t\t\"public\"\n\t\t\t{\n\t\t\t\t\"buildid\"\t\t\"24686592\"\n\t\t\t\t\"timeupdated\"\t\t\"1786515518\"\n\t\t\t}\n\t\t\t\"PUBLIC\"\n\t\t\t{\n\t\t\t\t\"buildid\"\t\t\"99999999\"\n\t\t\t}",
+		1,
+	)
+	tests := []struct {
+		name   string
+		output string
+	}{
+		{name: "duplicate branch case variant", output: duplicateBranch},
+		{name: "unknown wrapper", output: "Injected console line\n" + fixture},
+		{name: "unquoted structural junk", output: strings.Replace(fixture, "\"1829350\"\n{", "\"1829350\"\njunk\n{", 1)},
+		{name: "trailing structural token", output: strings.Replace(fixture, "\nSteam>\n", "\n}\nSteam>\n", 1)},
+		{name: "extra root", output: strings.Replace(fixture, "\nSteam>\n", "\n\"1829350\"\n{\n}\nSteam>\n", 1)},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runner := &recordingCommandRunner{results: []commandRun{{result: CommandResult{Stdout: []byte(tt.output)}}}}
+			client := newTestSteamClient(t, runner)
+
+			if _, err := client.RemoteBuild(t.Context()); err == nil {
+				t.Fatal("RemoteBuild() accepted ambiguous or malformed VDF output")
+			}
+			assertCommandSpecs(t, runner.specs, remoteSteamSpec(client))
+		})
+	}
 }
 
 func TestSteamMetadataFailureIsPreMutation(t *testing.T) {
@@ -106,11 +233,42 @@ func TestSteamMetadataFailureIsPreMutation(t *testing.T) {
 	assertCommandSpecs(t, runner.specs, remoteSteamSpec(client))
 }
 
+func TestSteamMetadataPhaseOverridesNestedPostMutationError(t *testing.T) {
+	adversarial := fmt.Errorf(
+		"outer runner wrapper: %w",
+		fmt.Errorf("inner runner wrapper: %w", &SteamPostMutationError{
+			Err: fmt.Errorf("adversarial post phase: %w", context.Canceled),
+		}),
+	)
+	runner := &recordingCommandRunner{results: []commandRun{{err: adversarial}}}
+	client := newTestSteamClient(t, runner)
+
+	_, err := client.RemoteBuild(t.Context())
+	if err == nil {
+		t.Fatal("RemoteBuild() succeeded after adversarial runner failure")
+	}
+	var preMutation *SteamPreMutationError
+	if !errors.As(err, &preMutation) {
+		t.Fatalf("RemoteBuild() error = %T %v, want *SteamPreMutationError", err, err)
+	}
+	var postMutation *SteamPostMutationError
+	if errors.As(err, &postMutation) {
+		t.Fatalf("RemoteBuild() error = %v, also exposes *SteamPostMutationError", err)
+	}
+	if !strings.Contains(err.Error(), "outer runner wrapper") || !strings.Contains(err.Error(), "adversarial post phase") {
+		t.Fatalf("RemoteBuild() error lost diagnostic text: %v", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("RemoteBuild() error = %v, want context cancellation preserved", err)
+	}
+	assertCommandSpecs(t, runner.specs, remoteSteamSpec(client))
+}
+
 func TestSteamUpdateUsesLiteralArgumentSlice(t *testing.T) {
 	runner := &recordingCommandRunner{results: []commandRun{{}}}
 	client := newTestSteamClient(t, runner)
 	client.Branch = "legacy-1.1"
-	installSteamFixture(t, client, "legacy-1.1", true, "1829350")
+	installSteamFixture(t, client, "legacy-1.1", true, "1604030")
 	target := SteamBuild{
 		BuildID:       steamTestBuildID,
 		DepotManifest: steamTestDepotManifest,
@@ -134,7 +292,7 @@ func TestSteamUpdateRetriesThreeTimes(t *testing.T) {
 		{},
 	}}
 	client := newTestSteamClient(t, runner)
-	installSteamFixture(t, client, "public", true, "1829350")
+	installSteamFixture(t, client, "public", true, "1604030")
 	target := testSteamBuild("public")
 
 	got, err := client.Update(t.Context(), target)
@@ -154,7 +312,7 @@ func TestSteamUpdateRetriesThreeTimes(t *testing.T) {
 func TestSteamUpdateRejectsMissingExecutable(t *testing.T) {
 	runner := &recordingCommandRunner{results: []commandRun{{}}}
 	client := newTestSteamClient(t, runner)
-	installSteamFixture(t, client, "public", false, "1829350")
+	installSteamFixture(t, client, "public", false, "1604030")
 
 	got, err := client.Update(t.Context(), testSteamBuild("public"))
 	if err == nil {
@@ -165,6 +323,131 @@ func TestSteamUpdateRejectsMissingExecutable(t *testing.T) {
 	}
 	assertPostMutationError(t, err)
 	assertCommandSpecs(t, runner.specs, publicUpdateSteamSpec(client))
+}
+
+func TestSteamUpdateRejectsNonRegularExecutable(t *testing.T) {
+	tests := []struct {
+		name   string
+		create func(*testing.T, string) func()
+	}{
+		{
+			name: "symlink",
+			create: func(t *testing.T, path string) func() {
+				t.Helper()
+				target := filepath.Join(filepath.Dir(path), "real-server.exe")
+				if err := os.WriteFile(target, []byte("server"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(target, path); err != nil {
+					t.Fatal(err)
+				}
+				return func() {}
+			},
+		},
+		{
+			name: "directory",
+			create: func(t *testing.T, path string) func() {
+				t.Helper()
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				return func() {}
+			},
+		},
+		{
+			name: "fifo",
+			create: func(t *testing.T, path string) func() {
+				t.Helper()
+				if err := unix.Mkfifo(path, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return func() {}
+			},
+		},
+		{
+			name: "socket",
+			create: func(t *testing.T, path string) func() {
+				t.Helper()
+				listener, err := net.Listen("unix", path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return func() {
+					if err := listener.Close(); err != nil {
+						t.Errorf("close Unix listener: %v", err)
+					}
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runner := &recordingCommandRunner{results: []commandRun{{}}}
+			client := newTestSteamClient(t, runner)
+			installSteamFixture(t, client, "public", false, "1604030")
+			cleanup := tt.create(t, filepath.Join(client.ServerDir, "VRisingServer.exe"))
+			defer cleanup()
+
+			if _, err := client.Update(t.Context(), testSteamBuild("public")); err == nil {
+				t.Fatal("Update() accepted a non-regular VRisingServer.exe")
+			} else {
+				assertPostMutationError(t, err)
+			}
+			assertCommandSpecs(t, runner.specs, publicUpdateSteamSpec(client))
+		})
+	}
+}
+
+func TestSteamUpdateAcceptsExactRuntimeAppIDFormats(t *testing.T) {
+	for _, content := range []string{"1604030", "1604030\n", "1604030\r\n"} {
+		t.Run(strings.ReplaceAll(content, "\n", `\n`), func(t *testing.T) {
+			runner := &recordingCommandRunner{results: []commandRun{{}}}
+			client := newTestSteamClient(t, runner)
+			installSteamFixture(t, client, "public", true, "1604030")
+			writeSteamAppID(t, client, []byte(content))
+
+			got, err := client.Update(t.Context(), testSteamBuild("public"))
+			if err != nil {
+				t.Fatalf("Update() error = %v", err)
+			}
+			if got != testSteamBuild("public") {
+				t.Fatalf("Update() = %#v, want exact target", got)
+			}
+			assertCommandSpecs(t, runner.specs, publicUpdateSteamSpec(client))
+		})
+	}
+}
+
+func TestSteamUpdateRejectsMalformedRuntimeAppID(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+	}{
+		{name: "leading space", content: " 1604030"},
+		{name: "trailing space", content: "1604030 "},
+		{name: "blank", content: ""},
+		{name: "blank line", content: "1604030\n\n"},
+		{name: "repeated line", content: "1604030\n1604030\n"},
+		{name: "unicode whitespace", content: "1604030\u00a0"},
+		{name: "trailing data", content: "1604030\nextra"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runner := &recordingCommandRunner{results: []commandRun{{}}}
+			client := newTestSteamClient(t, runner)
+			installSteamFixture(t, client, "public", true, "1604030")
+			writeSteamAppID(t, client, []byte(tt.content))
+
+			if _, err := client.Update(t.Context(), testSteamBuild("public")); err == nil {
+				t.Fatal("Update() accepted malformed steam_appid.txt bytes")
+			} else {
+				assertPostMutationError(t, err)
+			}
+			assertCommandSpecs(t, runner.specs, publicUpdateSteamSpec(client))
+		})
+	}
 }
 
 func TestSteamUpdateRejectsUnexpectedBuild(t *testing.T) {
@@ -178,25 +461,25 @@ func TestSteamUpdateRejectsUnexpectedBuild(t *testing.T) {
 		{
 			name:   "build id",
 			branch: "public",
-			appid:  "1829350",
+			appid:  "1604030",
 			target: SteamBuild{BuildID: "99999999", DepotManifest: steamTestDepotManifest, Branch: "public"},
 		},
 		{
 			name:   "depot manifest",
 			branch: "public",
-			appid:  "1829350",
+			appid:  "1604030",
 			target: SteamBuild{BuildID: steamTestBuildID, DepotManifest: "9999999999999999999", Branch: "public"},
 		},
 		{
 			name:   "steam app id file",
 			branch: "public",
-			appid:  "1604030",
+			appid:  "1829350",
 			target: testSteamBuild("public"),
 		},
 		{
 			name:   "manifest app id",
 			branch: "public",
-			appid:  "1829350",
+			appid:  "1604030",
 			target: testSteamBuild("public"),
 			transform: func(manifest string) string {
 				return strings.Replace(manifest, "\"appid\"\t\t\"1829350\"", "\"appid\"\t\t\"1604030\"", 1)
@@ -205,7 +488,7 @@ func TestSteamUpdateRejectsUnexpectedBuild(t *testing.T) {
 		{
 			name:   "branch",
 			branch: "legacy-1.1",
-			appid:  "1829350",
+			appid:  "1604030",
 			target: testSteamBuild("legacy-1.1"),
 			transform: func(manifest string) string {
 				return strings.Replace(manifest, "\"BetaKey\"\t\t\"legacy-1.1\"", "\"BetaKey\"\t\t\"other\"", 1)
@@ -254,7 +537,7 @@ func TestSteamFailureAfterMutationIsFatal(t *testing.T) {
 		{result: CommandResult{ExitCode: 8, Stderr: []byte("download failed")}},
 	}}
 	client := newTestSteamClient(t, runner)
-	installSteamFixture(t, client, "public", true, "1829350")
+	installSteamFixture(t, client, "public", true, "1604030")
 
 	got, err := client.Update(t.Context(), testSteamBuild("public"))
 	if err == nil {
@@ -267,6 +550,43 @@ func TestSteamFailureAfterMutationIsFatal(t *testing.T) {
 	var preMutation *SteamPreMutationError
 	if errors.As(err, &preMutation) {
 		t.Fatalf("Update() error = %v, unexpectedly classifies as pre-mutation", err)
+	}
+	wantSpec := publicUpdateSteamSpec(client)
+	assertCommandSpecs(t, runner.specs, wantSpec, wantSpec, wantSpec)
+}
+
+func TestSteamUpdatePhaseOverridesNestedPreMutationError(t *testing.T) {
+	adversarial := fmt.Errorf(
+		"outer runner wrapper: %w",
+		fmt.Errorf("inner runner wrapper: %w", &SteamPreMutationError{
+			Err: fmt.Errorf("adversarial pre phase: %w", context.Canceled),
+		}),
+	)
+	runner := &recordingCommandRunner{results: []commandRun{
+		{err: adversarial},
+		{err: adversarial},
+		{err: adversarial},
+	}}
+	client := newTestSteamClient(t, runner)
+	installSteamFixture(t, client, "public", true, "1604030")
+
+	_, err := client.Update(t.Context(), testSteamBuild("public"))
+	if err == nil {
+		t.Fatal("Update() succeeded after adversarial runner failures")
+	}
+	var postMutation *SteamPostMutationError
+	if !errors.As(err, &postMutation) {
+		t.Fatalf("Update() error = %T %v, want *SteamPostMutationError", err, err)
+	}
+	var preMutation *SteamPreMutationError
+	if errors.As(err, &preMutation) {
+		t.Fatalf("Update() error = %v, also exposes *SteamPreMutationError", err)
+	}
+	if !strings.Contains(err.Error(), "outer runner wrapper") || !strings.Contains(err.Error(), "adversarial pre phase") {
+		t.Fatalf("Update() error lost diagnostic text: %v", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Update() error = %v, want context cancellation preserved", err)
 	}
 	wantSpec := publicUpdateSteamSpec(client)
 	assertCommandSpecs(t, runner.specs, wantSpec, wantSpec, wantSpec)
@@ -365,6 +685,24 @@ func readSteamFixture(t *testing.T, name string) []byte {
 		t.Fatal(err)
 	}
 	return data
+}
+
+func writeInstalledManifest(t *testing.T, client *SteamClient, manifest []byte) {
+	t.Helper()
+	manifestPath := filepath.Join(client.ServerDir, "steamapps", "appmanifest_1829350.acf")
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, manifest, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeSteamAppID(t *testing.T, client *SteamClient, content []byte) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(client.ServerDir, "steam_appid.txt"), content, 0o600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func testSteamBuild(branch string) SteamBuild {
