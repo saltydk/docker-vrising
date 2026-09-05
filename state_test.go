@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -148,6 +149,19 @@ func TestLifetimeLockRejectsSecondOwner(t *testing.T) {
 	}
 }
 
+func TestLifetimeLockRejectsSymlinkedLock(t *testing.T) {
+	stateDir := t.TempDir()
+	externalLock := filepath.Join(t.TempDir(), "update.lock")
+	writeTestFile(t, externalLock, "external lock")
+	if err := os.Symlink(externalLock, filepath.Join(stateDir, "update.lock")); err != nil {
+		t.Fatalf("create lock symlink: %v", err)
+	}
+
+	if _, err := (&Store{StateDir: stateDir}).OpenLifetimeLock(); err == nil {
+		t.Fatal("OpenLifetimeLock() succeeded for a symlinked lock")
+	}
+}
+
 func TestRecoverInterruptedTransactionRestoresRecordedFiles(t *testing.T) {
 	serverDir := t.TempDir()
 	stateDir := filepath.Join(serverDir, ".docker-vrising")
@@ -199,6 +213,119 @@ func TestRecoverInterruptedTransactionRestoresRecordedFiles(t *testing.T) {
 	}
 }
 
+func TestRecoverInterruptedTransactionDoesNotDeleteThroughSymlink(t *testing.T) {
+	serverDir := t.TempDir()
+	stateDir := filepath.Join(serverDir, ".docker-vrising")
+	externalDir := t.TempDir()
+	externalFile := filepath.Join(externalDir, "managed.dll")
+	store := Store{StateDir: stateDir}
+
+	writeTestFile(t, externalFile, "external managed file")
+	if err := os.Symlink(externalDir, filepath.Join(serverDir, "BepInEx")); err != nil {
+		t.Fatalf("create target symlink: %v", err)
+	}
+	if err := store.Save(State{
+		SchemaVersion: 1,
+		Transaction: &TransactionJournal{Entries: []JournalEntry{{
+			RelativePath: "BepInEx/managed.dll",
+			Existed:      false,
+		}}},
+	}); err != nil {
+		t.Fatalf("save transaction state: %v", err)
+	}
+
+	if err := store.RecoverInterruptedTransaction(); err == nil {
+		t.Fatal("RecoverInterruptedTransaction() succeeded through a target symlink")
+	}
+	if got := readTestFile(t, externalFile); got != "external managed file" {
+		t.Fatalf("external file = %q, want unchanged external managed file", got)
+	}
+}
+
+func TestRecoverInterruptedTransactionDoesNotRestoreFromSymlinkedBackup(t *testing.T) {
+	serverDir := t.TempDir()
+	stateDir := filepath.Join(serverDir, ".docker-vrising")
+	externalDir := t.TempDir()
+	managedPath := filepath.Join(serverDir, "BepInEx", "managed.dll")
+	externalBackup := filepath.Join(externalDir, "managed.dll")
+	store := Store{StateDir: stateDir}
+
+	writeTestFile(t, managedPath, "replacement")
+	writeTestFile(t, externalBackup, "external backup")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatalf("create state directory: %v", err)
+	}
+	if err := os.Symlink(externalDir, filepath.Join(stateDir, "transaction")); err != nil {
+		t.Fatalf("create backup symlink: %v", err)
+	}
+	if err := store.Save(State{
+		SchemaVersion: 1,
+		Transaction: &TransactionJournal{Entries: []JournalEntry{{
+			RelativePath: "BepInEx/managed.dll",
+			BackupPath:   "transaction/managed.dll",
+			Existed:      true,
+		}}},
+	}); err != nil {
+		t.Fatalf("save transaction state: %v", err)
+	}
+
+	if err := store.RecoverInterruptedTransaction(); err == nil {
+		t.Fatal("RecoverInterruptedTransaction() restored from a symlinked backup")
+	}
+	if got := readTestFile(t, managedPath); got != "replacement" {
+		t.Fatalf("managed file = %q, want unchanged replacement", got)
+	}
+}
+
+func TestRecoverInterruptedTransactionRetainsJournalWhenRemovalParentSyncFails(t *testing.T) {
+	serverDir := t.TempDir()
+	stateDir := filepath.Join(serverDir, ".docker-vrising")
+	managedPath := filepath.Join(serverDir, "BepInEx", "new.dll")
+	store := Store{StateDir: stateDir}
+
+	writeTestFile(t, managedPath, "new managed file")
+	if err := store.Save(State{
+		SchemaVersion: 1,
+		Transaction: &TransactionJournal{Entries: []JournalEntry{{
+			RelativePath: "BepInEx/new.dll",
+			Existed:      false,
+		}}},
+	}); err != nil {
+		t.Fatalf("save transaction state: %v", err)
+	}
+	store.syncDirectory = func(int) error { return errors.New("target parent sync failed") }
+
+	if err := store.RecoverInterruptedTransaction(); err == nil {
+		t.Fatal("RecoverInterruptedTransaction() succeeded after target parent sync failed")
+	}
+	assertTransactionRetained(t, &store)
+}
+
+func TestRecoverInterruptedTransactionRetainsJournalWhenCreatedAncestorSyncFails(t *testing.T) {
+	serverDir := t.TempDir()
+	stateDir := filepath.Join(serverDir, ".docker-vrising")
+	backupPath := filepath.Join(stateDir, "transaction", "managed.dll")
+	store := Store{StateDir: stateDir}
+
+	writeTestFile(t, backupPath, "original")
+	if err := store.Save(State{
+		SchemaVersion: 1,
+		Transaction: &TransactionJournal{Entries: []JournalEntry{{
+			RelativePath: "BepInEx/plugins/managed.dll",
+			BackupPath:   "transaction/managed.dll",
+			Existed:      true,
+		}}},
+	}); err != nil {
+		t.Fatalf("save transaction state: %v", err)
+	}
+	store.syncDirectory = func(int) error { return errors.New("created ancestor sync failed") }
+
+	if err := store.RecoverInterruptedTransaction(); err == nil {
+		t.Fatal("RecoverInterruptedTransaction() succeeded after created ancestor sync failed")
+	}
+	assertTransactionRetained(t, &store)
+}
+
 func TestProcessIdentityRejectsReusedPID(t *testing.T) {
 	recorded := ProcessIdentity{PID: 123, StartTicks: 456}
 	reused := ProcessIdentity{PID: 123, StartTicks: 789}
@@ -225,4 +352,15 @@ func readTestFile(t *testing.T, path string) string {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	return string(data)
+}
+
+func assertTransactionRetained(t *testing.T, store *Store) {
+	t.Helper()
+	state, err := store.Load()
+	if err != nil {
+		t.Fatalf("load transaction state: %v", err)
+	}
+	if state.Transaction == nil {
+		t.Fatal("transaction journal was cleared before all recovery directories synced")
+	}
 }
