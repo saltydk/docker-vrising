@@ -84,6 +84,60 @@ func TestResolveDeduplicatesBepInEx(t *testing.T) {
 	}
 }
 
+func TestResolveAcceptsMetadataWithoutFileSize(t *testing.T) {
+	server := newThunderstoreServer(t, fixtureResponses(t))
+	defer server.Close()
+
+	graph, err := (&Thunderstore{BaseURL: server.URL, Client: server.Client()}).Resolve(t.Context(), RootSelection{
+		Namespace: "odjit", Name: "KindredCommands", Version: "2.5.8",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, pkg := range graph.Packages {
+		if pkg.FileSize != 0 {
+			t.Fatalf("%s FileSize = %d, want 0 when metadata omits file_size", pkg.FullName, pkg.FileSize)
+		}
+	}
+}
+
+func TestResolvePreservesReportedMetadataFileSize(t *testing.T) {
+	responses := fixtureResponses(t)
+	rootPath := thunderstoreAPIPath + "odjit/KindredCommands/2.5.8/"
+	responses[rootPath] = changeMetadata(t, responses[rootPath], func(metadata map[string]any) {
+		metadata["file_size"] = 1384283
+	})
+	server := newThunderstoreServer(t, responses)
+	defer server.Close()
+
+	graph, err := (&Thunderstore{BaseURL: server.URL, Client: server.Client()}).Resolve(t.Context(), RootSelection{
+		Namespace: "odjit", Name: "KindredCommands", Version: "2.5.8",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := graph.Packages[2].FileSize; got != 1384283 {
+		t.Fatalf("KindredCommands FileSize = %d, want 1384283", got)
+	}
+}
+
+func TestResolveRejectsNegativeFileSize(t *testing.T) {
+	responses := fixtureResponses(t)
+	rootPath := thunderstoreAPIPath + "odjit/KindredCommands/2.5.8/"
+	responses[rootPath] = changeMetadata(t, responses[rootPath], func(metadata map[string]any) {
+		metadata["file_size"] = -1
+	})
+	server := newThunderstoreServer(t, responses)
+	defer server.Close()
+
+	_, err := (&Thunderstore{BaseURL: server.URL, Client: server.Client()}).Resolve(t.Context(), RootSelection{
+		Namespace: "odjit", Name: "KindredCommands", Version: "2.5.8",
+	})
+	if err == nil || !strings.Contains(err.Error(), "negative file size") {
+		t.Fatalf("Resolve() error = %v, want negative file size", err)
+	}
+}
+
 func TestResolveRejectsConflictingExactVersions(t *testing.T) {
 	responses := fixtureResponses(t)
 	responses[thunderstoreAPIPath+"odjit/KindredCommands/2.5.8/"] = changeMetadata(t, responses[thunderstoreAPIPath+"odjit/KindredCommands/2.5.8/"], func(metadata map[string]any) {

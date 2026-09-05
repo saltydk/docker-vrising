@@ -195,8 +195,8 @@ func validateMetadata(ref PackageRef, metadata packageMetadata) error {
 	if !metadata.IsActive {
 		return fmt.Errorf("package %s is inactive", packageVersionFullName(ref))
 	}
-	if metadata.FileSize <= 0 {
-		return fmt.Errorf("package %s has non-positive file size", packageVersionFullName(ref))
+	if metadata.FileSize < 0 {
+		return fmt.Errorf("package %s has negative file size", packageVersionFullName(ref))
 	}
 	downloadURL, err := url.Parse(metadata.DownloadURL)
 	if err != nil || downloadURL.Scheme != "https" || downloadURL.Host == "" {
