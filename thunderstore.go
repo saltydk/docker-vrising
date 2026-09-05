@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -50,14 +51,14 @@ type Thunderstore struct {
 }
 
 type packageMetadata struct {
-	Namespace    string   `json:"namespace"`
-	Name         string   `json:"name"`
-	Version      string   `json:"version_number"`
-	FullName     string   `json:"full_name"`
-	Dependencies []string `json:"dependencies"`
-	DownloadURL  string   `json:"download_url"`
-	FileSize     int64    `json:"file_size"`
-	IsActive     bool     `json:"is_active"`
+	Namespace    string              `json:"namespace"`
+	Name         string              `json:"name"`
+	Version      string              `json:"version_number"`
+	FullName     string              `json:"full_name"`
+	Dependencies packageDependencies `json:"dependencies"`
+	DownloadURL  string              `json:"download_url"`
+	FileSize     int64               `json:"file_size"`
+	IsActive     bool                `json:"is_active"`
 }
 
 type packageResponse struct {
@@ -92,6 +93,9 @@ func (t *Thunderstore) Resolve(ctx context.Context, selection RootSelection) (Re
 func validateRootSelection(selection RootSelection) error {
 	if selection.Namespace == "" || selection.Name == "" {
 		return fmt.Errorf("root namespace and name are required")
+	}
+	if selection.Version == "latest" && (selection.Namespace != "odjit" || selection.Name != "KindredCommands") {
+		return fmt.Errorf("latest is only supported for odjit/KindredCommands")
 	}
 	if selection.Version != "latest" && !semanticVersion.MatchString(selection.Version) {
 		return fmt.Errorf("root version must be latest or a semantic version")
@@ -152,8 +156,8 @@ func (r *graphResolver) visit(ctx context.Context, ref PackageRef) error {
 		return err
 	}
 
-	dependencies := make([]PackageRef, 0, len(metadata.Dependencies))
-	for _, dependency := range metadata.Dependencies {
+	dependencies := make([]PackageRef, 0, len(metadata.Dependencies.values))
+	for _, dependency := range metadata.Dependencies.values {
 		parsed, err := parseDependency(dependency)
 		if err != nil {
 			return fmt.Errorf("parse dependency for %s: %w", packageVersionFullName(ref), err)
@@ -195,6 +199,9 @@ func validateMetadata(ref PackageRef, metadata packageMetadata) error {
 	if !metadata.IsActive {
 		return fmt.Errorf("package %s is inactive", packageVersionFullName(ref))
 	}
+	if !metadata.Dependencies.present || metadata.Dependencies.null {
+		return fmt.Errorf("package %s dependencies must be a non-null JSON array", packageVersionFullName(ref))
+	}
 	if metadata.FileSize < 0 {
 		return fmt.Errorf("package %s has negative file size", packageVersionFullName(ref))
 	}
@@ -203,6 +210,22 @@ func validateMetadata(ref PackageRef, metadata packageMetadata) error {
 		return fmt.Errorf("package %s has non-HTTPS download URL", packageVersionFullName(ref))
 	}
 	return nil
+}
+
+type packageDependencies struct {
+	values  []string
+	present bool
+	null    bool
+}
+
+func (d *packageDependencies) UnmarshalJSON(data []byte) error {
+	d.present = true
+	d.null = bytes.Equal(bytes.TrimSpace(data), []byte("null"))
+	if d.null {
+		d.values = nil
+		return nil
+	}
+	return json.Unmarshal(data, &d.values)
 }
 
 func (t *Thunderstore) getJSON(ctx context.Context, endpoint string, target any) error {

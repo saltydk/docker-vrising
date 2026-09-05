@@ -66,6 +66,21 @@ func TestResolvePinnedKindredSkipsLatestEndpoint(t *testing.T) {
 	}
 }
 
+func TestResolveRejectsLatestForAnotherRootBeforeRequest(t *testing.T) {
+	server := newThunderstoreServer(t, fixtureResponses(t))
+	defer server.Close()
+
+	_, err := (&Thunderstore{BaseURL: server.URL, Client: server.Client()}).Resolve(t.Context(), RootSelection{
+		Namespace: "deca", Name: "VampireCommandFramework", Version: "latest",
+	})
+	if err == nil || !strings.Contains(err.Error(), "latest is only supported") {
+		t.Fatalf("Resolve() error = %v, want restricted latest selection", err)
+	}
+	if got := server.requests(); len(got) != 0 {
+		t.Fatalf("resolver made requests before rejecting latest selection: %v", got)
+	}
+}
+
 func TestResolveDeduplicatesBepInEx(t *testing.T) {
 	server := newThunderstoreServer(t, fixtureResponses(t))
 	defer server.Close()
@@ -135,6 +150,40 @@ func TestResolveRejectsNegativeFileSize(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "negative file size") {
 		t.Fatalf("Resolve() error = %v, want negative file size", err)
+	}
+}
+
+func TestResolveRejectsOmittedDependenciesMetadata(t *testing.T) {
+	responses := fixtureResponses(t)
+	rootPath := thunderstoreAPIPath + "odjit/KindredCommands/2.5.8/"
+	responses[rootPath] = changeMetadata(t, responses[rootPath], func(metadata map[string]any) {
+		delete(metadata, "dependencies")
+	})
+	server := newThunderstoreServer(t, responses)
+	defer server.Close()
+
+	_, err := (&Thunderstore{BaseURL: server.URL, Client: server.Client()}).Resolve(t.Context(), RootSelection{
+		Namespace: "odjit", Name: "KindredCommands", Version: "2.5.8",
+	})
+	if err == nil || !strings.Contains(err.Error(), "dependencies must be a non-null JSON array") {
+		t.Fatalf("Resolve() error = %v, want omitted dependencies rejection", err)
+	}
+}
+
+func TestResolveRejectsNullDependenciesMetadata(t *testing.T) {
+	responses := fixtureResponses(t)
+	rootPath := thunderstoreAPIPath + "odjit/KindredCommands/2.5.8/"
+	responses[rootPath] = changeMetadata(t, responses[rootPath], func(metadata map[string]any) {
+		metadata["dependencies"] = nil
+	})
+	server := newThunderstoreServer(t, responses)
+	defer server.Close()
+
+	_, err := (&Thunderstore{BaseURL: server.URL, Client: server.Client()}).Resolve(t.Context(), RootSelection{
+		Namespace: "odjit", Name: "KindredCommands", Version: "2.5.8",
+	})
+	if err == nil || !strings.Contains(err.Error(), "dependencies must be a non-null JSON array") {
+		t.Fatalf("Resolve() error = %v, want null dependencies rejection", err)
 	}
 }
 
