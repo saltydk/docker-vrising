@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -205,6 +206,56 @@ func TestSteamRemoteMetadataRejectsAmbiguousVDF(t *testing.T) {
 			}
 			assertCommandSpecs(t, runner.specs, remoteSteamSpec(client))
 		})
+	}
+}
+
+func TestSteamRemoteMetadataRejectsEscapedRawControlBytes(t *testing.T) {
+	controls := []struct {
+		name  string
+		value byte
+	}{
+		{name: "nul", value: 0x00},
+		{name: "tab", value: '\t'},
+		{name: "line feed", value: '\n'},
+		{name: "carriage return", value: '\r'},
+		{name: "unit separator", value: 0x1f},
+	}
+
+	for _, control := range controls {
+		t.Run(control.name, func(t *testing.T) {
+			fixture := readSteamFixture(t, "app-info-public.txt")
+			replacement := append([]byte("V Rising\\"), control.value)
+			replacement = append(replacement, []byte(" Dedicated Server")...)
+			output := bytes.Replace(fixture, []byte("V Rising Dedicated Server"), replacement, 1)
+			runner := &recordingCommandRunner{results: []commandRun{{result: CommandResult{Stdout: output}}}}
+			client := newTestSteamClient(t, runner)
+
+			if _, err := client.RemoteBuild(t.Context()); err == nil {
+				t.Fatalf("RemoteBuild() accepted escaped raw control byte 0x%02x", control.value)
+			}
+			assertCommandSpecs(t, runner.specs, remoteSteamSpec(client))
+		})
+	}
+}
+
+func TestSteamRemoteMetadataAcceptsSupportedTextualEscapes(t *testing.T) {
+	for _, replacement := range [][]byte{
+		[]byte("V Rising \\\\ Dedicated Server"),
+		[]byte("V Rising \\\"Dedicated\\\" Server"),
+	} {
+		fixture := readSteamFixture(t, "app-info-public.txt")
+		output := bytes.Replace(fixture, []byte("V Rising Dedicated Server"), replacement, 1)
+		runner := &recordingCommandRunner{results: []commandRun{{result: CommandResult{Stdout: output}}}}
+		client := newTestSteamClient(t, runner)
+
+		got, err := client.RemoteBuild(t.Context())
+		if err != nil {
+			t.Fatalf("RemoteBuild() error = %v", err)
+		}
+		if got != testSteamBuild("public") {
+			t.Fatalf("RemoteBuild() = %#v, want public build", got)
+		}
+		assertCommandSpecs(t, runner.specs, remoteSteamSpec(client))
 	}
 }
 

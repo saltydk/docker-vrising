@@ -615,6 +615,9 @@ func (p *vdfParser) readString() (string, error) {
 		}
 		escaped := p.data[p.position]
 		p.position++
+		if escaped < 0x20 {
+			return "", fmt.Errorf("raw control byte after VDF escape")
+		}
 		switch escaped {
 		case '"', '\\':
 			value.WriteByte(escaped)
