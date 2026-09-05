@@ -8,12 +8,45 @@ for command in docker jq openssl sha256sum stat timeout; do
   command -v "$command" >/dev/null 2>&1 || { echo "required command is unavailable: $command" >&2; exit 1; }
 done
 
-test_root=$(mktemp -d "${TMPDIR:-/tmp}/docker-vrising-fixture.XXXXXX")
+fixture_tmp_parent=${TMPDIR:-/tmp}
+test_root=
+suite_token=
+suite_label=
+network_name=
+sidecar_name=
+controller_name=
+
+cleanup() {
+  if [[ -n ${controller_name:-} ]]; then
+    docker rm -fv "$controller_name" >/dev/null 2>&1 || true
+  fi
+  if [[ -n ${sidecar_name:-} ]]; then
+    docker rm -fv "$sidecar_name" >/dev/null 2>&1 || true
+  fi
+  if [[ -n ${suite_label:-} ]]; then
+    local -a labeled_containers=()
+    mapfile -t labeled_containers < <(docker ps -aq --filter "label=$suite_label" 2>/dev/null || true)
+    if (( ${#labeled_containers[@]} > 0 )); then
+      docker rm -fv "${labeled_containers[@]}" >/dev/null 2>&1 || true
+    fi
+  fi
+  if [[ -n ${network_name:-} ]]; then
+    docker network rm "$network_name" >/dev/null 2>&1 || true
+  fi
+  if [[ -n ${test_root:-} && -d $test_root && ! -L $test_root ]]; then
+    case $test_root in
+      "$fixture_tmp_parent"/docker-vrising-fixture.*) rm -rf -- "$test_root" ;;
+    esac
+  fi
+}
+
+test_root=$(mktemp -d "$fixture_tmp_parent/docker-vrising-fixture.XXXXXX")
 case $test_root in
-  "${TMPDIR:-/tmp}"/docker-vrising-fixture.*) ;;
+  "$fixture_tmp_parent"/docker-vrising-fixture.*) ;;
   *) echo "refusing unsafe temporary root: $test_root" >&2; exit 1 ;;
 esac
 [[ -d $test_root && ! -L $test_root ]] || { echo "invalid temporary root: $test_root" >&2; exit 1; }
+trap cleanup EXIT INT TERM
 
 suite_token=vrising-fixture-$(openssl rand -hex 8)
 label_key=com.saltydk.docker-vrising.fixture-suite
@@ -29,21 +62,6 @@ probe_server_dir=$test_root/probe-server
 probe_data_dir=$test_root/probe-persistentdata
 mkdir -p "$server_dir" "$data_dir" "$record_dir" "$tls_dir" \
   "$probe_server_dir/.docker-vrising/home" "$probe_data_dir"
-
-cleanup() {
-  local -a containers=()
-  mapfile -t containers < <(docker ps -aq --filter "label=$suite_label" 2>/dev/null || true)
-  if (( ${#containers[@]} > 0 )); then
-    docker rm -fv "${containers[@]}" >/dev/null 2>&1 || true
-  fi
-  docker network rm "$network_name" >/dev/null 2>&1 || true
-  if [[ -n ${test_root:-} && -d $test_root && ! -L $test_root ]]; then
-    case $test_root in
-      "${TMPDIR:-/tmp}"/docker-vrising-fixture.*) rm -rf -- "$test_root" ;;
-    esac
-  fi
-}
-trap cleanup EXIT INT TERM
 
 fail() {
   echo "FAIL: $*" >&2
@@ -96,11 +114,21 @@ validate_tls_fixture() {
 }
 
 expect_reject() {
-  local description=$1
-  shift
-  if "$@" >/dev/null 2>&1; then
-    fail "$description was accepted"
+  local description=$1 expected_stderr=$2 stderr status
+  shift 2
+  set +e
+  stderr=$(timeout --foreground 3s "$@" 2>&1 >/dev/null)
+  status=$?
+  set -e
+  if [[ $status -ne 64 ]]; then
+    echo "fake rejection $description: exit status $status, want 64" >&2
+    return 1
   fi
+  if [[ $stderr != "$expected_stderr" ]]; then
+    echo "fake rejection $description: stderr '$stderr', want '$expected_stderr'" >&2
+    return 1
+  fi
+  return 0
 }
 
 probe_mounts=(
@@ -118,14 +146,14 @@ run_strict_fake_probes() {
   local steam=(+@sSteamCmdForcePlatformType windows +login anonymous +app_info_update 1 +app_info_print 1829350 +quit)
   local wine=(VRisingServer.exe -persistentDataPath /mnt/vrising/persistentdata -logFile "$log")
 
-  expect_reject 'steamcmd extra argument' docker run --rm --name "$suite_token-probe-steam-extra" "${probe_mounts[@]}" \
+  expect_reject 'steamcmd extra argument' 'fake steamcmd: unexpected argv' docker run --rm --name "$suite_token-probe-steam-extra" "${probe_mounts[@]}" \
     --workdir "$home" --env HOME="$home" --entrypoint /fixture/bin/steamcmd "$fixture_image" "${steam[@]}" unexpected
-  expect_reject 'steamcmd missing argument' docker run --rm --name "$suite_token-probe-steam-missing" "${probe_mounts[@]}" \
+  expect_reject 'steamcmd missing argument' 'fake steamcmd: unexpected argv' docker run --rm --name "$suite_token-probe-steam-missing" "${probe_mounts[@]}" \
     --workdir "$home" --env HOME="$home" --entrypoint /fixture/bin/steamcmd "$fixture_image" "${steam[@]:0:8}"
-  expect_reject 'steamcmd reordered arguments' docker run --rm --name "$suite_token-probe-steam-order" "${probe_mounts[@]}" \
+  expect_reject 'steamcmd reordered arguments' 'fake steamcmd: unexpected argv' docker run --rm --name "$suite_token-probe-steam-order" "${probe_mounts[@]}" \
     --workdir "$home" --env HOME="$home" --entrypoint /fixture/bin/steamcmd "$fixture_image" \
     +login anonymous +@sSteamCmdForcePlatformType windows +app_info_update 1 +app_info_print 1829350 +quit
-  expect_reject 'steamcmd wrong HOME' docker run --rm --name "$suite_token-probe-steam-env" "${probe_mounts[@]}" \
+  expect_reject 'steamcmd wrong HOME' 'fake steamcmd: unexpected HOME: /tmp' docker run --rm --name "$suite_token-probe-steam-env" "${probe_mounts[@]}" \
     --workdir "$home" --env HOME=/tmp --entrypoint /fixture/bin/steamcmd "$fixture_image" "${steam[@]}"
 
   local wine_env=(
@@ -133,25 +161,25 @@ run_strict_fake_probes() {
     --env HOME="$home" --env WINEPREFIX=/mnt/vrising/server/.docker-vrising/wineprefix
     --env DISPLAY=:99 --env 'WINEDLLOVERRIDES=winhttp=n,b'
   )
-  expect_reject 'wine64 duplicate argument' docker run --rm --name "$suite_token-probe-wine-duplicate" "${probe_mounts[@]}" \
+  expect_reject 'wine64 duplicate argument' 'fake wine64: unexpected argument count' docker run --rm --name "$suite_token-probe-wine-duplicate" "${probe_mounts[@]}" \
     --workdir /mnt/vrising/server "${wine_env[@]}" --entrypoint /fixture/bin/wine64 "$fixture_image" \
     "${wine[@]}" -logFile "$log"
-  expect_reject 'wine64 wrong cwd' docker run --rm --name "$suite_token-probe-wine-cwd" "${probe_mounts[@]}" \
+  expect_reject 'wine64 wrong cwd' 'fake wine64: unexpected cwd: /' docker run --rm --name "$suite_token-probe-wine-cwd" "${probe_mounts[@]}" \
     --workdir / "${wine_env[@]}" --entrypoint /fixture/bin/wine64 "$fixture_image" "${wine[@]}"
-  expect_reject 'wine64 wrong environment' docker run --rm --name "$suite_token-probe-wine-env" "${probe_mounts[@]}" \
+  expect_reject 'wine64 wrong environment' 'fake wine64: unexpected DISPLAY' docker run --rm --name "$suite_token-probe-wine-env" "${probe_mounts[@]}" \
     --workdir /mnt/vrising/server "${wine_env[@]}" --env DISPLAY=:98 \
     --entrypoint /fixture/bin/wine64 "$fixture_image" "${wine[@]}"
 
-  expect_reject 'Xvfb reordered arguments' docker run --rm --name "$suite_token-probe-xvfb-order" "${probe_mounts[@]}" \
+  expect_reject 'Xvfb reordered arguments' 'fake Xvfb: unexpected argv' docker run --rm --name "$suite_token-probe-xvfb-order" "${probe_mounts[@]}" \
     --workdir / --env FIXTURE_RECORD_DIR=/fixture/records --env FIXTURE_RUN_TOKEN="$token" \
     --entrypoint /fixture/bin/Xvfb "$fixture_image" -screen 0 1024x768x24 -displayfd 3 -nolisten tcp
-  expect_reject 'Xvfb wrong environment' docker run --rm --name "$suite_token-probe-xvfb-env" "${probe_mounts[@]}" \
+  expect_reject 'Xvfb wrong environment' 'fake Xvfb: unexpected record directory' docker run --rm --name "$suite_token-probe-xvfb-env" "${probe_mounts[@]}" \
     --workdir / --env FIXTURE_RECORD_DIR=/wrong --env FIXTURE_RUN_TOKEN="$token" \
     --entrypoint /fixture/bin/Xvfb "$fixture_image" -displayfd 3 -screen 0 1024x768x24 -nolisten tcp
 
-  expect_reject 'wineserver extra argument' docker run --rm --name "$suite_token-probe-wineserver-extra" "${probe_mounts[@]}" \
+  expect_reject 'wineserver extra argument' 'fake wineserver: unexpected argv' docker run --rm --name "$suite_token-probe-wineserver-extra" "${probe_mounts[@]}" \
     --workdir / "${wine_env[@]}" --entrypoint /fixture/bin/wineserver "$fixture_image" -k extra
-  expect_reject 'wineserver wrong environment' docker run --rm --name "$suite_token-probe-wineserver-env" "${probe_mounts[@]}" \
+  expect_reject 'wineserver wrong environment' 'fake wineserver: unexpected WINEPREFIX' docker run --rm --name "$suite_token-probe-wineserver-env" "${probe_mounts[@]}" \
     --workdir / "${wine_env[@]}" --env WINEPREFIX=/wrong --entrypoint /fixture/bin/wineserver "$fixture_image" -k
   docker run --rm --name "$suite_token-probe-wineserver-valid" "${probe_mounts[@]}" \
     --workdir / "${wine_env[@]}" --entrypoint /fixture/bin/wineserver "$fixture_image" -k >/dev/null
