@@ -3,19 +3,22 @@ package main
 import (
 	"archive/zip"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"os"
 	"path"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -32,7 +35,16 @@ type ArchiveCache struct {
 	Attempts int
 	Timeout  time.Duration
 	Backoff  func(context.Context, time.Duration) error
+
+	cacheFilesystemHook func(archiveCacheHookStage, int, string, string) error
 }
+
+type archiveCacheHookStage uint8
+
+const (
+	archiveCacheBeforeValidation archiveCacheHookStage = iota
+	archiveCacheBeforePublication
+)
 
 type ExtractPolicy int
 
@@ -44,6 +56,31 @@ const (
 type ExtractedArchive struct {
 	Manifest PackageRef
 	Files    []string
+}
+
+// ValidatedArchive owns the verified archive descriptor returned by Fetch.
+// The caller must close it after the last extraction attempt.
+type ValidatedArchive struct {
+	mu     sync.Mutex
+	file   *os.File
+	locked LockedPackage
+}
+
+func (a *ValidatedArchive) LockedPackage() LockedPackage {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return cloneLockedPackage(a.locked)
+}
+
+func (a *ValidatedArchive) Close() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.file == nil {
+		return nil
+	}
+	err := a.file.Close()
+	a.file = nil
+	return err
 }
 
 type archiveManifest struct {
@@ -61,32 +98,46 @@ type archiveEntry struct {
 	outputPath  string
 }
 
-func (c *ArchiveCache) Fetch(ctx context.Context, pkg ResolvedPackage, prior LockedPackage) (LockedPackage, string, error) {
+type transientArchiveDownloadError struct {
+	err error
+}
+
+func (e *transientArchiveDownloadError) Error() string {
+	return e.err.Error()
+}
+
+func (e *transientArchiveDownloadError) Unwrap() error {
+	return e.err
+}
+
+func (c *ArchiveCache) Fetch(ctx context.Context, pkg ResolvedPackage, prior LockedPackage) (*ValidatedArchive, error) {
 	if err := validateResolvedArchivePackage(pkg); err != nil {
-		return LockedPackage{}, "", err
+		return nil, err
 	}
 	if err := validatePriorLockedPackage(pkg, prior); err != nil {
-		return LockedPackage{}, "", err
+		return nil, err
 	}
 
 	cacheRoot, err := openDirectoryPath(c.Dir, true)
 	if err != nil {
-		return LockedPackage{}, "", fmt.Errorf("open archive cache: %w", err)
+		return nil, fmt.Errorf("open archive cache: %w", err)
 	}
 	defer unix.Close(cacheRoot)
-
-	archiveName := pkg.FullName + ".zip"
-	if _, err := relativePathParts(archiveName); err != nil {
-		return LockedPackage{}, "", fmt.Errorf("invalid cache archive name: %w", err)
+	if err := validateArchiveCacheRoot(cacheRoot); err != nil {
+		return nil, err
 	}
-	archivePath := filepath.Join(c.Dir, archiveName)
 
-	locked, found, err := cachedArchive(cacheRoot, archiveName, pkg, prior)
+	archiveName := packageVersionFullName(pkg.Ref) + ".zip"
+	if _, err := relativePathParts(archiveName); err != nil {
+		return nil, fmt.Errorf("invalid cache archive name: %w", err)
+	}
+
+	archive, found, err := cachedArchive(cacheRoot, archiveName, pkg, prior)
 	if err != nil {
-		return LockedPackage{}, "", err
+		return nil, err
 	}
 	if found {
-		return locked, archivePath, nil
+		return archive, nil
 	}
 
 	requiredSize := uint64(maxUnknownArchive)
@@ -94,17 +145,20 @@ func (c *ArchiveCache) Fetch(ctx context.Context, pkg ResolvedPackage, prior Loc
 		requiredSize = uint64(pkg.FileSize)
 	}
 	if err := requireFilesystemSpace(cacheRoot, requiredSize, "archive cache"); err != nil {
-		return LockedPackage{}, "", err
+		return nil, err
 	}
 
-	temporaryName, temporaryFD, err := createTemporaryFileAt(cacheRoot, archiveName, 0o600)
+	temporaryName, temporaryFD, err := createArchiveTemporaryFileAt(cacheRoot, archiveName)
 	if err != nil {
-		return LockedPackage{}, "", fmt.Errorf("create archive cache temporary file: %w", err)
+		return nil, fmt.Errorf("create archive cache temporary file: %w", err)
 	}
 	temporary := os.NewFile(uintptr(temporaryFD), temporaryName)
 	removeTemporary := true
+	transferOwnership := false
 	defer func() {
-		temporary.Close()
+		if !transferOwnership {
+			temporary.Close()
+		}
 		if removeTemporary {
 			_ = unix.Unlinkat(cacheRoot, temporaryName, 0)
 		}
@@ -112,43 +166,75 @@ func (c *ArchiveCache) Fetch(ctx context.Context, pkg ResolvedPackage, prior Loc
 
 	actualSize, digest, err := c.download(ctx, temporary, pkg)
 	if err != nil {
-		return LockedPackage{}, "", err
+		return nil, err
 	}
 	if err := validateLockedBytes(prior, actualSize, digest); err != nil {
-		return LockedPackage{}, "", err
+		return nil, err
 	}
 	if err := temporary.Sync(); err != nil {
-		return LockedPackage{}, "", fmt.Errorf("sync downloaded archive: %w", err)
+		return nil, fmt.Errorf("sync downloaded archive: %w", err)
 	}
-	validationFD, err := unix.Openat(cacheRoot, temporaryName, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
-	if err != nil {
-		return LockedPackage{}, "", fmt.Errorf("open downloaded archive for validation: %w", err)
+	if c.cacheFilesystemHook != nil {
+		if err := c.cacheFilesystemHook(archiveCacheBeforeValidation, cacheRoot, temporaryName, archiveName); err != nil {
+			return nil, fmt.Errorf("archive cache validation hook: %w", err)
+		}
 	}
-	validationFile := os.NewFile(uintptr(validationFD), temporaryName)
-	validationErr := validatePackageZIP(validationFile, actualSize, pkg.Ref, pkg.Dependencies)
-	closeValidationErr := validationFile.Close()
-	if validationErr != nil {
-		return LockedPackage{}, "", fmt.Errorf("validate downloaded archive: %w", validationErr)
+	if err := validatePackageZIP(temporary, actualSize, pkg.Ref, pkg.Dependencies); err != nil {
+		return nil, fmt.Errorf("validate downloaded archive: %w", err)
 	}
-	if closeValidationErr != nil {
-		return LockedPackage{}, "", fmt.Errorf("close downloaded archive validation file: %w", closeValidationErr)
+	if c.cacheFilesystemHook != nil {
+		if err := c.cacheFilesystemHook(archiveCacheBeforePublication, cacheRoot, temporaryName, archiveName); err != nil {
+			return nil, fmt.Errorf("archive cache publication hook: %w", err)
+		}
 	}
-	if err := temporary.Close(); err != nil {
-		return LockedPackage{}, "", fmt.Errorf("close downloaded archive: %w", err)
+	if err := verifyNamedArchiveIdentity(cacheRoot, temporaryName, temporary); err != nil {
+		return nil, fmt.Errorf("verify archive temporary identity: %w", err)
 	}
-	if err := unix.Renameat(cacheRoot, temporaryName, cacheRoot, archiveName); err != nil {
-		return LockedPackage{}, "", fmt.Errorf("rename downloaded archive: %w", err)
+	if err := unix.Renameat2(cacheRoot, temporaryName, cacheRoot, archiveName, unix.RENAME_NOREPLACE); err != nil {
+		return nil, fmt.Errorf("rename downloaded archive: %w", err)
 	}
 	removeTemporary = false
+	if err := verifyNamedArchiveIdentity(cacheRoot, archiveName, temporary); err != nil {
+		_ = unix.Unlinkat(cacheRoot, archiveName, 0)
+		_ = unix.Fsync(cacheRoot)
+		return nil, fmt.Errorf("verify published archive identity: %w", err)
+	}
 	if err := unix.Fsync(cacheRoot); err != nil {
-		return LockedPackage{}, "", fmt.Errorf("sync archive cache: %w", err)
+		return nil, fmt.Errorf("sync archive cache: %w", err)
 	}
 
-	return lockedPackageForArchive(pkg, actualSize, digest), archivePath, nil
+	transferOwnership = true
+	return newValidatedArchive(temporary, lockedPackageForArchive(pkg, actualSize, digest)), nil
+}
+
+func createArchiveTemporaryFileAt(parent int, name string) (string, int, error) {
+	for range 16 {
+		var suffix [8]byte
+		if _, err := rand.Read(suffix[:]); err != nil {
+			return "", -1, fmt.Errorf("create temporary suffix: %w", err)
+		}
+		temporaryName := "." + name + ".tmp-" + hex.EncodeToString(suffix[:])
+		fd, err := unix.Openat(parent, temporaryName, unix.O_RDWR|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
+		if err == unix.EEXIST {
+			continue
+		}
+		if err != nil {
+			return "", -1, err
+		}
+		if err := unix.Fchmod(fd, 0o600); err != nil {
+			unix.Close(fd)
+			unix.Unlinkat(parent, temporaryName, 0)
+			return "", -1, err
+		}
+		return temporaryName, fd, nil
+	}
+	return "", -1, fmt.Errorf("create temporary file: too many collisions")
 }
 
 func validateResolvedArchivePackage(pkg ResolvedPackage) error {
-	if pkg.Ref.Namespace == "" || pkg.Ref.Name == "" || !semanticVersion.MatchString(pkg.Ref.Version) {
+	if !validPackageIdentifier(pkg.Ref.Namespace, false) ||
+		!validPackageIdentifier(pkg.Ref.Name, true) ||
+		!semanticVersion.MatchString(pkg.Ref.Version) {
 		return fmt.Errorf("archive package reference is invalid")
 	}
 	if pkg.FullName != packageVersionFullName(pkg.Ref) {
@@ -159,6 +245,57 @@ func validateResolvedArchivePackage(pkg ResolvedPackage) error {
 	}
 	if pkg.FileSize < 0 {
 		return fmt.Errorf("archive package size is negative")
+	}
+	return nil
+}
+
+func validPackageIdentifier(value string, allowHyphen bool) bool {
+	if value == "" {
+		return false
+	}
+	for _, character := range value {
+		if character >= 'A' && character <= 'Z' ||
+			character >= 'a' && character <= 'z' ||
+			character >= '0' && character <= '9' ||
+			character == '_' || allowHyphen && character == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func validateArchiveCacheRoot(fd int) error {
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		return fmt.Errorf("stat archive cache: %w", err)
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFDIR {
+		return fmt.Errorf("archive cache is not a directory")
+	}
+	if stat.Uid != uint32(os.Geteuid()) {
+		return fmt.Errorf("archive cache is not owned by runtime user")
+	}
+	if stat.Mode&0o7777 != 0o700 {
+		return fmt.Errorf("archive cache mode is %04o, want 0700", stat.Mode&0o7777)
+	}
+	return nil
+}
+
+func verifyNamedArchiveIdentity(root int, name string, file *os.File) error {
+	var held unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &held); err != nil {
+		return err
+	}
+	var named unix.Stat_t
+	if err := unix.Fstatat(root, name, &named, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return err
+	}
+	if held.Mode&unix.S_IFMT != unix.S_IFREG || named.Mode&unix.S_IFMT != unix.S_IFREG {
+		return fmt.Errorf("archive identity is not a regular file")
+	}
+	if held.Dev != named.Dev || held.Ino != named.Ino {
+		return fmt.Errorf("archive pathname does not reference held inode")
 	}
 	return nil
 }
@@ -187,41 +324,50 @@ func hasLockedPackage(pkg LockedPackage) bool {
 	return pkg.Ref != (PackageRef{}) || pkg.FullName != "" || pkg.DownloadURL != "" || pkg.FileSize != 0 || pkg.SHA256 != "" || len(pkg.Dependencies) != 0
 }
 
-func cachedArchive(root int, name string, pkg ResolvedPackage, prior LockedPackage) (LockedPackage, bool, error) {
+func cachedArchive(root int, name string, pkg ResolvedPackage, prior LockedPackage) (*ValidatedArchive, bool, error) {
 	fd, err := unix.Openat(root, name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err == unix.ENOENT {
-		return LockedPackage{}, false, nil
+		return nil, false, nil
 	}
 	if err != nil {
-		return LockedPackage{}, false, fmt.Errorf("open cached archive: %w", err)
+		return nil, false, fmt.Errorf("open cached archive: %w", err)
 	}
 	file := os.NewFile(uintptr(fd), name)
-	defer file.Close()
+	transferOwnership := false
+	defer func() {
+		if !transferOwnership {
+			file.Close()
+		}
+	}()
 
 	var stat unix.Stat_t
 	if err := unix.Fstat(fd, &stat); err != nil {
-		return LockedPackage{}, false, fmt.Errorf("stat cached archive: %w", err)
+		return nil, false, fmt.Errorf("stat cached archive: %w", err)
 	}
 	if stat.Mode&unix.S_IFMT != unix.S_IFREG {
-		return LockedPackage{}, false, fmt.Errorf("cached archive is not a regular file")
+		return nil, false, fmt.Errorf("cached archive is not a regular file")
 	}
 	if stat.Size <= 0 {
-		return LockedPackage{}, false, fmt.Errorf("cached archive size must be positive")
+		return nil, false, fmt.Errorf("cached archive size must be positive")
 	}
 	if pkg.FileSize > 0 && stat.Size != pkg.FileSize {
-		return LockedPackage{}, false, fmt.Errorf("cached archive size %d does not match metadata size %d", stat.Size, pkg.FileSize)
+		return nil, false, fmt.Errorf("cached archive size %d does not match metadata size %d", stat.Size, pkg.FileSize)
 	}
 	digest, err := hashFile(file)
 	if err != nil {
-		return LockedPackage{}, false, fmt.Errorf("hash cached archive: %w", err)
+		return nil, false, fmt.Errorf("hash cached archive: %w", err)
 	}
 	if err := validateLockedBytes(prior, stat.Size, digest); err != nil {
-		return LockedPackage{}, false, err
+		return nil, false, err
 	}
 	if err := validatePackageZIP(file, stat.Size, pkg.Ref, pkg.Dependencies); err != nil {
-		return LockedPackage{}, false, fmt.Errorf("validate cached archive: %w", err)
+		return nil, false, fmt.Errorf("validate cached archive: %w", err)
 	}
-	return lockedPackageForArchive(pkg, stat.Size, digest), true, nil
+	if err := verifyNamedArchiveIdentity(root, name, file); err != nil {
+		return nil, false, fmt.Errorf("verify cached archive identity: %w", err)
+	}
+	transferOwnership = true
+	return newValidatedArchive(file, lockedPackageForArchive(pkg, stat.Size, digest)), true, nil
 }
 
 func hashFile(file *os.File) (string, error) {
@@ -262,23 +408,28 @@ func (c *ArchiveCache) download(ctx context.Context, target *os.File, pkg Resolv
 		}
 		response, err := client.Do(request)
 		if err != nil {
+			requestErr := classifyArchiveRequestError(requestContext, err)
 			cancel()
-			lastErr = fmt.Errorf("download archive: %w", err)
-		} else if response.StatusCode == http.StatusTooManyRequests || response.StatusCode >= http.StatusInternalServerError {
+			if !isTransientArchiveDownload(requestErr) {
+				return 0, "", requestErr
+			}
+			lastErr = requestErr
+		} else if response.StatusCode == http.StatusTooManyRequests ||
+			response.StatusCode >= http.StatusInternalServerError && response.StatusCode <= 599 {
 			_ = response.Body.Close()
 			cancel()
-			lastErr = fmt.Errorf("archive response status %s", response.Status)
+			lastErr = transientArchiveDownload(fmt.Errorf("archive response status %s", response.Status))
 		} else if response.StatusCode != http.StatusOK {
 			_ = response.Body.Close()
 			cancel()
 			return 0, "", fmt.Errorf("archive response status %s", response.Status)
 		} else {
-			actualSize, digest, readErr := readArchiveResponse(response, target, pkg.FileSize)
+			actualSize, digest, readErr := readArchiveResponse(requestContext, response, target, pkg.FileSize)
 			cancel()
 			if readErr == nil {
 				return actualSize, digest, nil
 			}
-			if !isRetryableReadError(readErr) {
+			if !isTransientArchiveDownload(readErr) {
 				return 0, "", readErr
 			}
 			lastErr = readErr
@@ -294,6 +445,43 @@ func (c *ArchiveCache) download(ctx context.Context, target *os.File, pkg Resolv
 	return 0, "", lastErr
 }
 
+func classifyArchiveRequestError(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("download archive: %w", ctxErr)
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("download archive: %w", err)
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return transientArchiveDownload(fmt.Errorf("download archive: %w", err))
+	}
+	var dnsError *net.DNSError
+	if errors.As(err, &dnsError) {
+		if dnsError.IsTimeout || dnsError.IsTemporary {
+			return transientArchiveDownload(fmt.Errorf("download archive: %w", err))
+		}
+		return fmt.Errorf("download archive: %w", err)
+	}
+	var operationError *net.OpError
+	if errors.As(err, &operationError) {
+		return transientArchiveDownload(fmt.Errorf("download archive: %w", err))
+	}
+	var networkError net.Error
+	if errors.As(err, &networkError) && (networkError.Timeout() || networkError.Temporary()) {
+		return transientArchiveDownload(fmt.Errorf("download archive: %w", err))
+	}
+	return fmt.Errorf("download archive: %w", err)
+}
+
+func transientArchiveDownload(err error) error {
+	return &transientArchiveDownloadError{err: err}
+}
+
+func isTransientArchiveDownload(err error) bool {
+	var transient *transientArchiveDownloadError
+	return errors.As(err, &transient)
+}
+
 func resetTemporaryFile(file *os.File) error {
 	if err := file.Truncate(0); err != nil {
 		return fmt.Errorf("truncate archive temporary file: %w", err)
@@ -304,7 +492,7 @@ func resetTemporaryFile(file *os.File) error {
 	return nil
 }
 
-func readArchiveResponse(response *http.Response, target *os.File, metadataSize int64) (int64, string, error) {
+func readArchiveResponse(ctx context.Context, response *http.Response, target *os.File, metadataSize int64) (int64, string, error) {
 	defer response.Body.Close()
 
 	hasContentLength := response.Header.Get("Content-Length") != "" || response.ContentLength > 0
@@ -335,12 +523,35 @@ func readArchiveResponse(response *http.Response, target *os.File, metadataSize 
 		readLimit++
 	}
 	hash := sha256.New()
-	actualSize, err := io.Copy(io.MultiWriter(target, hash), io.LimitReader(response.Body, readLimit))
-	if err != nil {
-		if hasContentLength && actualSize != contentLength {
-			return 0, "", fmt.Errorf("archive actual size %d does not match Content-Length size %d: %w", actualSize, contentLength, err)
+	var actualSize int64
+	reader := io.LimitReader(response.Body, readLimit)
+	buffer := make([]byte, 32*1024)
+	for {
+		read, readErr := reader.Read(buffer)
+		if read > 0 {
+			written, writeErr := target.Write(buffer[:read])
+			if writeErr != nil {
+				return 0, "", fmt.Errorf("write archive temporary file: %w", writeErr)
+			}
+			if written != read {
+				return 0, "", fmt.Errorf("write archive temporary file: %w", io.ErrShortWrite)
+			}
+			_, _ = hash.Write(buffer[:read])
+			actualSize += int64(read)
 		}
-		return 0, "", fmt.Errorf("read archive response: %w", err)
+		if readErr == nil {
+			continue
+		}
+		if errors.Is(readErr, io.EOF) {
+			break
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return 0, "", fmt.Errorf("read archive response: %w", ctxErr)
+		}
+		if hasContentLength && actualSize != contentLength {
+			return 0, "", transientArchiveDownload(fmt.Errorf("archive actual size %d does not match Content-Length size %d: %w", actualSize, contentLength, readErr))
+		}
+		return 0, "", transientArchiveDownload(fmt.Errorf("read archive response: %w", readErr))
 	}
 	if actualSize > limit {
 		if metadataSize == 0 {
@@ -358,10 +569,6 @@ func readArchiveResponse(response *http.Response, target *os.File, metadataSize 
 		return 0, "", fmt.Errorf("archive actual size %d does not match Content-Length size %d", actualSize, contentLength)
 	}
 	return actualSize, hex.EncodeToString(hash.Sum(nil)), nil
-}
-
-func isRetryableReadError(err error) bool {
-	return strings.Contains(err.Error(), "read archive response")
 }
 
 func retryDelay(attempt int) time.Duration {
@@ -409,14 +616,42 @@ func lockedPackageForArchive(pkg ResolvedPackage, size int64, digest string) Loc
 	}
 }
 
-func ExtractArchive(archivePath, destination string, policy ExtractPolicy) (ExtractedArchive, error) {
-	file, size, err := openArchiveFile(archivePath)
+func newValidatedArchive(file *os.File, locked LockedPackage) *ValidatedArchive {
+	return &ValidatedArchive{file: file, locked: cloneLockedPackage(locked)}
+}
+
+func cloneLockedPackage(pkg LockedPackage) LockedPackage {
+	pkg.Dependencies = append([]PackageRef(nil), pkg.Dependencies...)
+	return pkg
+}
+
+func ExtractArchive(archive *ValidatedArchive, destination string, policy ExtractPolicy) (ExtractedArchive, error) {
+	if archive == nil {
+		return ExtractedArchive{}, fmt.Errorf("validated archive is nil")
+	}
+	archive.mu.Lock()
+	defer archive.mu.Unlock()
+	if archive.file == nil {
+		return ExtractedArchive{}, fmt.Errorf("validated archive is closed")
+	}
+	file := archive.file
+	locked := cloneLockedPackage(archive.locked)
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
+		return ExtractedArchive{}, fmt.Errorf("stat validated archive: %w", err)
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Size <= 0 {
+		return ExtractedArchive{}, fmt.Errorf("validated archive is not a non-empty regular file")
+	}
+	digest, err := hashFile(file)
 	if err != nil {
+		return ExtractedArchive{}, fmt.Errorf("hash validated archive: %w", err)
+	}
+	if err := validateLockedBytes(locked, stat.Size, digest); err != nil {
 		return ExtractedArchive{}, err
 	}
-	defer file.Close()
 
-	reader, err := zip.NewReader(file, size)
+	reader, err := zip.NewReader(file, stat.Size)
 	if err != nil {
 		return ExtractedArchive{}, fmt.Errorf("open ZIP archive: %w", err)
 	}
@@ -424,11 +659,7 @@ func ExtractArchive(archivePath, destination string, policy ExtractPolicy) (Extr
 	if err != nil {
 		return ExtractedArchive{}, err
 	}
-	expected, err := archiveReferenceFromPath(archivePath)
-	if err != nil {
-		return ExtractedArchive{}, err
-	}
-	manifest, _, err := readAndValidateManifest(manifestFile, expected, nil, false)
+	manifest, _, err := readAndValidateManifest(manifestFile, locked.Ref, locked.Dependencies, true)
 	if err != nil {
 		return ExtractedArchive{}, err
 	}
@@ -464,35 +695,6 @@ func ExtractArchive(archivePath, destination string, policy ExtractPolicy) (Extr
 	}
 	sort.Strings(files)
 	return ExtractedArchive{Manifest: manifest, Files: files}, nil
-}
-
-func openArchiveFile(archivePath string) (*os.File, int64, error) {
-	if !filepath.IsAbs(archivePath) {
-		return nil, 0, fmt.Errorf("archive path must be absolute")
-	}
-	parent, err := openDirectoryPath(filepath.Dir(archivePath), false)
-	if err != nil {
-		return nil, 0, fmt.Errorf("open archive parent: %w", err)
-	}
-	defer unix.Close(parent)
-	name := filepath.Base(archivePath)
-	if _, err := relativePathParts(name); err != nil {
-		return nil, 0, fmt.Errorf("invalid archive filename: %w", err)
-	}
-	fd, err := unix.Openat(parent, name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
-	if err != nil {
-		return nil, 0, fmt.Errorf("open archive: %w", err)
-	}
-	var stat unix.Stat_t
-	if err := unix.Fstat(fd, &stat); err != nil {
-		unix.Close(fd)
-		return nil, 0, fmt.Errorf("stat archive: %w", err)
-	}
-	if stat.Mode&unix.S_IFMT != unix.S_IFREG {
-		unix.Close(fd)
-		return nil, 0, fmt.Errorf("archive is not a regular file")
-	}
-	return os.NewFile(uintptr(fd), name), stat.Size, nil
 }
 
 func validatePackageZIP(file *os.File, size int64, expected PackageRef, dependencies []PackageRef) error {
@@ -619,18 +821,6 @@ func verifyZIPContents(entries []archiveEntry) error {
 
 func hasWindowsVolumePrefix(name string) bool {
 	return len(name) >= 2 && ((name[0] >= 'A' && name[0] <= 'Z') || (name[0] >= 'a' && name[0] <= 'z')) && name[1] == ':'
-}
-
-func archiveReferenceFromPath(archivePath string) (PackageRef, error) {
-	name := filepath.Base(archivePath)
-	if filepath.Ext(name) != ".zip" {
-		return PackageRef{}, fmt.Errorf("archive filename must end in .zip")
-	}
-	ref, err := parseDependency(strings.TrimSuffix(name, ".zip"))
-	if err != nil {
-		return PackageRef{}, fmt.Errorf("archive filename does not identify a package: %w", err)
-	}
-	return ref, nil
 }
 
 func readAndValidateManifest(file *zip.File, expected PackageRef, expectedDependencies []PackageRef, compareDependencies bool) (PackageRef, []PackageRef, error) {
