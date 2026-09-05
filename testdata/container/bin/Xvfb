@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+printf '%q ' "$0" "$@" >>"${FIXTURE_RECORD_DIR:?}/xvfb.argv"
+printf '\n' >>"$FIXTURE_RECORD_DIR/xvfb.argv"
+
+display_fd=
+previous=
+for argument in "$@"; do
+  if [[ $previous == -displayfd ]]; then
+    display_fd=$argument
+    break
+  fi
+  previous=$argument
+done
+[[ -n $display_fd ]] || { echo 'missing -displayfd' >&2; exit 64; }
+printf '99\n' >&"$display_fd"
+
+printf '%s\n' "$$" >>"$FIXTURE_RECORD_DIR/xvfb.pid"
+trap 'printf "TERM\n" >>"$FIXTURE_RECORD_DIR/xvfb.signals"; exit 0' TERM INT
+while :; do
+  sleep 1 &
+  wait $! || true
+done

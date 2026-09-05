@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+record_dir=/fixture/records
+printf '%q ' "$0" "$@" >>"$record_dir/steamcmd.argv"
+printf '\n' >>"$record_dir/steamcmd.argv"
+
+if [[ " $* " == *' +app_info_print 1829350 '* ]]; then
+	printf '"1829350"\n{\n\t"depots"\n\t{\n\t\t"1829351"\n\t\t{\n\t\t\t"manifests"\n\t\t\t{\n\t\t\t\t"public"\n\t\t\t\t{\n\t\t\t\t\t"gid"\t\t"515151"\n\t\t\t\t}\n\t\t\t}\n\t\t}\n\t\t"branches"\n\t\t{\n\t\t\t"public"\n\t\t\t{\n\t\t\t\t"buildid"\t\t"424242"\n\t\t\t}\n\t\t}\n\t}\n}\n'
+  exit 0
+fi
+
+install_dir=
+previous=
+for argument in "$@"; do
+  if [[ $previous == +force_install_dir ]]; then
+    install_dir=$argument
+    break
+  fi
+  previous=$argument
+done
+
+if [[ " $* " == *' +app_update 1829350 '* ]] && [[ -n $install_dir ]]; then
+  mkdir -p "$install_dir/steamapps"
+  : >"$install_dir/VRisingServer.exe"
+  printf '1604030\n' >"$install_dir/steam_appid.txt"
+  cat >"$install_dir/steamapps/appmanifest_1829350.acf" <<'EOF'
+"AppState"
+{
+    "appid"        "1829350"
+    "buildid"      "424242"
+    "StateFlags"   "4"
+    "InstalledDepots"
+    {
+        "1829351"
+        {
+            "manifest" "515151"
+        }
+    }
+}
+EOF
+  exit 0
+fi
+
+echo "unsupported fake steamcmd invocation" >&2
+exit 64

@@ -1,0 +1,152 @@
+package main
+
+import (
+	"archive/zip"
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"path"
+	"sort"
+	"strings"
+)
+
+type fixtureFile struct {
+	Name string
+	Body string
+}
+
+type fixturePackage struct {
+	Namespace    string
+	Name         string
+	Version      string
+	Dependencies []string
+	Files        []fixtureFile
+}
+
+var packages = []fixturePackage{
+	{Namespace: "BepInEx", Name: "BepInExPack_V_Rising", Version: "1.733.2", Dependencies: []string{}, Files: []fixtureFile{
+		{Name: "BepInExPack_V_Rising/.doorstop_version", Body: "6.0.0\n"},
+		{Name: "BepInExPack_V_Rising/doorstop_config.ini", Body: "[UnityDoorstop]\n"},
+		{Name: "BepInExPack_V_Rising/winhttp.dll", Body: "fixture proxy\n"},
+		{Name: "BepInExPack_V_Rising/dotnet/runtime.dll", Body: "fixture runtime\n"},
+		{Name: "BepInExPack_V_Rising/BepInEx/core/core.dll", Body: "fixture core\n"},
+		{Name: "BepInExPack_V_Rising/BepInEx/patchers/patcher.dll", Body: "fixture patcher\n"},
+		{Name: "BepInExPack_V_Rising/BepInEx/config/BepInEx.cfg", Body: "[Logging.Console]\nEnabled = true\n"},
+	}},
+	{Namespace: "deca", Name: "VampireCommandFramework", Version: "0.10.4", Dependencies: []string{"BepInEx-BepInExPack_V_Rising-1.733.2"}, Files: []fixtureFile{{Name: "VampireCommandFramework.dll", Body: "fixture vcf\n"}}},
+	{Namespace: "odjit", Name: "KindredCommands", Version: "2.5.8", Dependencies: []string{"BepInEx-BepInExPack_V_Rising-1.733.2", "deca-VampireCommandFramework-0.10.4"}, Files: []fixtureFile{{Name: "KindredCommands.dll", Body: "fixture kindred v1\n"}, {Name: "NetTopologySuite.dll", Body: "fixture topology\n"}}},
+	{Namespace: "cheesasaurus", Name: "HookDOTS_API", Version: "1.1.1", Dependencies: []string{"BepInEx-BepInExPack_V_Rising-1.733.2"}, Files: []fixtureFile{{Name: "HookDOTS.API.dll", Body: "fixture hookdots\n"}}},
+	{Namespace: "Team_GreenEye", Name: "Satisvampory", Version: "1.0.85", Dependencies: []string{"BepInEx-BepInExPack_V_Rising-1.733.2", "deca-VampireCommandFramework-0.10.4", "cheesasaurus-HookDOTS_API-1.1.1"}, Files: []fixtureFile{{Name: "plugins/Satisvampory.dll", Body: "fixture satisvampory v1\n"}}},
+}
+
+var updatedPackages = []fixturePackage{
+	{Namespace: "odjit", Name: "KindredCommands", Version: "2.5.9", Dependencies: []string{"BepInEx-BepInExPack_V_Rising-1.733.2", "deca-VampireCommandFramework-0.10.4"}, Files: []fixtureFile{{Name: "KindredCommands.dll", Body: "fixture kindred v2\n"}, {Name: "NetTopologySuite.dll", Body: "fixture topology\n"}}},
+	{Namespace: "Team_GreenEye", Name: "Satisvampory", Version: "1.0.86", Dependencies: []string{"BepInEx-BepInExPack_V_Rising-1.733.2", "deca-VampireCommandFramework-0.10.4", "cheesasaurus-HookDOTS_API-1.1.1"}, Files: []fixtureFile{{Name: "plugins/Satisvampory.dll", Body: "fixture satisvampory v2\n"}}},
+}
+
+func archive(pkg fixturePackage) []byte {
+	var body bytes.Buffer
+	zw := zip.NewWriter(&body)
+	manifest, _ := zw.Create("manifest.json")
+	_ = json.NewEncoder(manifest).Encode(map[string]any{"name": pkg.Name, "version_number": pkg.Version, "website_url": "", "description": "fixture", "dependencies": pkg.Dependencies})
+	files := append([]fixtureFile(nil), pkg.Files...)
+	sort.Slice(files, func(i, j int) bool { return files[i].Name < files[j].Name })
+	for _, fixture := range files {
+		file, _ := zw.Create(fixture.Name)
+		_, _ = file.Write([]byte(fixture.Body))
+	}
+	if pkg.Namespace == "BepInEx" {
+		for i := 0; i < 64; i++ {
+			name := fmt.Sprintf("BepInExPack_V_Rising/BepInEx/patchers/fixture-%02d.dll", i)
+			file, _ := zw.Create(name)
+			_, _ = fmt.Fprintf(file, "fixture patcher %02d\n", i)
+		}
+	}
+	_ = zw.Close()
+	return body.Bytes()
+}
+
+func main() {
+	recordDir := os.Getenv("FIXTURE_RECORD_DIR")
+	if recordDir != "" {
+		_ = os.WriteFile(path.Join(recordDir, "sidecar.argv"), []byte(strings.Join(os.Args, " ")+"\n"), 0o644)
+	}
+	allPackages := append(append([]fixturePackage(nil), packages...), updatedPackages...)
+	archives := make(map[string][]byte, len(allPackages))
+	for _, pkg := range allPackages {
+		archives[pkg.Namespace+"/"+pkg.Name+"/"+pkg.Version] = archive(pkg)
+	}
+
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if recordDir != "" {
+			file, err := os.OpenFile(path.Join(recordDir, "sidecar.requests"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+			if err == nil {
+				_, _ = fmt.Fprintln(file, r.Method, r.URL.RequestURI())
+				_ = file.Close()
+			}
+		}
+
+		selected := packages
+		if _, err := os.Stat(path.Join(recordDir, "updated-packages")); err == nil {
+			selected = append(append([]fixturePackage(nil), packages[:2]...), packages[3])
+			selected = append(selected, updatedPackages...)
+		}
+		for _, pkg := range allPackages {
+			key := pkg.Namespace + "/" + pkg.Name + "/" + pkg.Version
+			body := archives[key]
+			downloadURL := "https://thunderstore.io/package/download/" + key + "/"
+			exactPath := "/api/experimental/package/" + key + "/"
+			if r.URL.Path == exactPath {
+				response := metadata(pkg, downloadURL, body)
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(response)
+				return
+			}
+			if r.URL.Path == "/package/download/"+key+"/" {
+				if _, err := os.Stat(path.Join(recordDir, "corrupt-downloads")); err == nil {
+					body = []byte("corrupt fixture archive")
+				}
+				w.Header().Set("Content-Type", "application/zip")
+				_, _ = w.Write(body)
+				return
+			}
+		}
+		for _, pkg := range selected {
+			latestPath := "/api/experimental/package/" + pkg.Namespace + "/" + pkg.Name + "/"
+			if r.URL.Path != latestPath {
+				continue
+			}
+			key := pkg.Namespace + "/" + pkg.Name + "/" + pkg.Version
+			response := map[string]any{
+				"namespace": pkg.Namespace,
+				"name":      pkg.Name,
+				"full_name": pkg.Namespace + "-" + pkg.Name,
+				"latest":    metadata(pkg, "https://thunderstore.io/package/download/"+key+"/", archives[key]),
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(response)
+			return
+		}
+
+		http.NotFound(w, r)
+	})
+
+	log.Fatal(http.ListenAndServeTLS(":443", "/fixture/tls/server.crt", "/fixture/tls/server.key", nil))
+}
+
+func metadata(pkg fixturePackage, downloadURL string, body []byte) map[string]any {
+	sum := sha256.Sum256(body)
+	return map[string]any{
+		"namespace": pkg.Namespace, "name": pkg.Name, "version_number": pkg.Version,
+		"full_name":    pkg.Namespace + "-" + pkg.Name + "-" + pkg.Version,
+		"dependencies": pkg.Dependencies, "download_url": downloadURL, "file_size": len(body),
+		"is_active": true, "uuid4": "00000000-0000-0000-0000-000000000001",
+		"date_created": "2026-09-05T00:00:00Z", "website_url": "", "description": "fixture",
+		"icon": "", "downloads": 1, "sha256": hex.EncodeToString(sum[:]),
+	}
+}

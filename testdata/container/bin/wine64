@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+printf '%q ' "$0" "$@" >>"${FIXTURE_RECORD_DIR:?}/wine64.argv"
+printf '\n' >>"$FIXTURE_RECORD_DIR/wine64.argv"
+
+server_log=
+persistent_data=
+previous=
+for argument in "$@"; do
+  case $previous in
+    -logFile) server_log=$argument ;;
+    -persistentDataPath) persistent_data=$argument ;;
+  esac
+  previous=$argument
+done
+[[ -n $server_log && -n $persistent_data ]] || { echo 'missing Wine log or persistent-data argument' >&2; exit 64; }
+
+printf 'WINEDLLOVERRIDES=%s\n' "${WINEDLLOVERRIDES-}" >>"$FIXTURE_RECORD_DIR/wine64.env"
+printf '%s\n' "$$" >>"$FIXTURE_RECORD_DIR/wine64.pid"
+
+terminated=false
+on_term() {
+  terminated=true
+  printf 'TERM\n' >>"$FIXTURE_RECORD_DIR/wine64.signals"
+}
+trap on_term TERM INT
+
+mkdir -p "$(dirname "$server_log")" "$PWD/BepInEx"
+sleep 0.5
+printf '%s\n' '2026-09-05T12:00:00Z [Info] [Server] Startup Completed' >>"$server_log"
+if [[ ${MODS_ENABLED:-true} == true ]]; then
+  printf '%s\n' \
+    '[Message:   BepInEx] Chainloader startup complete' \
+    '[Info   :VampireCommandFramework] Plugin gg.deca.VampireCommandFramework version 0.10.4 is loaded!' \
+    "[Info   :KindredCommands] Plugin aa.odjit.KindredCommands version ${FIXTURE_KINDRED_VERSION:-2.5.8} is loaded!" \
+    "[Info   :Satisvampory] Satisvampory ${FIXTURE_SATISVAMPORY_VERSION:-1.0.85} (Satisvampory) ready." \
+    >>"$PWD/BepInEx/LogOutput.log"
+fi
+
+while [[ $terminated == false ]]; do
+  sleep 0.1 &
+  wait $! || true
+done

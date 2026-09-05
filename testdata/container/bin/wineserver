@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+printf '%q ' "$0" "$@" >>"${FIXTURE_RECORD_DIR:?}/wineserver.argv"
+printf '\n' >>"$FIXTURE_RECORD_DIR/wineserver.argv"
+exit 0
