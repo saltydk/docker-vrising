@@ -589,6 +589,41 @@ func TestPrepareOwnershipRejectsInsertionAfterDirectorySnapshot(t *testing.T) {
 	assertOwnershipMarkerAbsent(t, cfg.StateDir)
 }
 
+func TestPrepareOwnershipVerifiesCompletedSubtreesBeforePublication(t *testing.T) {
+	requireRoot(t)
+	cfg := newIdentityTestConfig(t)
+	earlier := filepath.Join(cfg.ServerDir, "a")
+	if err := os.Mkdir(earlier, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	later := filepath.Join(cfg.ServerDir, "z")
+	writeIdentityTestFile(t, later)
+	late := filepath.Join(earlier, "late.txt")
+	cfg.PUID, cfg.PGID = intPointer(testRuntimeUID), intPointer(testRuntimeGID)
+	identity, err := ResolveIdentity(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inserted := false
+	hooks := ownershipHooks{afterEntryInspect: func(mount string, _ int, name string, _ unix.Stat_t) error {
+		if mount != "server" || name != "z" || inserted {
+			return nil
+		}
+		inserted = true
+		return os.WriteFile(late, []byte("late subtree member"), 0o600)
+	}}
+
+	if err := prepareOwnership(cfg, identity, hooks); err == nil {
+		t.Fatal("prepareOwnership accepted a late insertion into a completed subtree")
+	}
+	assertOwnershipMarkerAbsent(t, cfg.StateDir)
+	assertPathOwner(t, late, 0, 0)
+	if err := PrepareOwnership(cfg, identity); err != nil {
+		t.Fatal(err)
+	}
+	assertPathOwner(t, late, identity.UID, identity.GID)
+}
+
 func TestPrepareOwnershipDoesNotPublishAfterFilesystemSyncFailure(t *testing.T) {
 	requireRoot(t)
 	for _, targetMount := range []string{"server", "persistent-data"} {
@@ -630,6 +665,107 @@ func TestPrepareOwnershipDoesNotPublishAfterFilesystemSyncFailure(t *testing.T) 
 			assertPathOwner(t, link, identity.UID, identity.GID)
 		})
 	}
+}
+
+func TestPrepareOwnershipHoldsBarrierDescriptorsFromBeforeFirstChownThroughPublication(t *testing.T) {
+	requireRoot(t)
+	cfg := newIdentityTestConfig(t)
+	writeIdentityTestFile(t, filepath.Join(cfg.ServerDir, "server.txt"))
+	writeIdentityTestFile(t, filepath.Join(cfg.DataDir, "persistent.txt"))
+	cfg.PUID, cfg.PGID = intPointer(testRuntimeUID), intPointer(testRuntimeGID)
+	identity, err := ResolveIdentity(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type barrierIdentity struct {
+		fd       int
+		dev, ino uint64
+		synced   bool
+	}
+	barriers := make(map[string]barrierIdentity)
+	publicationObserved := false
+	hooks := ownershipHooks{
+		barrierOpened: func(mount string, fd int, stat unix.Stat_t) error {
+			barriers[mount] = barrierIdentity{fd: fd, dev: uint64(stat.Dev), ino: stat.Ino}
+			return nil
+		},
+		beforeChown: func(_ string, _ string, _ int) error {
+			if len(barriers) != 2 {
+				return fmt.Errorf("first chown observed before both barrier descriptors")
+			}
+			return nil
+		},
+		syncFilesystem: func(mount string, fd int) error {
+			barrier, ok := barriers[mount]
+			if !ok || fd != barrier.fd {
+				return fmt.Errorf("syncfs descriptor for %s was not the original barrier", mount)
+			}
+			var stat unix.Stat_t
+			if err := unix.Fstat(fd, &stat); err != nil {
+				return err
+			}
+			if uint64(stat.Dev) != barrier.dev || stat.Ino != barrier.ino {
+				return fmt.Errorf("syncfs descriptor for %s changed identity", mount)
+			}
+			barrier.synced = true
+			barriers[mount] = barrier
+			return unix.Syncfs(fd)
+		},
+		beforeMarkerRename: func() error {
+			for mount, barrier := range barriers {
+				var stat unix.Stat_t
+				if err := unix.Fstat(barrier.fd, &stat); err != nil {
+					return fmt.Errorf("barrier descriptor for %s closed before publication: %w", mount, err)
+				}
+				if uint64(stat.Dev) != barrier.dev || stat.Ino != barrier.ino || !barrier.synced {
+					return fmt.Errorf("barrier descriptor for %s was not retained and synced", mount)
+				}
+			}
+			publicationObserved = true
+			return nil
+		},
+	}
+
+	if err := prepareOwnership(cfg, identity, hooks); err != nil {
+		t.Fatal(err)
+	}
+	if !publicationObserved {
+		t.Fatal("marker publication did not observe retained barrier descriptors")
+	}
+}
+
+func TestPrepareOwnershipRejectsDescendantFilesystemCrossing(t *testing.T) {
+	requireRoot(t)
+	cfg := newIdentityTestConfig(t)
+	crossing := filepath.Join(cfg.ServerDir, "crossing")
+	if err := os.Mkdir(crossing, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	nested := filepath.Join(crossing, "nested.txt")
+	writeIdentityTestFile(t, nested)
+	cfg.PUID, cfg.PGID = intPointer(testRuntimeUID), intPointer(testRuntimeGID)
+	identity, err := ResolveIdentity(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hooks := ownershipHooks{entryDevice: func(mount, name string, actual uint64) uint64 {
+		if mount == "server" && (name == "crossing" || strings.HasPrefix(name, "crossing/")) {
+			return actual ^ 1
+		}
+		return actual
+	}}
+
+	if err := prepareOwnership(cfg, identity, hooks); err == nil {
+		t.Fatal("prepareOwnership accepted a descendant filesystem crossing")
+	}
+	assertPathOwner(t, crossing, 0, 0)
+	assertPathOwner(t, nested, 0, 0)
+	assertOwnershipMarkerAbsent(t, cfg.StateDir)
+	if err := PrepareOwnership(cfg, identity); err != nil {
+		t.Fatal(err)
+	}
+	assertPathOwner(t, crossing, identity.UID, identity.GID)
+	assertPathOwner(t, nested, identity.UID, identity.GID)
 }
 
 func TestPrepareOwnershipDoesNotPublishAfterRegularFileSyncFailure(t *testing.T) {
