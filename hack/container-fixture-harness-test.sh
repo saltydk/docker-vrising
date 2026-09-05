@@ -9,7 +9,7 @@ fail() {
   exit 1
 }
 
-test_rejection_helper() {
+run_rejection_helper_cases() {
   # Exercise the function body that the container driver actually uses.
   # shellcheck disable=SC1090
   source <(awk '/^expect_reject\(\)/ { capture=1 } capture { print } capture && /^}/ { exit }' "$fixture_script")
@@ -22,12 +22,48 @@ test_rejection_helper() {
   if expect_reject wrong-stderr expected-token bash -c 'echo unrelated >&2; exit 64' >/dev/null 2>&1; then
     fail 'wrong fake stderr was accepted'
   fi
+  if expect_reject success expected-token bash -c 'echo expected-token >&2; exit 0' >/dev/null 2>&1; then
+    fail 'successful command was accepted as a fake rejection'
+  fi
+  if expect_reject crash expected-token bash -c 'echo expected-token >&2; kill -SEGV $$' >/dev/null 2>&1; then
+    fail 'crashed command was accepted as a fake rejection'
+  fi
 
   started=$SECONDS
-  if expect_reject timeout expected-token bash -c 'sleep 30' >/dev/null 2>&1; then
+  # The child shell, not this shell, expands its PID-file environment.
+  # shellcheck disable=SC2016
+  if expect_reject timeout expected-token bash -c '
+    printf "%s\n" "$$" >"${TERM_IGNORE_PID_FILE:?}"
+    trap "" TERM
+    while :; do sleep 1; done
+  ' >/dev/null 2>&1; then
     fail 'timeout was accepted as a fake rejection'
   fi
   (( SECONDS - started < 5 )) || fail 'rejection helper did not bound a long-lived command'
+}
+
+test_rejection_helper() {
+  local child_pid inner_timeout_pid output pid_file status
+  pid_file=$(mktemp "${TMPDIR:-/tmp}/docker-vrising-term-ignore.XXXXXX")
+  set +e
+  output=$(TERM_IGNORE_PID_FILE=$pid_file timeout --kill-after=1s 6s bash "$0" rejection-inner 2>&1)
+  status=$?
+  set -e
+  if [[ -s $pid_file ]]; then
+    child_pid=$(<"$pid_file")
+    inner_timeout_pid=$(ps -o ppid= -p "$child_pid" 2>/dev/null | tr -d ' ' || true)
+    if [[ $child_pid =~ ^[0-9]+$ ]]; then
+      kill -KILL "$child_pid" 2>/dev/null || true
+    fi
+    if [[ $inner_timeout_pid =~ ^[0-9]+$ ]]; then
+      kill -KILL "$inner_timeout_pid" 2>/dev/null || true
+    fi
+  fi
+  rm -f -- "$pid_file"
+  if [[ $status -eq 124 || $status -eq 137 ]]; then
+    fail "outer hard timeout fired; inner helper lacks a KILL deadline (status $status)"
+  fi
+  [[ $status -eq 0 ]] || fail "inner rejection test failed with status $status: $output"
 }
 
 test_bootstrap_cleanup() {
@@ -66,10 +102,59 @@ FAKE
   fi
 }
 
+test_docker_cleanup() {
+  local token container network sandbox controlled_tmp output status
+  token=vrising-fixture-cleanup-$$
+  container=$token-controller
+  network=$token-network
+  sandbox=$(mktemp -d "${TMPDIR:-/tmp}/docker-vrising-docker-cleanup.XXXXXX")
+  controlled_tmp=$sandbox/tmp
+  mkdir -p "$controlled_tmp"
+
+  cleanup_docker_test() {
+    local volume
+    docker rm -fv "$container" >/dev/null 2>&1 || true
+    docker network rm "$network" >/dev/null 2>&1 || true
+    while IFS= read -r volume; do
+      if [[ $volume == "$token"* ]]; then
+        docker volume rm -f "$volume" >/dev/null 2>&1 || true
+      fi
+    done < <(docker volume ls -q --filter "name=$token")
+    rm -rf -- "$sandbox"
+  }
+  trap cleanup_docker_test RETURN
+  cleanup_docker_test
+  mkdir -p "$controlled_tmp"
+
+  set +e
+  output=$(timeout --kill-after=1s 8s env \
+    TMPDIR="$controlled_tmp" \
+    CONTAINER_FIXTURE_SUITE_TOKEN=$token \
+    CONTAINER_FIXTURE_TEST_MODE=docker-cleanup \
+    bash "$fixture_script" 2>&1)
+  status=$?
+  set -e
+  [[ $status -ne 0 ]] || fail 'Docker cleanup child unexpectedly succeeded'
+  [[ $status -ne 124 && $status -ne 137 ]] || fail "outer Docker cleanup timeout fired with status $status"
+  grep -Eq 'fake rejection docker cleanup timeout: exit status (124|137), want 64' <<<"$output" \
+    || fail "Docker cleanup child failed for the wrong reason: $output"
+  [[ -z $(docker ps -aq --filter "label=com.saltydk.docker-vrising.fixture-suite=$token") ]] \
+    || fail 'scoped Docker cleanup container remains'
+  [[ -z $(docker network ls -q --filter "label=com.saltydk.docker-vrising.fixture-suite=$token") ]] \
+    || fail 'scoped Docker cleanup network remains'
+  [[ -z $(docker volume ls -q --filter "label=com.saltydk.docker-vrising.fixture-suite=$token") ]] \
+    || fail 'scoped Docker cleanup volume remains'
+  if find "$controlled_tmp" -mindepth 1 -maxdepth 1 -type d -name 'docker-vrising-fixture.*' -print -quit | grep -q .; then
+    fail 'Docker cleanup child left its fixture root'
+  fi
+}
+
 case ${1-} in
   rejection) test_rejection_helper ;;
+  rejection-inner) run_rejection_helper_cases ;;
   cleanup) test_bootstrap_cleanup ;;
-  *) fail 'usage: container-fixture-harness-test.sh rejection|cleanup' ;;
+  docker-cleanup) test_docker_cleanup ;;
+  *) fail 'usage: container-fixture-harness-test.sh rejection|cleanup|docker-cleanup' ;;
 esac
 
 echo "container fixture harness test: PASS ($1)"

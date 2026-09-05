@@ -48,7 +48,8 @@ esac
 [[ -d $test_root && ! -L $test_root ]] || { echo "invalid temporary root: $test_root" >&2; exit 1; }
 trap cleanup EXIT INT TERM
 
-suite_token=vrising-fixture-$(openssl rand -hex 8)
+suite_token=${CONTAINER_FIXTURE_SUITE_TOKEN:-vrising-fixture-$(openssl rand -hex 8)}
+[[ $suite_token =~ ^vrising-fixture-[a-z0-9-]+$ ]] || { echo "invalid fixture suite token: $suite_token" >&2; exit 1; }
 label_key=com.saltydk.docker-vrising.fixture-suite
 suite_label=$label_key=$suite_token
 network_name=$suite_token-network
@@ -117,7 +118,7 @@ expect_reject() {
   local description=$1 expected_stderr=$2 stderr status
   shift 2
   set +e
-  stderr=$(timeout --foreground 3s "$@" 2>&1 >/dev/null)
+  stderr=$(timeout --foreground --kill-after=1s 3s "$@" 2>&1 >/dev/null)
   status=$?
   set -e
   if [[ $status -ne 64 ]]; then
@@ -435,6 +436,25 @@ assert_production_isolation() {
     docker rm -fv "$name" >/dev/null
   done
 }
+
+run_docker_cleanup_probe() {
+  docker network create --internal --label "$suite_label" "$network_name" >/dev/null
+  docker run -d \
+    --name "$controller_name" --label "$suite_label" --network "$network_name" \
+    --mount "type=bind,src=$server_dir,dst=/mnt/vrising/server" \
+    --mount "type=bind,src=$data_dir,dst=/mnt/vrising/persistentdata" \
+    --mount "type=bind,src=$record_dir,dst=/fixture/records" \
+    --mount "type=bind,src=$tls_dir,dst=/fixture/tls,readonly" \
+    --entrypoint /bin/bash "$fixture_image" \
+    -c 'trap "" TERM; while :; do sleep 1; done' >/dev/null
+  assert_bind_mounts "$controller_name"
+  expect_reject 'docker cleanup timeout' 'unreachable fake rejection' docker wait "$controller_name"
+  fail 'Docker cleanup timeout was accepted'
+}
+
+if [[ ${CONTAINER_FIXTURE_TEST_MODE-} == docker-cleanup ]]; then
+  run_docker_cleanup_probe
+fi
 
 assert_zero_suite_resources
 generate_tls_fixture
