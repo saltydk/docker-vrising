@@ -367,6 +367,7 @@ func (f *logFollower) readAvailableContext(ctx context.Context) ([]string, error
 		}
 	}
 
+	queuedLinesStart := len(lines)
 	for _, queued := range f.pendingGenerations {
 		queued.more = false
 		queued.activity = false
@@ -378,13 +379,28 @@ func (f *logFollower) readAvailableContext(ctx context.Context) ([]string, error
 		f.activity = f.activity || queued.activity
 	}
 
+	retiringChanged := false
+	if len(f.pendingGenerations) != 0 && f.file != nil {
+		current, readErr := f.readCurrent(ctx, &remaining)
+		if readErr != nil {
+			return nil, readErr
+		}
+		if f.resetEvidence {
+			queuedLines := append([]string(nil), lines[queuedLinesStart:]...)
+			lines = queuedLines
+			retiringChanged = true
+		} else {
+			lines = append(lines, current...)
+		}
+	}
+
 	if len(f.pendingGenerations) != 0 {
 		head := f.pendingGenerations[0]
 		activeMore := false
 		if f.file != nil {
 			activeMore = f.more
 		}
-		if !activeMore && !head.more && f.observation > head.detectedObservation && !time.Now().Before(head.notBefore) {
+		if !retiringChanged && !activeMore && !head.more && f.observation > head.detectedObservation && !time.Now().Before(head.notBefore) {
 			f.closeActive()
 			f.file = head.file
 			head.file = nil

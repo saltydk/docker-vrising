@@ -200,6 +200,132 @@ func TestReadinessDrainsRotatedOldBacklogBeforeAdoptingReplacement(t *testing.T)
 	}
 }
 
+func TestReadinessRevalidatesRetiringActiveAfterQueuedRead(t *testing.T) {
+	root := t.TempDir()
+	serverLog := filepath.Join(root, "server.log")
+	activeLog := filepath.Join(root, "generation-A.log")
+	writeLog(t, serverLog, "generation A\n")
+	output := newReadinessOutput()
+	detected := make(chan struct{})
+	var detectOnce sync.Once
+	var armed atomic.Bool
+	var appendOnce sync.Once
+	var appendErr error
+	monitor := ReadinessMonitor{
+		ServerLog: serverLog,
+		Output:    output,
+		PollEvery: 5 * time.Millisecond,
+		testHooks: &readinessTestHooks{
+			replacementDetected: func(string) { detectOnce.Do(func() { close(detected) }) },
+			afterReadChunk: func(string) {
+				if armed.Load() {
+					appendOnce.Do(func() {
+						appendErr = appendLogError(activeLog, "[Fatal : BepInEx] active A failed during B read\n")
+					})
+				}
+			},
+		},
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	result := waitForReadiness(monitor, ctx, ExpectedReadiness{})
+	appendUntilObserved(t, serverLog, output.server, result)
+	appendLog(t, serverLog, readLogFixture(t, "server-ready.log"))
+	waitForOutput(t, output, "[Server] Startup Completed", result)
+	if err := os.Rename(serverLog, activeLog); err != nil {
+		t.Fatal(err)
+	}
+	writeLog(t, serverLog, "")
+	select {
+	case <-detected:
+	case err := <-result:
+		t.Fatalf("Wait() returned before B detection: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("generation B was not detected")
+	}
+	armed.Store(true)
+	appendLog(t, serverLog, "generation B adoption data\n")
+
+	err := <-result
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "fatal") {
+		t.Fatalf("Wait() error = %v, want fatal appended to retiring A; output = %q", err, output.String())
+	}
+	if appendErr != nil {
+		t.Fatalf("append A fatal error = %v", appendErr)
+	}
+}
+
+func TestReadinessRevalidationClearsRetiringActiveEvidenceOnTruncate(t *testing.T) {
+	root := t.TempDir()
+	serverLog := filepath.Join(root, "server.log")
+	activeLog := filepath.Join(root, "generation-A.log")
+	writeLog(t, serverLog, "generation A\n")
+	output := newReadinessOutput()
+	detected := make(chan struct{})
+	var detectOnce sync.Once
+	var armed atomic.Bool
+	var truncateOnce sync.Once
+	var truncateErr error
+	truncated := make(chan struct{})
+	monitor := ReadinessMonitor{
+		ServerLog: serverLog,
+		Output:    output,
+		PollEvery: 5 * time.Millisecond,
+		testHooks: &readinessTestHooks{
+			replacementDetected: func(string) { detectOnce.Do(func() { close(detected) }) },
+			afterReadChunk: func(string) {
+				if armed.Load() {
+					truncateOnce.Do(func() {
+						truncateErr = os.WriteFile(activeLog, []byte("truncated retiring A\n"), 0o600)
+						close(truncated)
+					})
+				}
+			},
+		},
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	result := waitForReadiness(monitor, ctx, ExpectedReadiness{})
+	appendUntilObserved(t, serverLog, output.server, result)
+	appendLog(t, serverLog, readLogFixture(t, "server-ready.log"))
+	waitForOutput(t, output, "[Server] Startup Completed", result)
+	if err := os.Rename(serverLog, activeLog); err != nil {
+		t.Fatal(err)
+	}
+	writeLog(t, serverLog, "")
+	select {
+	case <-detected:
+	case err := <-result:
+		t.Fatalf("Wait() returned before B detection: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("generation B was not detected")
+	}
+	armed.Store(true)
+	appendLog(t, serverLog, "generation B adoption data\n")
+	select {
+	case <-truncated:
+	case err := <-result:
+		t.Fatalf("Wait() returned before retiring A truncate hook: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("retiring A truncate hook did not run")
+	}
+	select {
+	case err := <-result:
+		t.Fatalf("Wait() retained readiness from truncated retiring A: %v", err)
+	case <-time.After(40 * time.Millisecond):
+	}
+	if truncateErr != nil {
+		t.Fatalf("truncate A error = %v", truncateErr)
+	}
+	if err := os.Rename(serverLog, serverLog+".generation-B"); err != nil {
+		t.Fatal(err)
+	}
+	writeLog(t, serverLog, readLogFixture(t, "server-ready.log"))
+	if err := <-result; err != nil {
+		t.Fatalf("Wait() error after generation C readiness = %v", err)
+	}
+}
+
 func TestReadinessFinalBarrierRejectsServerFatalAfterModReadyEvidence(t *testing.T) {
 	root := t.TempDir()
 	serverLog := filepath.Join(root, "server.log")
@@ -829,6 +955,7 @@ func TestReadinessInvalidatesBaselinedEvidenceTruncatedDuringRead(t *testing.T) 
 	var armed atomic.Bool
 	var truncateOnce sync.Once
 	var truncateErr error
+	truncated := make(chan struct{})
 	monitor := ReadinessMonitor{
 		ServerLog: serverLog,
 		Output:    output,
@@ -837,6 +964,7 @@ func TestReadinessInvalidatesBaselinedEvidenceTruncatedDuringRead(t *testing.T) 
 			if armed.Load() {
 				truncateOnce.Do(func() {
 					truncateErr = os.WriteFile(serverLog, []byte("truncated baseline\n"), 0o600)
+					close(truncated)
 				})
 			}
 		}},
@@ -847,6 +975,13 @@ func TestReadinessInvalidatesBaselinedEvidenceTruncatedDuringRead(t *testing.T) 
 	appendUntilObserved(t, serverLog, output.server, result)
 	armed.Store(true)
 	appendLog(t, serverLog, readLogFixture(t, "server-ready.log"))
+	select {
+	case <-truncated:
+	case err := <-result:
+		t.Fatalf("Wait() returned before baseline truncate hook: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("baseline truncate hook did not run")
+	}
 	select {
 	case err := <-result:
 		t.Fatalf("Wait() retained evidence from a truncated baseline: %v", err)
