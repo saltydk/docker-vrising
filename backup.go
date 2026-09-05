@@ -48,9 +48,13 @@ type BackupManager struct {
 	BackupDir string
 	Now       func() time.Time
 
-	availableSpace     func(int) (uint64, error)
-	syncDirectory      func(int) error
-	beforeVerification func(int, string) error
+	availableSpace           func(int) (uint64, error)
+	syncDirectory            func(int) error
+	beforeVerification       func(int, string) error
+	afterPublication         func(int, string) error
+	beforePruneDelete        func(int, string) error
+	afterTemporaryCreate     func()
+	beforeVerificationMember func(string)
 }
 
 type backupManifest struct {
@@ -67,19 +71,28 @@ type backupSourceEntry struct {
 	archivePath string
 	stat        unix.Stat_t
 	isDirectory bool
+	payloadHash string
+}
+
+type backupSource struct {
+	root        int
+	sourcePath  string
+	archivePath string
 }
 
 type backupExpectedMember struct {
-	name     string
-	typeflag byte
-	size     int64
-	body     []byte
+	name        string
+	typeflag    byte
+	size        int64
+	body        []byte
+	payloadHash string
 }
 
 type completedBackup struct {
 	name      string
 	createdAt time.Time
 	stat      unix.Stat_t
+	sha256    string
 }
 
 func (m *BackupManager) Create(ctx context.Context, request BackupRequest) (BackupRecord, error) {
@@ -103,17 +116,14 @@ func (m *BackupManager) Create(ctx context.Context, request BackupRequest) (Back
 	}
 	defer unix.Close(serverRoot)
 
-	var entries []backupSourceEntry
-	var sourceBytes uint64
-	for _, source := range []struct {
-		root        int
-		sourcePath  string
-		archivePath string
-	}{
+	sources := []backupSource{
 		{root: dataRoot, sourcePath: "Settings", archivePath: "persistentdata/Settings"},
 		{root: dataRoot, sourcePath: "Saves", archivePath: "persistentdata/Saves"},
 		{root: serverRoot, sourcePath: "BepInEx/config", archivePath: "server/BepInEx/config"},
-	} {
+	}
+	var entries []backupSourceEntry
+	var sourceBytes uint64
+	for _, source := range sources {
 		if err := collectBackupSource(ctx, source.root, source.sourcePath, source.archivePath, &entries, &sourceBytes); err != nil {
 			return BackupRecord{}, err
 		}
@@ -152,23 +162,25 @@ func (m *BackupManager) Create(ctx context.Context, request BackupRequest) (Back
 	if err != nil {
 		return BackupRecord{}, fmt.Errorf("create backup temporary file: %w", err)
 	}
+	temporary := os.NewFile(uintptr(temporaryFD), temporaryName)
+	defer temporary.Close()
 	removeTemporary := true
 	defer func() {
 		if removeTemporary {
-			_ = unix.Unlinkat(backupRoot, temporaryName, 0)
+			_, _ = unlinkBackupNameIfIdentity(backupRoot, temporaryName, temporary)
 		}
 	}()
-	temporary := os.NewFile(uintptr(temporaryFD), temporaryName)
+	if m.afterTemporaryCreate != nil {
+		m.afterTemporaryCreate()
+	}
+	if err := ctx.Err(); err != nil {
+		return BackupRecord{}, err
+	}
 	if err := writeBackupArchive(ctx, temporary, createdAt, manifestBytes, entries); err != nil {
-		temporary.Close()
 		return BackupRecord{}, err
 	}
 	if err := temporary.Sync(); err != nil {
-		temporary.Close()
 		return BackupRecord{}, fmt.Errorf("sync backup temporary file: %w", err)
-	}
-	if err := temporary.Close(); err != nil {
-		return BackupRecord{}, fmt.Errorf("close backup temporary file: %w", err)
 	}
 
 	if m.beforeVerification != nil {
@@ -181,10 +193,22 @@ func (m *BackupManager) Create(ctx context.Context, request BackupRequest) (Back
 		return BackupRecord{}, fmt.Errorf("reopen backup for verification: %w", err)
 	}
 	defer verified.Close()
+	if err := verifyBackupDescriptorIdentity(temporary, verified); err != nil {
+		return BackupRecord{}, fmt.Errorf("verify reopened backup identity: %w", err)
+	}
 	expected := expectedBackupMembers(manifestBytes, entries)
-	digest, size, err := verifyBackupArchive(ctx, verified, expected)
+	digest, size, err := verifyBackupArchiveWithHook(ctx, verified, expected, m.beforeVerificationMember)
 	if err != nil {
 		return BackupRecord{}, fmt.Errorf("verify backup archive: %w", err)
+	}
+	if err := validateBackupSourceSnapshot(ctx, sources, entries, sourceBytes); err != nil {
+		return BackupRecord{}, err
+	}
+	if err := verifyBackupDescriptorIdentity(temporary, verified); err != nil {
+		return BackupRecord{}, fmt.Errorf("recheck backup descriptor identity: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return BackupRecord{}, err
 	}
 	if err := verifyNamedArchiveIdentity(backupRoot, temporaryName, verified); err != nil {
 		return BackupRecord{}, fmt.Errorf("verify backup temporary identity: %w", err)
@@ -193,15 +217,19 @@ func (m *BackupManager) Create(ctx context.Context, request BackupRequest) (Back
 		return BackupRecord{}, fmt.Errorf("publish backup archive: %w", err)
 	}
 	removeTemporary = false
+	if m.afterPublication != nil {
+		if err := m.afterPublication(backupRoot, finalName); err != nil {
+			cleanupErr := m.removePublishedBackupIfIdentity(backupRoot, finalName, verified)
+			return BackupRecord{}, errors.Join(fmt.Errorf("after backup publication: %w", err), cleanupErr)
+		}
+	}
 	if err := verifyNamedArchiveIdentity(backupRoot, finalName, verified); err != nil {
-		_ = unix.Unlinkat(backupRoot, finalName, 0)
-		_ = m.syncBackupDirectory(backupRoot)
-		return BackupRecord{}, fmt.Errorf("verify published backup identity: %w", err)
+		cleanupErr := m.removePublishedBackupIfIdentity(backupRoot, finalName, verified)
+		return BackupRecord{}, errors.Join(fmt.Errorf("verify published backup identity: %w", err), cleanupErr)
 	}
 	if err := m.syncBackupDirectory(backupRoot); err != nil {
-		_ = unix.Unlinkat(backupRoot, finalName, 0)
-		_ = m.syncBackupDirectory(backupRoot)
-		return BackupRecord{}, fmt.Errorf("sync backup directory: %w", err)
+		cleanupErr := m.removePublishedBackupIfIdentity(backupRoot, finalName, verified)
+		return BackupRecord{}, errors.Join(fmt.Errorf("sync backup directory: %w", err), cleanupErr)
 	}
 
 	return BackupRecord{
@@ -212,7 +240,7 @@ func (m *BackupManager) Create(ctx context.Context, request BackupRequest) (Back
 	}, nil
 }
 
-func (m *BackupManager) Prune(retain int) error {
+func (m *BackupManager) Prune(retain int) (retErr error) {
 	if retain < 1 {
 		return fmt.Errorf("backup retention must be at least one")
 	}
@@ -224,6 +252,15 @@ func (m *BackupManager) Prune(retain int) error {
 		return err
 	}
 	defer unix.Close(root)
+	deleted := false
+	defer func() {
+		if !deleted {
+			return
+		}
+		if err := m.syncBackupDirectory(root); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("sync pruned backup directory: %w", err))
+		}
+	}()
 	names, err := backupDirectoryNames(root)
 	if err != nil {
 		return fmt.Errorf("list backup directory: %w", err)
@@ -241,7 +278,22 @@ func (m *BackupManager) Prune(retain int) error {
 		if stat.Mode&unix.S_IFMT != unix.S_IFREG {
 			return fmt.Errorf("recognized backup entry is not a regular file")
 		}
-		backups = append(backups, completedBackup{name: name, createdAt: createdAt, stat: stat})
+		file, err := openBackupRegularAt(root, name)
+		if err != nil {
+			return fmt.Errorf("open completed backup for pruning preflight: %w", err)
+		}
+		digest, opened, hashErr := hashStableBackupFile(file)
+		closeErr := file.Close()
+		if hashErr != nil || closeErr != nil {
+			if hashErr != nil {
+				hashErr = fmt.Errorf("hash completed backup for pruning preflight: %w", hashErr)
+			}
+			return errors.Join(hashErr, closeErr)
+		}
+		if !sameBackupSnapshot(opened, stat) {
+			return fmt.Errorf("completed backup changed during pruning preflight")
+		}
+		backups = append(backups, completedBackup{name: name, createdAt: createdAt, stat: stat, sha256: digest})
 	}
 	sort.Slice(backups, func(i, j int) bool {
 		if backups[i].createdAt.Equal(backups[j].createdAt) {
@@ -253,18 +305,23 @@ func (m *BackupManager) Prune(retain int) error {
 		return nil
 	}
 	for _, backup := range backups[retain:] {
+		if m.beforePruneDelete != nil {
+			if err := m.beforePruneDelete(root, backup.name); err != nil {
+				return fmt.Errorf("before pruning completed backup: %w", err)
+			}
+		}
 		file, err := openBackupRegularAt(root, backup.name)
 		if err != nil {
 			return fmt.Errorf("reopen completed backup for pruning: %w", err)
 		}
-		var held unix.Stat_t
-		if err := unix.Fstat(int(file.Fd()), &held); err != nil {
+		digest, held, err := hashStableBackupFile(file)
+		if err != nil {
 			file.Close()
-			return fmt.Errorf("inspect completed backup for pruning: %w", err)
+			return fmt.Errorf("rehash completed backup for pruning: %w", err)
 		}
-		if !sameBackupIdentity(held, backup.stat) {
+		if !sameBackupSnapshot(held, backup.stat) || digest != backup.sha256 {
 			file.Close()
-			return fmt.Errorf("completed backup changed before pruning")
+			return fmt.Errorf("completed backup content or identity changed before pruning")
 		}
 		if err := verifyNamedArchiveIdentity(root, backup.name, file); err != nil {
 			file.Close()
@@ -274,12 +331,10 @@ func (m *BackupManager) Prune(retain int) error {
 			file.Close()
 			return fmt.Errorf("prune completed backup: %w", err)
 		}
+		deleted = true
 		if err := file.Close(); err != nil {
 			return fmt.Errorf("close pruned backup: %w", err)
 		}
-	}
-	if err := m.syncBackupDirectory(root); err != nil {
-		return fmt.Errorf("sync pruned backup directory: %w", err)
 	}
 	return nil
 }
@@ -411,6 +466,72 @@ func collectBackupDirectory(ctx context.Context, root, directory int, sourcePath
 	return nil
 }
 
+func validateBackupSourceSnapshot(ctx context.Context, sources []backupSource, expected []backupSourceEntry, expectedBytes uint64) error {
+	var current []backupSourceEntry
+	var currentBytes uint64
+	for _, source := range sources {
+		if err := collectBackupSource(ctx, source.root, source.sourcePath, source.archivePath, &current, &currentBytes); err != nil {
+			return fmt.Errorf("revalidate selected backup sources: %w", err)
+		}
+	}
+	sort.Slice(current, func(i, j int) bool { return current[i].archivePath < current[j].archivePath })
+	if currentBytes != expectedBytes || len(current) != len(expected) {
+		return fmt.Errorf("selected backup sources changed after streaming")
+	}
+	for index := range expected {
+		want := expected[index]
+		got := current[index]
+		if got.root != want.root || got.sourcePath != want.sourcePath || got.archivePath != want.archivePath ||
+			got.isDirectory != want.isDirectory || !sameBackupSnapshot(got.stat, want.stat) {
+			return fmt.Errorf("selected backup sources changed after streaming")
+		}
+		if got.isDirectory {
+			continue
+		}
+		digest, err := hashBackupSourceEntry(ctx, got)
+		if err != nil {
+			return fmt.Errorf("rehash selected backup source: %w", err)
+		}
+		if digest != want.payloadHash {
+			return fmt.Errorf("selected backup source payload changed after streaming")
+		}
+	}
+	return nil
+}
+
+func hashBackupSourceEntry(ctx context.Context, entry backupSourceEntry) (string, error) {
+	parent, name, err := openRelativeParent(entry.root, entry.sourcePath, false, nil)
+	if err != nil {
+		return "", err
+	}
+	defer unix.Close(parent)
+	fd, err := unix.Openat(parent, name, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return "", err
+	}
+	file := os.NewFile(uintptr(fd), entry.archivePath)
+	defer file.Close()
+	var before unix.Stat_t
+	if err := unix.Fstat(fd, &before); err != nil {
+		return "", err
+	}
+	if before.Mode&unix.S_IFMT != unix.S_IFREG || !sameBackupSnapshot(before, entry.stat) {
+		return "", fmt.Errorf("selected backup file changed before rehash")
+	}
+	hasher := sha256.New()
+	if _, err := io.CopyN(hasher, contextReader{ctx: ctx, reader: file}, before.Size); err != nil {
+		return "", err
+	}
+	var after unix.Stat_t
+	if err := unix.Fstat(fd, &after); err != nil {
+		return "", err
+	}
+	if !sameBackupSnapshot(after, before) {
+		return "", fmt.Errorf("selected backup file changed while rehashing")
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
 func openBackupDirectoryAt(root int, relativePath string) (int, error) {
 	parent, name, err := openRelativeParent(root, relativePath, false, nil)
 	if err != nil {
@@ -439,6 +560,9 @@ func (m *BackupManager) requireSpace(root int, sourceBytes uint64) error {
 }
 
 func writeBackupArchive(ctx context.Context, target *os.File, createdAt time.Time, manifest []byte, entries []backupSourceEntry) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	gz := gzip.NewWriter(target)
 	gz.Header.ModTime = createdAt
 	gz.Header.OS = 255
@@ -453,11 +577,11 @@ func writeBackupArchive(ctx context.Context, target *os.File, createdAt time.Tim
 	if _, err := tarWriter.Write(manifest); err != nil {
 		return fmt.Errorf("write backup manifest: %w", err)
 	}
-	for _, entry := range entries {
+	for index := range entries {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := writeBackupSourceEntry(tarWriter, entry); err != nil {
+		if err := writeBackupSourceEntry(ctx, tarWriter, &entries[index]); err != nil {
 			return err
 		}
 	}
@@ -470,7 +594,7 @@ func writeBackupArchive(ctx context.Context, target *os.File, createdAt time.Tim
 	return nil
 }
 
-func writeBackupSourceEntry(writer *tar.Writer, entry backupSourceEntry) error {
+func writeBackupSourceEntry(ctx context.Context, writer *tar.Writer, entry *backupSourceEntry) error {
 	header := &tar.Header{
 		Name: entry.archivePath, Mode: int64(entry.stat.Mode & 0o7777),
 		ModTime: time.Unix(entry.stat.Mtim.Sec, entry.stat.Mtim.Nsec).UTC(), Format: tar.FormatPAX,
@@ -515,9 +639,11 @@ func writeBackupSourceEntry(writer *tar.Writer, entry backupSourceEntry) error {
 	if err := writer.WriteHeader(header); err != nil {
 		return fmt.Errorf("write backup file header: %w", err)
 	}
-	if _, err := io.CopyN(writer, file, before.Size); err != nil {
+	hasher := sha256.New()
+	if _, err := io.CopyN(io.MultiWriter(writer, hasher), contextReader{ctx: ctx, reader: file}, before.Size); err != nil {
 		return fmt.Errorf("stream backup file: %w", err)
 	}
+	entry.payloadHash = hex.EncodeToString(hasher.Sum(nil))
 	var after unix.Stat_t
 	if err := unix.Fstat(fd, &after); err != nil {
 		return fmt.Errorf("reinspect backup file: %w", err)
@@ -537,24 +663,37 @@ func expectedBackupMembers(manifest []byte, entries []backupSourceEntry) []backu
 			typeflag = tar.TypeDir
 			size = 0
 		}
-		expected = append(expected, backupExpectedMember{name: entry.archivePath, typeflag: typeflag, size: size})
+		expected = append(expected, backupExpectedMember{
+			name: entry.archivePath, typeflag: typeflag, size: size, payloadHash: entry.payloadHash,
+		})
 	}
 	return expected
 }
 
 func verifyBackupArchive(ctx context.Context, file *os.File, expected []backupExpectedMember) (string, int64, error) {
+	return verifyBackupArchiveWithHook(ctx, file, expected, nil)
+}
+
+func verifyBackupArchiveWithHook(ctx context.Context, file *os.File, expected []backupExpectedMember, beforeMember func(string)) (string, int64, error) {
+	var before unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &before); err != nil {
+		return "", 0, err
+	}
+	if before.Mode&unix.S_IFMT != unix.S_IFREG {
+		return "", 0, fmt.Errorf("backup descriptor is not a regular file")
+	}
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return "", 0, err
 	}
 	hasher := sha256.New()
-	size, err := io.Copy(hasher, file)
+	size, err := io.Copy(hasher, contextReader{ctx: ctx, reader: file})
 	if err != nil {
 		return "", 0, err
 	}
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return "", 0, err
 	}
-	buffered := bufio.NewReader(file)
+	buffered := bufio.NewReader(contextReader{ctx: ctx, reader: file})
 	gz, err := gzip.NewReader(buffered)
 	if err != nil {
 		return "", 0, err
@@ -575,12 +714,19 @@ func verifyBackupArchive(ctx context.Context, file *os.File, expected []backupEx
 			gz.Close()
 			return "", 0, err
 		}
+		if beforeMember != nil {
+			beforeMember(header.Name)
+		}
+		if err := ctx.Err(); err != nil {
+			gz.Close()
+			return "", 0, err
+		}
 		if header.Name != want.name || header.Typeflag != want.typeflag || header.Size != want.size || header.Linkname != "" {
 			gz.Close()
 			return "", 0, fmt.Errorf("backup member list or type does not match manifest")
 		}
 		if want.body != nil {
-			body, err := io.ReadAll(tarReader)
+			body, err := io.ReadAll(contextReader{ctx: ctx, reader: tarReader})
 			if err != nil {
 				gz.Close()
 				return "", 0, err
@@ -591,10 +737,15 @@ func verifyBackupArchive(ctx context.Context, file *os.File, expected []backupEx
 			}
 			continue
 		}
-		written, err := io.Copy(io.Discard, tarReader)
+		payloadHasher := sha256.New()
+		written, err := io.Copy(payloadHasher, contextReader{ctx: ctx, reader: tarReader})
 		if err != nil || written != want.size {
 			gz.Close()
 			return "", 0, fmt.Errorf("read complete backup member: copied %d of %d bytes: %w", written, want.size, err)
+		}
+		if want.payloadHash != "" && hex.EncodeToString(payloadHasher.Sum(nil)) != want.payloadHash {
+			gz.Close()
+			return "", 0, fmt.Errorf("backup member payload digest does not match source")
 		}
 	}
 	if header, err := tarReader.Next(); err != io.EOF {
@@ -604,7 +755,7 @@ func verifyBackupArchive(ctx context.Context, file *os.File, expected []backupEx
 		}
 		return "", 0, err
 	}
-	trailingTarBytes, err := io.Copy(io.Discard, gz)
+	trailingTarBytes, err := io.Copy(io.Discard, contextReader{ctx: ctx, reader: gz})
 	if err != nil {
 		gz.Close()
 		return "", 0, err
@@ -621,6 +772,13 @@ func verifyBackupArchive(ctx context.Context, file *os.File, expected []backupEx
 			return "", 0, fmt.Errorf("backup contains trailing compressed bytes")
 		}
 		return "", 0, err
+	}
+	var after unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &after); err != nil {
+		return "", 0, err
+	}
+	if !sameBackupSnapshot(after, before) {
+		return "", 0, fmt.Errorf("backup changed during verification")
 	}
 	return hex.EncodeToString(hasher.Sum(nil)), size, nil
 }
@@ -653,6 +811,78 @@ func openBackupRegularAt(root int, name string) (*os.File, error) {
 		return nil, fmt.Errorf("is not a regular file")
 	}
 	return os.NewFile(uintptr(fd), name), nil
+}
+
+func hashStableBackupFile(file *os.File) (string, unix.Stat_t, error) {
+	var before unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &before); err != nil {
+		return "", unix.Stat_t{}, err
+	}
+	if before.Mode&unix.S_IFMT != unix.S_IFREG {
+		return "", unix.Stat_t{}, fmt.Errorf("is not a regular file")
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return "", unix.Stat_t{}, err
+	}
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, file); err != nil {
+		return "", unix.Stat_t{}, err
+	}
+	var after unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &after); err != nil {
+		return "", unix.Stat_t{}, err
+	}
+	if !sameBackupSnapshot(after, before) {
+		return "", unix.Stat_t{}, fmt.Errorf("file changed while hashing")
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), after, nil
+}
+
+func verifyBackupDescriptorIdentity(left, right *os.File) error {
+	var leftStat unix.Stat_t
+	if err := unix.Fstat(int(left.Fd()), &leftStat); err != nil {
+		return err
+	}
+	var rightStat unix.Stat_t
+	if err := unix.Fstat(int(right.Fd()), &rightStat); err != nil {
+		return err
+	}
+	if leftStat.Mode&unix.S_IFMT != unix.S_IFREG || rightStat.Mode&unix.S_IFMT != unix.S_IFREG ||
+		!sameBackupIdentity(leftStat, rightStat) {
+		return fmt.Errorf("backup descriptors identify different files")
+	}
+	return nil
+}
+
+func unlinkBackupNameIfIdentity(root int, name string, expected *os.File) (bool, error) {
+	var held unix.Stat_t
+	if err := unix.Fstat(int(expected.Fd()), &held); err != nil {
+		return false, err
+	}
+	var named unix.Stat_t
+	if err := unix.Fstatat(root, name, &named, unix.AT_SYMLINK_NOFOLLOW); errors.Is(err, unix.ENOENT) {
+		return false, nil
+	} else if err != nil {
+		return false, err
+	}
+	if held.Mode&unix.S_IFMT != unix.S_IFREG || named.Mode&unix.S_IFMT != unix.S_IFREG || !sameBackupIdentity(held, named) {
+		return false, nil
+	}
+	if err := unix.Unlinkat(root, name, 0); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (m *BackupManager) removePublishedBackupIfIdentity(root int, name string, expected *os.File) error {
+	removed, err := unlinkBackupNameIfIdentity(root, name, expected)
+	if err != nil || !removed {
+		return err
+	}
+	if err := m.syncBackupDirectory(root); err != nil {
+		return fmt.Errorf("sync backup directory after cleanup: %w", err)
+	}
+	return nil
 }
 
 func backupDirectoryNames(root int) ([]string, error) {
@@ -701,4 +931,16 @@ func (m *BackupManager) syncBackupDirectory(fd int) error {
 		return m.syncDirectory(fd)
 	}
 	return unix.Fsync(fd)
+}
+
+type contextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r contextReader) Read(buffer []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(buffer)
 }

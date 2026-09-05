@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -206,6 +207,134 @@ func TestBackupFailureLeavesExistingBackupsUntouched(t *testing.T) {
 	}
 }
 
+func TestBackupRejectsValidSameSizePayloadSubstitution(t *testing.T) {
+	manager := newBackupTestManager(t)
+	writeBackupTestFile(t, filepath.Join(manager.DataDir, "Saves", "world.save"), "original")
+	manager.beforeVerification = func(root int, name string) error {
+		return rewriteBackupTestMember(root, name, "persistentdata/Saves/world.save", []byte("attacker"))
+	}
+
+	if _, err := manager.Create(t.Context(), BackupRequest{}); err == nil {
+		t.Fatal("Create() accepted a valid archive whose payload changed at the same size")
+	}
+	assertNoCompletedBackup(t, manager.BackupDir)
+}
+
+func TestBackupRejectsTemporaryNameSubstitution(t *testing.T) {
+	manager := newBackupTestManager(t)
+	writeBackupTestFile(t, filepath.Join(manager.DataDir, "Saves", "world.save"), "save")
+	var replacementName string
+	var heldName string
+	manager.beforeVerification = func(root int, name string) error {
+		replacementName = name
+		heldName = name + ".held"
+		if err := unix.Renameat(root, name, root, heldName); err != nil {
+			return err
+		}
+		sourceFD, err := unix.Openat(root, heldName, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+		if err != nil {
+			return err
+		}
+		source := os.NewFile(uintptr(sourceFD), heldName)
+		defer source.Close()
+		replacementFD, err := unix.Openat(root, name, unix.O_RDWR|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
+		if err != nil {
+			return err
+		}
+		replacement := os.NewFile(uintptr(replacementFD), name)
+		if _, err := io.Copy(replacement, source); err != nil {
+			replacement.Close()
+			return err
+		}
+		if err := replacement.Sync(); err != nil {
+			replacement.Close()
+			return err
+		}
+		return replacement.Close()
+	}
+
+	if _, err := manager.Create(t.Context(), BackupRequest{}); err == nil {
+		t.Fatal("Create() accepted a substituted temporary backup name")
+	}
+	assertNoCompletedBackup(t, manager.BackupDir)
+	for _, name := range []string{replacementName, heldName} {
+		if _, err := os.Stat(filepath.Join(manager.BackupDir, name)); err != nil {
+			t.Fatalf("substitution artifact %q was not preserved: %v", name, err)
+		}
+	}
+}
+
+func TestBackupRejectsNewSourceEntryAddedAfterStreaming(t *testing.T) {
+	manager := newBackupTestManager(t)
+	settings := filepath.Join(manager.DataDir, "Settings")
+	writeBackupTestFile(t, filepath.Join(settings, "ServerGameSettings.json"), "settings")
+	manager.beforeVerification = func(int, string) error {
+		return os.WriteFile(filepath.Join(settings, "late.txt"), []byte("late"), 0o600)
+	}
+
+	if _, err := manager.Create(t.Context(), BackupRequest{}); err == nil {
+		t.Fatal("Create() published a snapshot after a new selected source entry appeared")
+	}
+	assertNoCompletedBackup(t, manager.BackupDir)
+}
+
+func TestBackupRejectsInitiallyAbsentSourceAppearingAfterStreaming(t *testing.T) {
+	manager := newBackupTestManager(t)
+	writeBackupTestFile(t, filepath.Join(manager.DataDir, "Settings", "ServerGameSettings.json"), "settings")
+	manager.beforeVerification = func(int, string) error {
+		writeBackupTestFile(t, filepath.Join(manager.DataDir, "Saves", "late.save"), "late")
+		return nil
+	}
+
+	if _, err := manager.Create(t.Context(), BackupRequest{}); err == nil {
+		t.Fatal("Create() published a snapshot after an initially absent selected root appeared")
+	}
+	assertNoCompletedBackup(t, manager.BackupDir)
+}
+
+func TestBackupPreservesUnexpectedFinalNameReplacement(t *testing.T) {
+	manager := newBackupTestManager(t)
+	writeBackupTestFile(t, filepath.Join(manager.DataDir, "Saves", "world.save"), "save")
+	const replacementBody = "operator replacement"
+	var finalName string
+	var heldName string
+	manager.afterPublication = func(root int, name string) error {
+		finalName = name
+		heldName = name + ".held"
+		if err := unix.Renameat(root, name, root, heldName); err != nil {
+			return err
+		}
+		fd, err := unix.Openat(root, name, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
+		if err != nil {
+			return err
+		}
+		file := os.NewFile(uintptr(fd), name)
+		if _, err := file.Write([]byte(replacementBody)); err != nil {
+			file.Close()
+			return err
+		}
+		if err := file.Sync(); err != nil {
+			file.Close()
+			return err
+		}
+		return file.Close()
+	}
+
+	if _, err := manager.Create(t.Context(), BackupRequest{}); err == nil {
+		t.Fatal("Create() accepted a replacement at the published backup name")
+	}
+	got, err := os.ReadFile(filepath.Join(manager.BackupDir, finalName))
+	if err != nil {
+		t.Fatalf("read unexpected final-name replacement: %v", err)
+	}
+	if string(got) != replacementBody {
+		t.Fatalf("unexpected final-name replacement body = %q, want preserved operator bytes", got)
+	}
+	if _, err := os.Stat(filepath.Join(manager.BackupDir, heldName)); err != nil {
+		t.Fatalf("verified backup displaced by replacement was not preserved: %v", err)
+	}
+}
+
 func TestBackupPruneKeepsNewestThree(t *testing.T) {
 	manager := newBackupTestManager(t)
 	writeBackupTestFile(t, filepath.Join(manager.DataDir, "Saves", "world.save"), "save")
@@ -235,6 +364,102 @@ func TestBackupPruneKeepsNewestThree(t *testing.T) {
 	sort.Strings(want)
 	if got := backupTestDirectoryNames(t, manager.BackupDir); !reflect.DeepEqual(got, want) {
 		t.Fatalf("backup directory after prune = %#v, want %#v", got, want)
+	}
+}
+
+func TestBackupPruneSyncsAfterPartialFailureAndJoinsErrors(t *testing.T) {
+	manager := newBackupTestManager(t)
+	writeBackupTestFile(t, filepath.Join(manager.DataDir, "Saves", "world.save"), "save")
+	var records []BackupRecord
+	for minute := range 3 {
+		createdAt := time.Date(2026, 9, 5, 12, minute, 0, 0, time.UTC)
+		manager.Now = func() time.Time { return createdAt }
+		record, err := manager.Create(t.Context(), BackupRequest{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		records = append(records, record)
+	}
+
+	pruneErr := errors.New("injected second prune failure")
+	syncErr := errors.New("injected partial prune sync failure")
+	deleteAttempt := 0
+	manager.beforePruneDelete = func(int, string) error {
+		deleteAttempt++
+		if deleteAttempt == 2 {
+			return pruneErr
+		}
+		return nil
+	}
+	var backupDirectory unix.Stat_t
+	if err := unix.Stat(manager.BackupDir, &backupDirectory); err != nil {
+		t.Fatal(err)
+	}
+	manager.syncDirectory = func(fd int) error {
+		var current unix.Stat_t
+		if err := unix.Fstat(fd, &current); err != nil {
+			return err
+		}
+		if current.Dev == backupDirectory.Dev && current.Ino == backupDirectory.Ino {
+			return syncErr
+		}
+		return unix.Fsync(fd)
+	}
+
+	err := manager.Prune(1)
+	if !errors.Is(err, pruneErr) || !errors.Is(err, syncErr) {
+		t.Fatalf("Prune() error = %v, want operation and directory sync errors", err)
+	}
+	want := []string{filepath.Base(records[0].Path), filepath.Base(records[2].Path)}
+	sort.Strings(want)
+	if got := backupTestDirectoryNames(t, manager.BackupDir); !reflect.DeepEqual(got, want) {
+		t.Fatalf("backup directory after partial prune = %#v, want first deletion durable and second preserved %#v", got, want)
+	}
+}
+
+func TestBackupPrunePreservesBackupChangedBeforeUnlink(t *testing.T) {
+	manager := newBackupTestManager(t)
+	writeBackupTestFile(t, filepath.Join(manager.DataDir, "Saves", "world.save"), "save")
+	var records []BackupRecord
+	for minute := range 2 {
+		createdAt := time.Date(2026, 9, 5, 12, minute, 0, 0, time.UTC)
+		manager.Now = func() time.Time { return createdAt }
+		record, err := manager.Create(t.Context(), BackupRequest{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		records = append(records, record)
+	}
+	const replacement = "changed recognized backup"
+	manager.beforePruneDelete = func(root int, name string) error {
+		fd, err := unix.Openat(root, name, unix.O_WRONLY|unix.O_TRUNC|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+		if err != nil {
+			return err
+		}
+		file := os.NewFile(uintptr(fd), name)
+		if _, err := file.Write([]byte(replacement)); err != nil {
+			file.Close()
+			return err
+		}
+		if err := file.Sync(); err != nil {
+			file.Close()
+			return err
+		}
+		return file.Close()
+	}
+
+	if err := manager.Prune(1); err == nil {
+		t.Fatal("Prune() deleted a recognized backup whose content changed before unlink")
+	}
+	got, err := os.ReadFile(records[0].Path)
+	if err != nil {
+		t.Fatalf("read changed recognized backup: %v", err)
+	}
+	if string(got) != replacement {
+		t.Fatalf("changed recognized backup body = %q, want preserved replacement", got)
+	}
+	if _, err := os.Stat(records[1].Path); err != nil {
+		t.Fatalf("newest retained backup missing: %v", err)
 	}
 }
 
@@ -426,6 +651,54 @@ func TestBackupRejectsCancelledContextBeforeWriting(t *testing.T) {
 	}
 }
 
+func TestBackupCancellationAfterTemporaryCreationLeavesNoArchive(t *testing.T) {
+	manager := newBackupTestManager(t)
+	writeBackupTestFile(t, filepath.Join(manager.DataDir, "Saves", "world.save"), "save")
+	ctx, cancel := context.WithCancel(t.Context())
+	manager.afterTemporaryCreate = func() { cancel() }
+
+	if _, err := manager.Create(ctx, BackupRequest{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Create() error = %v, want cancellation after temporary creation", err)
+	}
+	if got := backupTestDirectoryNames(t, manager.BackupDir); len(got) != 0 {
+		t.Fatalf("backup directory after post-create cancellation = %#v, want empty", got)
+	}
+}
+
+func TestBackupCancellationDuringFinalMemberVerificationLeavesNoArchive(t *testing.T) {
+	manager := newBackupTestManager(t)
+	writeBackupTestFile(t, filepath.Join(manager.DataDir, "Saves", "world.save"), strings.Repeat("save", 1024))
+	ctx, cancel := context.WithCancel(t.Context())
+	manager.beforeVerificationMember = func(name string) {
+		if name == "persistentdata/Saves/world.save" {
+			cancel()
+		}
+	}
+
+	if _, err := manager.Create(ctx, BackupRequest{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Create() error = %v, want cancellation during final-member verification", err)
+	}
+	if got := backupTestDirectoryNames(t, manager.BackupDir); len(got) != 0 {
+		t.Fatalf("backup directory after verification cancellation = %#v, want empty", got)
+	}
+}
+
+func TestBackupRejectsSourceChangeDuringArchiveVerification(t *testing.T) {
+	manager := newBackupTestManager(t)
+	saves := filepath.Join(manager.DataDir, "Saves")
+	writeBackupTestFile(t, filepath.Join(saves, "world.save"), "save")
+	manager.beforeVerificationMember = func(name string) {
+		if name == "persistentdata/Saves/world.save" {
+			writeBackupTestFile(t, filepath.Join(saves, "late.save"), "late")
+		}
+	}
+
+	if _, err := manager.Create(t.Context(), BackupRequest{}); err == nil {
+		t.Fatal("Create() published after selected sources changed during archive verification")
+	}
+	assertNoCompletedBackup(t, manager.BackupDir)
+}
+
 func newBackupTestManager(t *testing.T) BackupManager {
 	t.Helper()
 	root := t.TempDir()
@@ -491,6 +764,80 @@ func readBackupTestArchive(t *testing.T, name string) []backupTestEntry {
 	return entries
 }
 
+func rewriteBackupTestMember(root int, name, target string, replacement []byte) error {
+	fd, err := unix.Openat(root, name, unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	file := os.NewFile(uintptr(fd), name)
+	defer file.Close()
+	gz, err := gzip.NewReader(file)
+	if err != nil {
+		return err
+	}
+	reader := tar.NewReader(gz)
+	type storedEntry struct {
+		header tar.Header
+		body   []byte
+	}
+	var entries []storedEntry
+	found := false
+	for {
+		header, err := reader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			gz.Close()
+			return err
+		}
+		body, err := io.ReadAll(reader)
+		if err != nil {
+			gz.Close()
+			return err
+		}
+		if header.Name == target {
+			if len(body) != len(replacement) {
+				gz.Close()
+				return fmt.Errorf("replacement size %d differs from member size %d", len(replacement), len(body))
+			}
+			body = append([]byte(nil), replacement...)
+			found = true
+		}
+		entries = append(entries, storedEntry{header: *header, body: body})
+	}
+	if err := gz.Close(); err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("member %q not found", target)
+	}
+	if err := file.Truncate(0); err != nil {
+		return err
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	gzWriter := gzip.NewWriter(file)
+	tarWriter := tar.NewWriter(gzWriter)
+	for _, entry := range entries {
+		header := entry.header
+		if err := tarWriter.WriteHeader(&header); err != nil {
+			return err
+		}
+		if _, err := tarWriter.Write(entry.body); err != nil {
+			return err
+		}
+	}
+	if err := tarWriter.Close(); err != nil {
+		return err
+	}
+	if err := gzWriter.Close(); err != nil {
+		return err
+	}
+	return file.Sync()
+}
+
 func backupTestEntryNames(entries []backupTestEntry) []string {
 	names := make([]string, 0, len(entries))
 	for _, entry := range entries {
@@ -514,4 +861,13 @@ func backupTestDirectoryNames(t *testing.T, directory string) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+func assertNoCompletedBackup(t *testing.T, directory string) {
+	t.Helper()
+	for _, name := range backupTestDirectoryNames(t, directory) {
+		if isCompletedBackupName(name) {
+			t.Fatalf("completed backup %q exists after rejected snapshot", name)
+		}
+	}
 }
