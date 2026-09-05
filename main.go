@@ -48,6 +48,18 @@ func runCommand(output io.Writer, _ Config) int {
 }
 
 func healthCommand(output io.Writer) int {
-	fmt.Fprintln(output, "not running")
-	return 1
+	cfg, _, err := LoadConfig(EnvironmentMap(os.Environ()))
+	if err == nil {
+		var state State
+		state, err = (&Store{StateDir: cfg.StateDir}).Load()
+		if err == nil {
+			err = CheckHealth(state, procFSInspector{})
+		}
+	}
+	if err != nil {
+		fmt.Fprintln(output, err)
+		return 1
+	}
+	fmt.Fprintln(output, "healthy")
+	return 0
 }

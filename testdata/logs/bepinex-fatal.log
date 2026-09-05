@@ -1,0 +1,4 @@
+[Message:   BepInEx] Chainloader startup complete
+[Info   :VampireCommandFramework] Plugin gg.deca.VampireCommandFramework version 0.10.4 is loaded!
+[Info   :KindredCommands] Plugin aa.odjit.KindredCommands version 2.5.8 is loaded!
+[Fatal  :Doorstop] CoreCLR initialization failed
