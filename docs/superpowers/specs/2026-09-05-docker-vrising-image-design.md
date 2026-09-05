@@ -100,7 +100,9 @@ The image contains no game or mod binaries. A pinned Go builder image produces
 the control binary; the runtime image contains only the resulting binary and
 runtime dependencies.
 
-Tini is PID 1 and runs **vrisingctl run**. The binary presents one deep runtime
+Tini is PID 1 and runs **vrisingctl run**. After any explicitly requested
+ownership migration, the controller drops to the selected mount identity before
+locking, downloading, backing up, updating, or launching. The binary presents one deep runtime
 interface while hiding update, archive, backup, process, and health mechanics.
 The Go source remains flat by default. Concrete implementations are preferred;
 small internal interfaces exist only at filesystem, HTTP, clock, and subprocess
