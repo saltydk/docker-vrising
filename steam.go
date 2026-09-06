@@ -19,10 +19,11 @@ const (
 )
 
 type CommandSpec struct {
-	Path string
-	Args []string
-	Env  []string
-	Dir  string
+	Path         string
+	Args         []string
+	Env          []string
+	Dir          string
+	StreamOutput bool
 }
 
 type CommandResult struct {
@@ -195,10 +196,11 @@ func (s *SteamClient) updateCommand(branch string) CommandSpec {
 	}
 	args = append(args, "validate", "+quit")
 	return CommandSpec{
-		Path: s.SteamCMD,
-		Args: args,
-		Env:  []string{"HOME=" + s.HomeDir},
-		Dir:  s.HomeDir,
+		Path:         s.SteamCMD,
+		Args:         args,
+		Env:          []string{"HOME=" + s.HomeDir},
+		Dir:          s.HomeDir,
+		StreamOutput: true,
 	}
 }
 
@@ -522,10 +524,14 @@ func remoteVDFRootLine(output []byte, rootName string) (int, int) {
 func validateSteamWrapper(data []byte, beforeRoot bool) error {
 	for _, rawLine := range strings.Split(string(data), "\n") {
 		line := strings.TrimSuffix(rawLine, "\r")
+		line = strings.ReplaceAll(line, "\x1b[0m", "")
+		if strings.ContainsRune(line, '\x1b') {
+			return fmt.Errorf("unrecognized ANSI sequence in SteamCMD console output")
+		}
 		if strings.Trim(line, " \t") == "" {
 			continue
 		}
-		if beforeRoot && isSteamPrefixLine(line) || !beforeRoot && line == "Steam>" {
+		if beforeRoot && isSteamPrefixLine(line) || !beforeRoot && isSteamSuffixLine(line) {
 			continue
 		}
 		return fmt.Errorf("unrecognized SteamCMD console output %q", line)
@@ -537,8 +543,13 @@ func isSteamPrefixLine(line string) bool {
 	switch line {
 	case "[  0%] Checking for available updates...",
 		"[----] Verifying installation...",
+		"UpdateUI: skip show logo",
 		"-- type 'quit' to exit --",
-		"Loading Steam API...OK":
+		"Loading Steam API...OK",
+		`"@sSteamCmdForcePlatformType" = "windows"`,
+		"Connecting anonymously to Steam Public...OK",
+		"Waiting for client config...OK",
+		"Waiting for user info...OK":
 		return true
 	}
 	if quotedConsolePath(line, "Redirecting stderr to ") || quotedConsolePath(line, "Logging directory: ") {
@@ -555,6 +566,10 @@ func isSteamPrefixLine(line string) bool {
 	change, changedAt, ok := strings.Cut(changeAndTime, ", last change : ")
 	left, right, slash := strings.Cut(change, "/")
 	return ok && slash && asciiDigits(left) && asciiDigits(right) && safeConsoleText(changedAt)
+}
+
+func isSteamSuffixLine(line string) bool {
+	return line == "Steam>" || line == "Unloading Steam API...OK"
 }
 
 func quotedConsolePath(line, prefix string) bool {

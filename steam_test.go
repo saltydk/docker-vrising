@@ -136,6 +136,35 @@ func TestParseRemotePublicBuildAndDepot(t *testing.T) {
 	assertCommandSpecs(t, runner.specs, remoteSteamSpec(client))
 }
 
+func TestRemoteBuildAcceptsCurrentSteamConsoleWrapper(t *testing.T) {
+	output := string(readSteamFixture(t, "app-info-public.txt"))
+	output = strings.Replace(output,
+		"[----] Verifying installation...\n",
+		"[----] Verifying installation...\nUpdateUI: skip show logo\n",
+		1,
+	)
+	output = strings.Replace(output,
+		"Loading Steam API...OK\n\nAppID :",
+		"Loading Steam API...\x1b[0mOK\n\x1b[0m\"@sSteamCmdForcePlatformType\" = \"windows\"\n\x1b[0m\n"+
+			"Connecting anonymously to Steam Public...\x1b[0mOK\n"+
+			"\x1b[0mWaiting for client config...\x1b[0mOK\n"+
+			"\x1b[0mWaiting for user info...\x1b[0mOK\n\x1b[0mAppID :",
+		1,
+	)
+	output = strings.Replace(output, "\nSteam>\n", "\nUnloading Steam API...\x1b[0mOK\n\x1b[0m\n", 1)
+	runner := &recordingCommandRunner{results: []commandRun{{result: CommandResult{Stdout: []byte(output)}}}}
+	client := newTestSteamClient(t, runner)
+
+	got, err := client.RemoteBuild(t.Context())
+	if err != nil {
+		t.Fatalf("RemoteBuild() rejected the current SteamCMD console wrapper: %v", err)
+	}
+	if got != testSteamBuild("public") {
+		t.Fatalf("RemoteBuild() = %#v, want public build", got)
+	}
+	assertCommandSpecs(t, runner.specs, remoteSteamSpec(client))
+}
+
 func TestRemoteBuildSelectsConfiguredBranch(t *testing.T) {
 	output := strings.ReplaceAll(
 		string(readSteamFixture(t, "app-info-public.txt")),
@@ -226,6 +255,7 @@ func TestSteamRemoteMetadataRejectsAmbiguousVDF(t *testing.T) {
 	}{
 		{name: "duplicate branch case variant", output: duplicateBranch},
 		{name: "unknown wrapper", output: "Injected console line\n" + fixture},
+		{name: "unsupported ANSI wrapper", output: "Loading Steam API...\x1b[31mOK\n" + fixture},
 		{name: "unquoted structural junk", output: strings.Replace(fixture, "\"1829350\"\n{", "\"1829350\"\njunk\n{", 1)},
 		{name: "trailing structural token", output: strings.Replace(fixture, "\nSteam>\n", "\n}\nSteam>\n", 1)},
 		{name: "extra root", output: strings.Replace(fixture, "\nSteam>\n", "\n\"1829350\"\n{\n}\nSteam>\n", 1)},
@@ -824,8 +854,9 @@ func publicUpdateSteamSpec(client *SteamClient) CommandSpec {
 			"+app_update", "1829350",
 			"validate", "+quit",
 		},
-		Env: []string{"HOME=" + client.HomeDir},
-		Dir: client.HomeDir,
+		Env:          []string{"HOME=" + client.HomeDir},
+		Dir:          client.HomeDir,
+		StreamOutput: true,
 	}
 }
 
@@ -840,8 +871,9 @@ func betaUpdateSteamSpec(client *SteamClient, branch string) CommandSpec {
 			"-beta", branch,
 			"validate", "+quit",
 		},
-		Env: []string{"HOME=" + client.HomeDir},
-		Dir: client.HomeDir,
+		Env:          []string{"HOME=" + client.HomeDir},
+		Dir:          client.HomeDir,
+		StreamOutput: true,
 	}
 }
 
