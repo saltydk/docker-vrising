@@ -285,6 +285,8 @@ func TestSteamRemoteMetadataRejectsAmbiguousVDF(t *testing.T) {
 		{name: "unknown wrapper", output: "Injected console line\n" + fixture},
 		{name: "unsupported ANSI wrapper", output: "Loading Steam API...\x1b[31mOK\n" + fixture},
 		{name: "invalid bootstrap progress", output: "[101%] Downloading update (1 of 2 KB)...\n" + fixture},
+		{name: "invalid bootstrap source commas", output: "[ 10%] Downloading update (1,,000 of 2,000 KB)...\n" + fixture},
+		{name: "invalid bootstrap total commas", output: "[ 10%] Downloading update (1,000 of 2,000, KB)...\n" + fixture},
 		{name: "unquoted structural junk", output: strings.Replace(fixture, "\"1829350\"\n{", "\"1829350\"\njunk\n{", 1)},
 		{name: "trailing structural token", output: strings.Replace(fixture, "\nSteam>\n", "\n}\nSteam>\n", 1)},
 		{name: "extra root", output: strings.Replace(fixture, "\nSteam>\n", "\n\"1829350\"\n{\n}\nSteam>\n", 1)},

@@ -20,7 +20,7 @@ const (
 )
 
 var steamBootstrapDownloadProgress = regexp.MustCompile(
-	`^(\[(  [0-9]| [1-9][0-9]|100)%\]|\[----\]) Downloading update \([0-9][0-9,]* of [0-9][0-9,]* KB\)\.\.\.$`,
+	`^(\[(  [0-9]| [1-9][0-9]|100)%\]|\[----\]) Downloading update \(([0-9]+|[0-9]{1,3}(,[0-9]{3})+) of ([0-9]+|[0-9]{1,3}(,[0-9]{3})+) KB\)\.\.\.$`,
 )
 
 type CommandSpec struct {
