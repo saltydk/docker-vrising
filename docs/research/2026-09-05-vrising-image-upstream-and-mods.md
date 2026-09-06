@@ -35,12 +35,13 @@ stack remained running for five minutes after readiness and wrote autosaves.
 The earlier Wine 11 approximation also lacked installed mod DLLs after rollback,
 so it cannot establish mod compatibility or superiority of DLL suppression.
 
-The independent Ubuntu image therefore reproduces WineHQ 10.0 and the tested
+The independent Ubuntu image initially reproduced WineHQ 10.0 and the tested
 `winecfg`, five-second delay, then Xvfb sequence. Forced `mscoree`/`mshtml`
 suppression is not part of the selected runtime. Current VCF startup output is
 `[Message:VampireCommandFramework] VCF Loaded: 0.10.4`; the earlier synthetic
-`is loaded!` fixture was incorrect. See the separate runtime acceptance report
-for the exact image, packages, and limits of the evidence.
+`is loaded!` fixture was incorrect. See the
+[runtime acceptance report](2026-09-06-runtime-acceptance.md) for the subsequent
+Wine 11 comparison, selected runtime, reproduction commands, and evidence limits.
 
 ### Snapshot and history
 

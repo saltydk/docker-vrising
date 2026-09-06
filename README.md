@@ -354,3 +354,7 @@ root; it never runs against, writes to, or deletes the source trees. Failed
 runs retain and print that root for diagnosis. Do not describe a deployment as
 migration-compatible until both fresh and copied-data acceptance pass on a
 representative host.
+
+The [runtime acceptance report](docs/research/2026-09-06-runtime-acceptance.md)
+records the tested versions, known limitations, and commands for reproducing
+the Wine 10/11 comparison using your own test directories.

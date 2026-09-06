@@ -17,6 +17,9 @@ Wine 10 baseline image: `sha256:8fc2c29c17b42780a992cc56bb4e4730157dd599fc38c6e7
 
 Wine 11 tested image: `sha256:9aafea70ba56e80e591f051cc7a7d60992db09f5455c257e63225b8932efa59a`.
 
+These are historical local image IDs, not published tags to pull. Build and
+test your own images with the repository commands below.
+
 ## Verified behavior
 
 - Published reference: vanilla, KindredCommands with dependencies, and the full
@@ -32,7 +35,7 @@ Wine 11 tested image: `sha256:9aafea70ba56e80e591f051cc7a7d60992db09f5455c257e63
   and an operator-owned mod config file remained unchanged.
 - RCON authentication succeeded over the published loopback TCP port. UDP
   9876/9877 were bound. An additional A2S request timed out with listing disabled;
-  player connectivity is a separate pending manual test.
+  subsequent player connectivity checks are recorded below.
 - The update test ran with four CPUs and a 14-GiB memory limit. Tests must run
   sequentially: earlier overlapping game instances exhausted the 23-GiB host
   and one Kindred instance was OOM-killed. That run is not a stability pass.
@@ -67,7 +70,7 @@ underlying interop-generation problem is fixed.
 After the user connected on Wine 10 and confirmed `.whereami` and `.s help`,
 the server completed `AutoSave_18.save.gz` after their disconnect. Wine 10 was
 stopped and removed before the replacement was started. Its server and data
-trees remain intact as the baseline.
+trees were preserved as the comparison baseline.
 
 The Wine 11 image was built from the same source with only the Wine package
 version argument changed. Both images contain controller SHA-256
@@ -79,13 +82,48 @@ was `9528025effd5950355661235a83ab2caeaaf187696f9cb465d229593baa0b032`.
 Wine 11 passed the image contract, loaded the existing save and both mods,
 passed deep installation verification and public-IP RCON authentication, and
 remained healthy with zero container restarts. Server logs confirmed that the
-user reconnected as the existing character Jediah; the user reported that the
+player reconnected as their existing character; the player reported that the
 test worked. Wine 11 is therefore the selected default.
 
 This comparison reused the already-generated BepInEx interop assemblies. It
 does not establish that Wine 11 fixes the intermittent cold-generation failure
 described above. Fresh runtime acceptance remains a publication gate.
 
-The user's original deployment save is not available on this host. Connection
-testing used the generated world under `/opt/v-rising-test`, now containing the
-user's test character. No image or commits have been published remotely.
+Migration and connection testing used a generated world containing a test
+character. Migration of another deployment needs validation against a stopped
+copy of that deployment's own saves and settings.
+
+## Reproducing the checks
+
+Run these commands from the repository root. They use the checked-in
+[Dockerfile](../../Dockerfile) and [acceptance helper](../../hack/live-acceptance.sh),
+without requiring files from the original test machine.
+
+```bash
+docker buildx build --platform linux/amd64 --target production --load \
+  --build-arg WINE_VERSION=10.0.0.0~jammy-1 -t vrising:wine10-test .
+docker buildx build --platform linux/amd64 --target production --load \
+  --build-arg WINE_VERSION=11.0.0.0~jammy-1 -t vrising:wine11-test .
+
+# Run sequentially; each invocation manages its own disposable installation.
+bash hack/live-acceptance.sh fresh vrising:wine10-test
+bash hack/live-acceptance.sh fresh vrising:wine11-test
+```
+
+For migration, substitute absolute paths to your stopped server and data trees:
+
+```bash
+bash hack/live-acceptance.sh migrate vrising:wine11-test \
+  /path/to/stopped/server /path/to/stopped/persistentdata
+```
+
+For the manual connection comparison, preserve the stopped Wine 10 installation
+and run Wine 11 against a separate copy. Keep the game, mod files, configuration,
+ports, and resource limits identical; set `UPDATE_GAME=false` and
+`UPDATE_MODS=false` after establishing a valid installation. Use a fresh Wine
+prefix in the trial copy. Verify that no other running container uses either
+copy before starting a game instance. Connect and repeat `.whereami` and
+`.s help` in chat, checking that the same character and world load.
+
+The generated interop cache was preserved in the recorded connection comparison;
+the `fresh` checks above additionally exercise uncached interop generation.
