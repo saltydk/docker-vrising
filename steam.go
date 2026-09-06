@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 )
 
@@ -16,6 +17,10 @@ const (
 	steamRuntimeAppID = "1604030"
 	publicBranch      = "public"
 	updateTries       = 3
+)
+
+var steamBootstrapDownloadProgress = regexp.MustCompile(
+	`^(\[(  [0-9]| [1-9][0-9]|100)%\]|\[----\]) Downloading update \([0-9][0-9,]* of [0-9][0-9,]* KB\)\.\.\.$`,
 )
 
 type CommandSpec struct {
@@ -549,7 +554,18 @@ func validateSteamWrapper(data []byte, beforeRoot bool) error {
 
 func isSteamPrefixLine(line string) bool {
 	switch line {
-	case "[  0%] Checking for available updates...",
+	case `ILocalize::AddFile() failed to load file "public/steambootstrapper_english.txt".`,
+		"[  0%] Checking for available update...",
+		"[  0%] Checking for available updates...",
+		"[  0%] Downloading update...",
+		"[100%] Download Complete.",
+		"[----] Applying update...",
+		"[----] Download complete.",
+		"[----] Extracting package...",
+		"[----] Installing update...",
+		"[----] Cleaning up...",
+		"[----] Update complete, launching...",
+		"[----] Update complete, launching Steamcmd...",
 		"[----] Verifying installation...",
 		"UpdateUI: skip show logo",
 		"-- type 'quit' to exit --",
@@ -558,6 +574,9 @@ func isSteamPrefixLine(line string) bool {
 		"Connecting anonymously to Steam Public...OK",
 		"Waiting for client config...OK",
 		"Waiting for user info...OK":
+		return true
+	}
+	if steamBootstrapDownloadProgress.MatchString(line) {
 		return true
 	}
 	if quotedConsolePath(line, "Redirecting stderr to ") || quotedConsolePath(line, "Logging directory: ") {

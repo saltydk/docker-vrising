@@ -165,6 +165,34 @@ func TestRemoteBuildAcceptsCurrentSteamConsoleWrapper(t *testing.T) {
 	assertCommandSpecs(t, runner.specs, remoteSteamSpec(client))
 }
 
+func TestRemoteBuildAcceptsFreshSteamBootstrapWrapper(t *testing.T) {
+	const bootstrap = `ILocalize::AddFile() failed to load file "public/steambootstrapper_english.txt".
+[  0%] Checking for available update...
+[----] Downloading update (0 of 40,430 KB)...
+[  3%] Downloading update (4,425 of 40,430 KB)...
+[100%] Download Complete.
+[----] Applying update...
+[----] Extracting package...
+[----] Installing update...
+[----] Cleaning up...
+[----] Update complete, launching...
+[  0%] Downloading update...
+[----] Download complete.
+[----] Update complete, launching Steamcmd...
+`
+	output := []byte(bootstrap + string(readSteamFixture(t, "app-info-public.txt")))
+	runner := &recordingCommandRunner{results: []commandRun{{result: CommandResult{Stdout: output}}}}
+	client := newTestSteamClient(t, runner)
+
+	got, err := client.RemoteBuild(t.Context())
+	if err != nil {
+		t.Fatalf("RemoteBuild() rejected the fresh SteamCMD bootstrap wrapper: %v", err)
+	}
+	if got != testSteamBuild("public") {
+		t.Fatalf("RemoteBuild() = %#v, want public build", got)
+	}
+}
+
 func TestRemoteBuildSelectsConfiguredBranch(t *testing.T) {
 	output := strings.ReplaceAll(
 		string(readSteamFixture(t, "app-info-public.txt")),
@@ -256,6 +284,7 @@ func TestSteamRemoteMetadataRejectsAmbiguousVDF(t *testing.T) {
 		{name: "duplicate branch case variant", output: duplicateBranch},
 		{name: "unknown wrapper", output: "Injected console line\n" + fixture},
 		{name: "unsupported ANSI wrapper", output: "Loading Steam API...\x1b[31mOK\n" + fixture},
+		{name: "invalid bootstrap progress", output: "[101%] Downloading update (1 of 2 KB)...\n" + fixture},
 		{name: "unquoted structural junk", output: strings.Replace(fixture, "\"1829350\"\n{", "\"1829350\"\njunk\n{", 1)},
 		{name: "trailing structural token", output: strings.Replace(fixture, "\nSteam>\n", "\n}\nSteam>\n", 1)},
 		{name: "extra root", output: strings.Replace(fixture, "\nSteam>\n", "\n\"1829350\"\n{\n}\nSteam>\n", 1)},
