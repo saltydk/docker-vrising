@@ -1657,9 +1657,8 @@ func requireManagedRuntimeFiles(files []ManagedFile) error {
 		}
 	}
 	for prefix, label := range map[string]string{
-		"dotnet/":           "dotnet runtime",
-		"BepInEx/core/":     "BepInEx core",
-		"BepInEx/patchers/": "BepInEx patchers",
+		"dotnet/":       "dotnet runtime",
+		"BepInEx/core/": "BepInEx core",
 	} {
 		found := false
 		for relativePath := range paths {

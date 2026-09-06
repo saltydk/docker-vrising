@@ -120,7 +120,6 @@ func TestStageRequiresCompleteBepInExRuntime(t *testing.T) {
 		"BepInExPack_V_Rising/winhttp.dll",
 		"BepInExPack_V_Rising/dotnet/runtime.dll",
 		"BepInExPack_V_Rising/BepInEx/core/core.dll",
-		"BepInExPack_V_Rising/BepInEx/patchers/patcher.dll",
 	} {
 		t.Run(filepath.Base(missing), func(t *testing.T) {
 			manager := newTestModManager(t)
@@ -137,6 +136,28 @@ func TestStageRequiresCompleteBepInExRuntime(t *testing.T) {
 				t.Fatalf("Stage() succeeded without required BepInEx runtime path %s", missing)
 			}
 		})
+	}
+}
+
+func TestStageAcceptsEmptyBepInExPatchersDirectory(t *testing.T) {
+	manager := newTestModManager(t)
+	entries := slices.DeleteFunc(defaultBepInExEntries("live"), func(entry zipEntry) bool {
+		return entry.name == "BepInExPack_V_Rising/BepInEx/patchers/patcher.dll"
+	})
+	entries = append(entries, zipEntry{
+		name: "BepInExPack_V_Rising/BepInEx/patchers/",
+		mode: os.ModeDir | 0o755,
+	})
+	lock, archives := newManagedArchiveSet(t, managedArchiveContents{bepInEx: entries})
+
+	staged, err := manager.Stage(t.Context(), lock, archives)
+	if err != nil {
+		t.Fatalf("Stage() rejected the live BepInEx empty patchers layout: %v", err)
+	}
+	for _, file := range staged.Manifest.Files {
+		if strings.HasPrefix(file.RelativePath, "BepInEx/patchers/") {
+			t.Fatalf("staged manifest unexpectedly contains a patcher file: %s", file.RelativePath)
+		}
 	}
 }
 
