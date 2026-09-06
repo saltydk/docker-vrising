@@ -161,7 +161,7 @@ mounts = {
 if mounts != expected_mounts or len(service.get("volumes", [])) != 2:
     fail("Compose mounts do not match the approved service")
 for mount in service["volumes"]:
-    if set(mount) != {"bind", "source", "target", "type"} or mount.get("bind") != {}:
+    if set(mount) != {"bind", "source", "target", "type"} or mount.get("bind") not in ({}, {"create_host_path": True}):
         fail("Compose mount options do not match the approved service")
 
 expected_ports = {

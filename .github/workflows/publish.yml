@@ -38,7 +38,7 @@ jobs:
         run: go test -race ./...
 
       - name: Run container fixture acceptance
-        run: make container-test
+        run: sudo -E make container-test
 
       - name: Generate image metadata
         id: metadata
@@ -73,7 +73,7 @@ jobs:
       - name: Check release image contract
         env:
           IMAGE: saltydk/vrising:${{ steps.metadata.outputs.tag }}
-        run: scripts/image-contract.sh "$IMAGE"
+        run: sudo -E bash scripts/image-contract.sh "$IMAGE"
 
       - name: Remove disposable fixture images
         run: docker image rm docker-vrising:fixture-test docker-vrising:default-test docker-vrising:production-test
@@ -86,7 +86,7 @@ jobs:
       - name: Test automatic installation and offline restart
         env:
           IMAGE: saltydk/vrising:${{ steps.metadata.outputs.tag }}
-        run: bash hack/live-acceptance.sh fresh "$IMAGE"
+        run: sudo -E bash hack/live-acceptance.sh fresh "$IMAGE"
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v4

@@ -32,7 +32,7 @@ jobs:
         run: go test -race ./...
 
       - name: Check image contract
-        run: make image-check
+        run: sudo -E make image-check
 
       - name: Run container fixture acceptance
-        run: make container-test
+        run: sudo -E make container-test
