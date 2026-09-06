@@ -54,14 +54,15 @@ handle_term() {
 }
 
 begin_creation_handoff() {
-	creation_handoff=true
 	deferred_signal=0
+	creation_handoff=true
 }
 
 finish_creation_handoff() {
-	local pending=$deferred_signal
+	local pending
 
 	creation_handoff=false
+	pending=$deferred_signal
 	deferred_signal=0
 	if [[ $pending -ne 0 ]]; then
 		exit "$pending"
@@ -637,6 +638,10 @@ run_migrate() {
 	assert_sources_quiescent
 	print_evidence
 }
+
+if [[ ${BASH_SOURCE[0]} != "$0" ]]; then
+	return 0
+fi
 
 case ${1:-} in
 	fresh)

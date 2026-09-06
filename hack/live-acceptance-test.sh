@@ -254,6 +254,39 @@ chmod 0755 "$fake_bin/sleep"
 fake_container_id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 fake_network_id=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 
+run_handoff_boundary_case() {
+	local boundary=$1
+	local status
+
+	set +e
+	LIVE_SCRIPT="$live_script" BOUNDARY="$boundary" /bin/bash -c '
+		set -eTuo pipefail
+		source "$LIVE_SCRIPT"
+		case $BOUNDARY in
+			begin)
+				creation_handoff=false
+				deferred_signal=0
+				trap '\''if [[ $BASH_COMMAND == "creation_handoff=true" ]]; then trap - DEBUG; kill -TERM $$; fi'\'' DEBUG
+				begin_creation_handoff
+				;;
+			finish)
+				creation_handoff=true
+				deferred_signal=0
+				trap '\''if [[ $BASH_COMMAND == "creation_handoff=false" ]]; then trap - DEBUG; kill -TERM $$; fi'\'' DEBUG
+				finish_creation_handoff
+				;;
+			*) exit 64 ;;
+		esac
+		exit 0
+	' >/dev/null 2>&1
+	status=$?
+	set -e
+	[[ $status -eq 143 ]] || fail "$boundary handoff boundary lost TERM (status $status)"
+}
+
+run_handoff_boundary_case begin
+run_handoff_boundary_case finish
+
 run_cleanup_case() {
 	local scenario=$1
 	local expected_status=$2
