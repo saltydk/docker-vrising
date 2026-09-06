@@ -162,14 +162,17 @@ network_identity_matches() {
 cleanup_created_resources() {
 	local failed=0
 
-	stop_log_follower
 	if [[ $container_created == true ]]; then
 		if container_identity_matches && docker rm -fv "$created_container_id" >/dev/null 2>&1; then
 			container_created=false
 			created_container_id=
+			reap_log_follower
 		else
 			failed=1
+			cancel_log_follower
 		fi
+	else
+		cancel_log_follower
 	fi
 	if [[ $network_created == true ]]; then
 		if network_identity_matches && docker network rm "$created_network_id" >/dev/null 2>&1; then
@@ -189,9 +192,36 @@ start_log_follower() {
 	log_follower_pid=$!
 }
 
-stop_log_follower() {
+log_follower_is_running() {
+	local running
+
+	[[ -n $log_follower_pid ]] || return 1
+	while IFS= read -r running; do
+		[[ $running == "$log_follower_pid" ]] && return 0
+	done < <(jobs -pr)
+	return 1
+}
+
+reap_log_follower() {
 	[[ -n $log_follower_pid ]] || return 0
-	kill "$log_follower_pid" >/dev/null 2>&1 || true
+	for _ in {1..50}; do
+		if ! log_follower_is_running; then
+			break
+		fi
+		sleep 0.1
+	done
+	if log_follower_is_running; then
+		kill "$log_follower_pid" >/dev/null 2>&1 || true
+	fi
+	wait "$log_follower_pid" >/dev/null 2>&1 || true
+	log_follower_pid=
+}
+
+cancel_log_follower() {
+	[[ -n $log_follower_pid ]] || return 0
+	if log_follower_is_running; then
+		kill "$log_follower_pid" >/dev/null 2>&1 || true
+	fi
 	wait "$log_follower_pid" >/dev/null 2>&1 || true
 	log_follower_pid=
 }
@@ -329,10 +359,10 @@ start_container() {
 
 remove_container() {
 	assert_container_owned
-	stop_log_follower
 	docker rm -fv "$created_container_id" >/dev/null || fail "could not remove acceptance container"
 	container_created=false
 	created_container_id=
+	reap_log_follower
 }
 
 stop_cleanly() {

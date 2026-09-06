@@ -167,6 +167,19 @@ case ${1-} in
 		fi
 		printf '%s\n' "${!#}"
 		;;
+	logs)
+		[[ ${2-} == --follow && ${3-} == "$container_id" ]] || exit 2
+		printf '%s\n' "$BASHPID" >"$state/log-follower-pid"
+		trap 'printf "TERM\n" >"$state/log-follower-term"; exit 143' TERM INT
+		if [[ $scenario == logs-already-exited ]]; then
+			printf '%s\n' exited >"$state/log-follower-exit"
+			exit 0
+		fi
+		while [[ -f $state/container-id ]]; do
+			/bin/sleep 0.01
+		done
+		printf '%s\n' exited >"$state/log-follower-exit"
+		;;
 	run)
 		if [[ $scenario == network-only ]]; then
 			exit 125
@@ -216,7 +229,7 @@ case ${1-} in
 				;;
 			*State.Status*) printf '%s\n' running ;;
 			*State.Health*)
-				if [[ $scenario == signal ]]; then printf '%s\n' starting; else printf '%s\n' healthy; fi
+			if [[ $scenario == signal || $scenario == signal-int ]]; then printf '%s\n' starting; else printf '%s\n' healthy; fi
 				;;
 			*State.ExitCode*) printf '%s\n' 0 ;;
 			*Name*) printf '/%s\n' "$(<"$state/container-name")" ;;
@@ -243,9 +256,16 @@ chmod 0755 "$fake_bin/docker"
 cat >"$fake_bin/sleep" <<'FAKE_SLEEP'
 #!/usr/bin/env bash
 set -euo pipefail
-if [[ ${FAKE_DOCKER_SCENARIO-} == signal ]]; then
+signal_marker=${FAKE_DOCKER_STATE:?}/signal-sent
+if [[ ${FAKE_DOCKER_SCENARIO-} == signal && ! -e $signal_marker ]]; then
+	: >"$signal_marker"
 	kill -TERM "$PPID"
 	exit 143
+fi
+if [[ ${FAKE_DOCKER_SCENARIO-} == signal-int && ! -e $signal_marker ]]; then
+	: >"$signal_marker"
+	kill -INT "$PPID"
+	exit 130
 fi
 exit 0
 FAKE_SLEEP
@@ -372,16 +392,32 @@ grep -Fq "rm -fv $fake_container_id " "$signal_state/calls" \
 	|| fail 'signal cleanup did not remove its created container'
 grep -Fq "network rm $fake_network_id " "$signal_state/calls" \
 	|| fail 'signal cleanup did not remove its created network'
+[[ -f $signal_state/log-follower-exit && ! -e $signal_state/log-follower-term ]] \
+	|| fail 'TERM cleanup did not naturally reap the current log follower'
+
+signal_int_state=$(run_cleanup_case signal-int 130)
+grep -Fq "rm -fv $fake_container_id " "$signal_int_state/calls" \
+	|| fail 'INT cleanup did not remove its created container'
+grep -Fq "network rm $fake_network_id " "$signal_int_state/calls" \
+	|| fail 'INT cleanup did not remove its created network'
+[[ -f $signal_int_state/log-follower-exit && ! -e $signal_int_state/log-follower-term ]] \
+	|| fail 'INT cleanup did not naturally reap the current log follower'
 
 verify_state=$(run_cleanup_case verify-failure 1)
 grep -Fq "logs --follow $fake_container_id " "$verify_state/calls" \
 	|| fail 'acceptance did not stream the current container logs'
+[[ -f $verify_state/log-follower-exit && ! -e $verify_state/log-follower-term ]] \
+	|| fail 'failure cleanup did not naturally reap the current log follower'
 grep -Eq '^exec .* vrisingctl verify' "$verify_state/calls" \
 	|| fail 'healthy acceptance did not invoke the deep live-state verifier'
 grep -Fq "rm -fv $fake_container_id " "$verify_state/calls" \
 	|| fail 'deep verifier failure did not remove its created container'
 grep -Fq "network rm $fake_network_id " "$verify_state/calls" \
 	|| fail 'deep verifier failure did not remove its created network'
+
+already_exited_state=$(run_cleanup_case logs-already-exited 1)
+[[ -f $already_exited_state/log-follower-exit && ! -e $already_exited_state/log-follower-term ]] \
+	|| fail 'already-exited log follower was not reaped without signaling'
 
 make_bin=$sandbox/make-bin
 mkdir -p "$make_bin"
