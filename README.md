@@ -137,9 +137,12 @@ Defaults require no additional environment values.
 Boolean controls accept only the literal lowercase values `true` and `false`.
 Invalid booleans, versions, durations, retention values, log retention, or
 ownership IDs fail during preflight before update mutation. `PUID` and `PGID`
-must be supplied together. Without them, the controller infers the numeric
-owner of the server bind and requires the persistent-data bind to be writable
-by that identity; it never makes the trees world-writable.
+must be supplied together. Without them, the controller retains the container's
+configured identity: root with the supplied image and Compose. Mount ownership
+does not select the runtime UID/GID. Only explicit `PUID`/`PGID` settings request
+an ownership migration and privilege drop. Private runtime directories are
+prepared for the selected identity; game/save trees are not recursively chowned
+by default and are never made world-writable.
 
 The supported legacy aliases have no image-defined default:
 
@@ -175,6 +178,15 @@ server, BepInEx, VCF, KindredCommands, and Satisvampory readiness evidence all
 succeeds. Failed candidate logs and backup state are retained; saves are never
 restored automatically because the game may already have migrated or written
 them.
+
+Recovery preserves runtime-written `BepInEx.cfg` contents and any original
+configuration backup. A completed recovery does not permanently block the same
+package lock: the next container restart may attempt it again. Failure records
+remain available for diagnosis; no save is automatically restored.
+
+The [startup recovery incident report](docs/research/2026-09-06-startup-recovery.md)
+explains the earlier UID-selection and configuration-recovery defects, the test
+gaps that missed them, and the recovery validation.
 
 ### Emergency controls and exact pins
 

@@ -403,6 +403,11 @@ func (s *Store) recoverConfigJournalEntry(serverDir string, entry JournalEntry) 
 	if quarantineExists && (!entry.Existed || quarantine.SHA256 != entry.OriginalSHA256) {
 		return fmt.Errorf("config quarantine contains externally changed content")
 	}
+	// BepInEx rewrites its configuration while loading. Preserve the mutable
+	// live file and any original backup rather than blocking DLL recovery.
+	if liveExists && live.SHA256 != entry.InstalledSHA256 {
+		return s.syncQuarantinedJournalParents(serverDir, entry)
+	}
 	if !entry.Existed {
 		if quarantineExists {
 			return fmt.Errorf("new config has unexpected quarantine content")
@@ -410,13 +415,10 @@ func (s *Store) recoverConfigJournalEntry(serverDir string, entry JournalEntry) 
 		if !liveExists {
 			return s.syncQuarantinedJournalParents(serverDir, entry)
 		}
-		if live.SHA256 != entry.InstalledSHA256 {
-			return fmt.Errorf("new config was changed externally")
-		}
 		return s.syncQuarantinedJournalParents(serverDir, entry)
 	}
 	if !quarantineExists {
-		if !liveExists || live.SHA256 != entry.OriginalSHA256 && live.SHA256 != entry.InstalledSHA256 {
+		if !liveExists {
 			return fmt.Errorf("config is not an observed journal state")
 		}
 		return s.syncQuarantinedJournalParents(serverDir, entry)
@@ -430,9 +432,6 @@ func (s *Store) recoverConfigJournalEntry(serverDir string, entry JournalEntry) 
 			return fmt.Errorf("restore config before edit: %w", err)
 		}
 		return s.syncQuarantinedJournalParents(serverDir, entry)
-	}
-	if live.SHA256 != entry.InstalledSHA256 {
-		return fmt.Errorf("config was changed externally")
 	}
 	if err := s.syncJournalTargetParent(serverDir, entry.RelativePath); err != nil {
 		return err

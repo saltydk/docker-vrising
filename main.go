@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"syscall"
 )
 
 const (
@@ -63,7 +65,7 @@ func runCommand(output io.Writer, cfg Config) int {
 	if err == nil {
 		err = PrepareOwnership(cfg, identity)
 	}
-	if err == nil {
+	if err == nil && cfg.PUID != nil {
 		err = DropPrivileges(identity)
 	}
 	if err == nil {
@@ -117,6 +119,11 @@ func configureApplicationOutput(app *Application, output io.Writer) {
 func healthCommand(output io.Writer) int {
 	cfg, _, err := LoadConfig(EnvironmentMap(os.Environ()))
 	if err == nil {
+		if code, handled := commandAsExplicitIdentity(output, cfg, "health"); handled {
+			return code
+		}
+	}
+	if err == nil {
 		var state State
 		state, err = (&Store{StateDir: cfg.StateDir}).Load()
 		if err == nil {
@@ -129,4 +136,41 @@ func healthCommand(output io.Writer) int {
 	}
 	fmt.Fprintln(output, "healthy")
 	return 0
+}
+
+// Docker exec/HEALTHCHECK uses the image user. Launch read-only commands under
+// the explicitly configured runtime credentials, without altering this process.
+func commandAsExplicitIdentity(output io.Writer, cfg Config, name string) (int, bool) {
+	if cfg.PUID == nil && cfg.PGID == nil {
+		return 0, false
+	}
+	if cfg.PUID == nil || cfg.PGID == nil {
+		fmt.Fprintln(output, "PUID and PGID must be supplied together")
+		return exitPreflight, true
+	}
+	identity := RuntimeIdentity{UID: *cfg.PUID, GID: *cfg.PGID}
+	if err := validateRuntimeIdentity(identity, true); err != nil {
+		fmt.Fprintln(output, err)
+		return exitPreflight, true
+	}
+	if os.Geteuid() == identity.UID && os.Getegid() == identity.GID {
+		return 0, false
+	}
+	path, err := os.Executable()
+	if err != nil {
+		fmt.Fprintln(output, err)
+		return exitPreflight, true
+	}
+	cmd := exec.Command(path, name)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uint32(identity.UID), Gid: uint32(identity.GID)}}
+	cmd.Stdout, cmd.Stderr = output, output
+	if err := cmd.Run(); err != nil {
+		var exited *exec.ExitError
+		if errors.As(err, &exited) {
+			return exited.ExitCode(), true
+		}
+		fmt.Fprintln(output, err)
+		return exitPreflight, true
+	}
+	return 0, true
 }

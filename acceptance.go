@@ -116,6 +116,9 @@ func verifyCommand(output io.Writer, cfg Config) int {
 		}
 		cfg = loaded
 	}
+	if code, handled := commandAsExplicitIdentity(output, cfg, "verify"); handled {
+		return code
+	}
 	if err := ValidateLiveInstallation(context.Background(), cfg); err != nil {
 		fmt.Fprintln(output, err)
 		return exitPreflight

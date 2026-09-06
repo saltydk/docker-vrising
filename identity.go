@@ -105,7 +105,7 @@ func (h ownershipHooks) syncfs(mount string, fd int) error {
 }
 
 func ResolveIdentity(cfg Config) (RuntimeIdentity, error) {
-	serverFD, server, err := openMountRoot(cfg.ServerDir, "server mount")
+	serverFD, _, err := openMountRoot(cfg.ServerDir, "server mount")
 	if err != nil {
 		return RuntimeIdentity{}, err
 	}
@@ -123,11 +123,9 @@ func ResolveIdentity(cfg Config) (RuntimeIdentity, error) {
 	explicit := cfg.PUID != nil || cfg.PGID != nil
 	switch {
 	case cfg.PUID == nil && cfg.PGID == nil:
-		identity.UID = int(server.Uid)
-		identity.GID = int(server.Gid)
-		if identity.UID == 0 {
-			log.Printf("security notice: inferred root-owned server mount; runtime processes will retain UID/GID %d:%d", identity.UID, identity.GID)
-		}
+		identity.UID = os.Geteuid()
+		identity.GID = os.Getegid()
+		log.Printf("runtime: retaining container UID/GID %d:%d", identity.UID, identity.GID)
 	case cfg.PUID == nil || cfg.PGID == nil:
 		return RuntimeIdentity{}, fmt.Errorf("PUID and PGID must be supplied together")
 	case *cfg.PUID <= 0:
@@ -137,6 +135,7 @@ func ResolveIdentity(cfg Config) (RuntimeIdentity, error) {
 	default:
 		identity.UID = *cfg.PUID
 		identity.GID = *cfg.PGID
+		log.Printf("runtime: explicit PUID/PGID selects %d:%d", identity.UID, identity.GID)
 	}
 	if err := validateRuntimeIdentity(identity, explicit); err != nil {
 		return RuntimeIdentity{}, err
@@ -163,7 +162,7 @@ func prepareOwnership(cfg Config, identity RuntimeIdentity, hooks ownershipHooks
 		return fmt.Errorf("runtime home must be StateDir/home")
 	}
 
-	explicit, err := validateConfiguredIdentity(cfg, identity, server)
+	explicit, err := validateConfiguredIdentity(cfg, identity)
 	if err != nil {
 		return err
 	}
@@ -342,16 +341,13 @@ func openMountRoot(path, label string) (int, unix.Stat_t, error) {
 	return fd, stat, nil
 }
 
-func validateConfiguredIdentity(cfg Config, identity RuntimeIdentity, server unix.Stat_t) (bool, error) {
+func validateConfiguredIdentity(cfg Config, identity RuntimeIdentity) (bool, error) {
 	if cfg.PUID == nil && cfg.PGID == nil {
 		if err := validateRuntimeIdentity(identity, false); err != nil {
 			return false, err
 		}
-		if uint64(server.Uid) > maxRuntimeID || uint64(server.Gid) > maxRuntimeID {
-			return false, fmt.Errorf("server mount owner uses the kernel no-change ID sentinel")
-		}
-		if identity.UID != int(server.Uid) || identity.GID != int(server.Gid) {
-			return false, fmt.Errorf("runtime identity does not match server mount owner")
+		if identity.UID != os.Geteuid() || identity.GID != os.Getegid() {
+			return false, fmt.Errorf("runtime identity does not match container identity")
 		}
 		return false, nil
 	}

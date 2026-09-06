@@ -431,12 +431,6 @@ func (a *Application) stageCandidate(ctx context.Context, state State, active St
 	}
 	lock.Digest = PackageLockDigest(lock)
 	a.progressf("mods: staging package set %s", lock.Digest)
-	if state.Failed != nil && state.Failed.LockDigest == lock.Digest {
-		return StagedGeneration{}, errors.Join(
-			fmt.Errorf("package lock %s was previously marked failed", lock.Digest),
-			closeValidatedArchives(archives),
-		)
-	}
 
 	staged, stageErr := a.Mods.Stage(ctx, lock, archives)
 	closeErr := closeValidatedArchives(archives)
@@ -641,6 +635,9 @@ func (a *Application) launch(ctx context.Context, selected StagedGeneration, ste
 	})
 	if !result.Ready {
 		readinessErr := errors.Join(errors.New("server did not become ready"), err)
+		if result.ExitCode != 0 {
+			readinessErr = errors.Join(readinessErr, fmt.Errorf("server process exited with status %d before readiness", result.ExitCode))
+		}
 		if candidate {
 			if promotionOutcome == PromotionRecoveryRequired || promotionOutcome == PromotionCommitted {
 				return exitFailure(exitReadiness, readinessErr)

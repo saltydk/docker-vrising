@@ -740,6 +740,79 @@ func TestRecoverAfterInterruptedApply(t *testing.T) {
 	}
 }
 
+func TestRollbackPreservesRuntimeWrittenConfig(t *testing.T) {
+	for _, existed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("existed=%t", existed), func(t *testing.T) {
+			manager := newTestModManager(t)
+			config := filepath.Join(manager.ServerDir, "BepInEx", "config", "BepInEx.cfg")
+			if existed {
+				writeTestFile(t, config, "[Logging.Console]\nEnabled = true\n")
+			}
+			staged := stageTestGeneration(t, manager, managedArchiveContents{})
+			if err := manager.Apply(t.Context(), staged); err != nil {
+				t.Fatal(err)
+			}
+			before, err := manager.Store.Load()
+			if err != nil || before.Transaction.Config == nil {
+				t.Fatalf("missing configuration journal: %v", err)
+			}
+			rewritten := "[Logging.Console]\nEnabled = false\n\n[IL2CPP]\nUpdateInteropAssemblies = true\n"
+			writeTestFile(t, config, rewritten)
+			for attempt := 0; attempt < 2; attempt++ {
+				if err := manager.Store.RecoverInterruptedTransaction(); err != nil {
+					t.Fatalf("recovery %d: %v", attempt, err)
+				}
+			}
+			if got := readTestFile(t, config); got != rewritten {
+				t.Fatal("recovery replaced runtime-written configuration")
+			}
+			state, err := manager.Store.Load()
+			if err != nil || state.Transaction != nil || state.Candidate != nil {
+				t.Fatalf("recovery left pending state: %v", err)
+			}
+			if existed {
+				original := filepath.Join(manager.Store.StateDir, before.Transaction.Config.QuarantinePath)
+				if got := readTestFile(t, original); got != "[Logging.Console]\nEnabled = true\n" {
+					t.Fatal("original configuration backup was not preserved")
+				}
+			}
+		})
+	}
+}
+
+func TestConfigRecoveryRestoresMissingOriginalAndRejectsCorruptBackup(t *testing.T) {
+	for _, corrupt := range []bool{false, true} {
+		t.Run(fmt.Sprintf("corrupt=%t", corrupt), func(t *testing.T) {
+			manager := newTestModManager(t)
+			config := filepath.Join(manager.ServerDir, "BepInEx", "config", "BepInEx.cfg")
+			original := "[Logging.Console]\nEnabled = true\n"
+			writeTestFile(t, config, original)
+			staged := stageTestGeneration(t, manager, managedArchiveContents{})
+			if err := manager.Apply(t.Context(), staged); err != nil {
+				t.Fatal(err)
+			}
+			state, err := manager.Store.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Remove(config); err != nil {
+				t.Fatal(err)
+			}
+			if corrupt {
+				writeTestFile(t, filepath.Join(manager.Store.StateDir, state.Transaction.Config.QuarantinePath), "corrupt")
+			}
+			err = manager.Store.RecoverInterruptedTransaction()
+			if corrupt {
+				if err == nil || !strings.Contains(err.Error(), "unexpected content") {
+					t.Fatalf("corrupt backup recovery = %v", err)
+				}
+			} else if err != nil || readTestFile(t, config) != original {
+				t.Fatalf("missing configuration recovery = %v", err)
+			}
+		})
+	}
+}
+
 func TestRecoverAfterInterruptedFirstApply(t *testing.T) {
 	manager := newTestModManager(t)
 	staged := stageTestGeneration(t, manager, managedArchiveContents{})

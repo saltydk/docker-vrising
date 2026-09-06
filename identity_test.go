@@ -21,7 +21,7 @@ const (
 	testRuntimeGID = 42421
 )
 
-func TestResolveIdentityUsesServerMountOwnerByDefault(t *testing.T) {
+func TestResolveIdentityRetainsContainerIdentityByDefault(t *testing.T) {
 	requireRoot(t)
 	cfg := newIdentityTestConfig(t)
 	chownTestPath(t, cfg.ServerDir, testRuntimeUID, testRuntimeGID)
@@ -31,8 +31,8 @@ func TestResolveIdentityUsesServerMountOwnerByDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if identity.UID != testRuntimeUID || identity.GID != testRuntimeGID {
-		t.Fatalf("identity = %d:%d, want %d:%d", identity.UID, identity.GID, testRuntimeUID, testRuntimeGID)
+	if identity.UID != os.Geteuid() || identity.GID != os.Getegid() {
+		t.Fatalf("identity = %d:%d, want container identity %d:%d", identity.UID, identity.GID, os.Geteuid(), os.Getegid())
 	}
 	if identity.Home != filepath.Join(cfg.StateDir, "home") {
 		t.Fatalf("Home = %q, want StateDir/home", identity.Home)
@@ -43,6 +43,7 @@ func TestResolveIdentityRequiresPersistentMountWritable(t *testing.T) {
 	requireRoot(t)
 	cfg := newIdentityTestConfig(t)
 	chownTestPath(t, cfg.ServerDir, testRuntimeUID, testRuntimeGID)
+	cfg.PUID, cfg.PGID = intPointer(testRuntimeUID), intPointer(testRuntimeGID)
 
 	identity, err := ResolveIdentity(cfg)
 	if err != nil {
@@ -55,6 +56,31 @@ func TestResolveIdentityRequiresPersistentMountWritable(t *testing.T) {
 	assertDroppedIdentity(t, result, identity)
 	assertNoIdentityProbes(t, cfg.ServerDir)
 	assertNoIdentityProbes(t, cfg.DataDir)
+}
+
+func TestDefaultRootAdoptsPrivatePrefixWithoutChowningGameData(t *testing.T) {
+	requireRoot(t)
+	cfg := newIdentityTestConfig(t)
+	gameFile := filepath.Join(cfg.ServerDir, "operator-file")
+	prefix := filepath.Join(cfg.StateDir, "wineprefix")
+	writeTestFile(t, gameFile, "preserve")
+	if err := os.MkdirAll(prefix, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{cfg.ServerDir, cfg.DataDir, cfg.StateDir, prefix, gameFile} {
+		chownTestPath(t, path, testRuntimeUID, testRuntimeGID)
+	}
+	identity, err := ResolveIdentity(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := PrepareOwnership(cfg, identity); err != nil {
+		t.Fatal(err)
+	}
+	assertPathOwner(t, prefix, 0, 0)
+	assertPathOwner(t, cfg.ServerDir, testRuntimeUID, testRuntimeGID)
+	assertPathOwner(t, cfg.DataDir, testRuntimeUID, testRuntimeGID)
+	assertPathOwner(t, gameFile, testRuntimeUID, testRuntimeGID)
 }
 
 func TestResolveIdentityUsesExplicitPUIDAndPGID(t *testing.T) {
@@ -106,16 +132,14 @@ func TestPrepareOwnershipRejectsIDsOutsideKernelRangeBeforeMutation(t *testing.T
 	}
 }
 
-func TestValidateConfiguredIdentityRejectsInferredKernelSentinel(t *testing.T) {
+func TestValidateConfiguredIdentityRejectsKernelSentinel(t *testing.T) {
 	sentinel := ^uint32(0)
-	maximum := sentinel - 1
-	valid := RuntimeIdentity{UID: int(uint64(maximum)), GID: int(uint64(maximum)), Home: "/state/home"}
-	if _, err := validateConfiguredIdentity(Config{StateDir: "/state"}, valid, unix.Stat_t{Uid: maximum, Gid: maximum}); err != nil {
-		t.Fatalf("validateConfiguredIdentity rejected maximum inferred IDs: %v", err)
+	valid := RuntimeIdentity{UID: os.Geteuid(), GID: os.Getegid(), Home: "/state/home"}
+	if _, err := validateConfiguredIdentity(Config{StateDir: "/state"}, valid); err != nil {
+		t.Fatalf("validateConfiguredIdentity rejected container identity: %v", err)
 	}
-	server := unix.Stat_t{Uid: sentinel, Gid: sentinel}
 	identity := RuntimeIdentity{UID: int(uint64(sentinel)), GID: int(uint64(sentinel)), Home: "/state/home"}
-	if _, err := validateConfiguredIdentity(Config{StateDir: "/state"}, identity, server); err == nil {
+	if _, err := validateConfiguredIdentity(Config{StateDir: "/state"}, identity); err == nil {
 		t.Fatal("validateConfiguredIdentity accepted the kernel no-change sentinel")
 	}
 }
@@ -153,7 +177,7 @@ func TestResolveIdentityRejectsUnsafeMountRoots(t *testing.T) {
 	}
 }
 
-func TestResolveIdentityReportsInferredRootSecurityNotice(t *testing.T) {
+func TestResolveIdentityReportsContainerIdentity(t *testing.T) {
 	requireRoot(t)
 	cfg := newIdentityTestConfig(t)
 	var output bytes.Buffer
@@ -176,8 +200,8 @@ func TestResolveIdentityReportsInferredRootSecurityNotice(t *testing.T) {
 	if identity.UID != 0 || identity.GID != 0 {
 		t.Fatalf("identity = %d:%d, want retained root", identity.UID, identity.GID)
 	}
-	if got := strings.Count(output.String(), "security notice"); got != 1 {
-		t.Fatalf("security notice count = %d, output %q", got, output.String())
+	if got := strings.Count(output.String(), "retaining container UID/GID 0:0"); got != 1 {
+		t.Fatalf("runtime identity notice count = %d, output %q", got, output.String())
 	}
 }
 

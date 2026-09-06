@@ -1074,17 +1074,25 @@ func TestRunFailedCandidateRollsBackWithBoundedUncancelledContext(t *testing.T) 
 	}
 }
 
-func TestRunRejectsPreviouslyFailedLockWithoutRetry(t *testing.T) {
+func TestRunPreservesStartupExitStatus(t *testing.T) {
+	fixture := newRunFixture(t)
+	fixture.supervisor.result = RunResult{ExitCode: 42}
+	err := fixture.app.Run(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "exited with status 42 before readiness") {
+		t.Fatalf("startup lost process exit status: %v", err)
+	}
+}
+
+func TestRunRetriesPreviouslyFailedLockOnRestart(t *testing.T) {
 	fixture := newRunFixture(t)
 	failedLock := canonicalTestLock(fixture.resolver.graph, "a")
 	fixture.store.state.Failed = &GenerationRecord{ID: "failed", LockDigest: failedLock.Digest, Status: "failed"}
 
 	err := fixture.app.Run(t.Context())
-	assertRunExitCode(t, err, exitModUpdate)
-
-	assertNoEvent(t, fixture.recorder.events, "stage")
-	assertNoEvent(t, fixture.recorder.events, "remote-build")
-	assertNoEvent(t, fixture.recorder.events, "launch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertEventBefore(t, fixture.recorder.events, "stage", "launch")
 	fixture.archives.assertClosed(t)
 }
 
