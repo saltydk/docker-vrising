@@ -1,7 +1,12 @@
 # Docker V Rising image design
 
 Date: 2026-09-05
-Status: approved
+Status: historical; runtime ownership policy superseded on 2026-09-06
+
+The ownership-inference and one-time migration sections below are historical,
+not current requirements. Follow the root-bootstrap and permission-repair
+contract in the [README](../../../README.md) and the
+[incident report](../../research/2026-09-06-startup-recovery.md).
 
 ## Summary
 

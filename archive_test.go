@@ -722,9 +722,19 @@ func TestArchiveCacheRejectsPermissiveCacheRoot(t *testing.T) {
 	}))
 	defer server.Close()
 
-	if _, err := (&ArchiveCache{Dir: cacheDir, Client: server.Client()}).Fetch(
+	archive, err := (&ArchiveCache{Dir: cacheDir, Client: server.Client()}).Fetch(
 		t.Context(), resolvedArchivePackage(server.URL, body), LockedPackage{},
-	); err == nil {
+	)
+	if os.Geteuid() == 0 {
+		if err != nil {
+			t.Fatalf("root rejected usable cache: %v", err)
+		}
+		if err := archive.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	if err == nil {
 		t.Fatal("Fetch() accepted a cache root not restricted to mode 0700")
 	}
 	if requests != 0 {

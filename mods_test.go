@@ -740,6 +740,41 @@ func TestRecoverAfterInterruptedApply(t *testing.T) {
 	}
 }
 
+func TestRootRecoveryAdoptsPendingNonRootTransaction(t *testing.T) {
+	requireRoot(t)
+	manager := newTestModManager(t)
+	config := filepath.Join(manager.ServerDir, "BepInEx", "config", "BepInEx.cfg")
+	staged := stageTestGeneration(t, manager, managedArchiveContents{})
+	if err := manager.Apply(t.Context(), staged); err != nil {
+		t.Fatal(err)
+	}
+	writeTestFile(t, config, "runtime-written configuration")
+	if err := filepath.Walk(manager.Store.StateDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		return os.Lchown(path, testRuntimeUID, testRuntimeGID)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := newIdentityTestConfig(t)
+	cfg.ServerDir, cfg.StateDir = manager.ServerDir, manager.Store.StateDir
+	identity, err := ResolveIdentity(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := PrepareOwnership(cfg, identity); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Store.RecoverInterruptedTransaction(); err != nil {
+		t.Fatal(err)
+	}
+	assertTransactionCleared(t, manager.Store)
+	if got := readTestFile(t, config); got != "runtime-written configuration" {
+		t.Fatalf("configuration changed: %q", got)
+	}
+}
+
 func TestRollbackPreservesRuntimeWrittenConfig(t *testing.T) {
 	for _, existed := range []bool{false, true} {
 		t.Run(fmt.Sprintf("existed=%t", existed), func(t *testing.T) {
@@ -1316,6 +1351,13 @@ func TestPromotionFinalSchemaValidatesBeforeAnyWrite(t *testing.T) {
 					err = manager.Rollback(t.Context())
 				} else {
 					err = manager.Promote(t.Context(), second)
+				}
+				if invalid == "permissive namespace" && os.Geteuid() == 0 {
+					if err != nil {
+						t.Fatalf("root rejected usable promotion namespace: %v", err)
+					}
+					assertTransactionCleared(t, manager.Store)
+					return
 				}
 				if err == nil {
 					t.Error("promotion accepted invalid transaction")

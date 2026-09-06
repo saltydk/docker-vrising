@@ -28,6 +28,7 @@ assert_inspect() {
 }
 
 assert_inspect "platform" '{{.Os}}/{{.Architecture}}' "linux/amd64"
+assert_inspect "bootstrap user" '{{.Config.User}}' "0:0"
 assert_inspect "entrypoint" '{{json .Config.Entrypoint}}' '["/usr/bin/tini","--","/usr/local/bin/vrisingctl"]'
 assert_inspect "command" '{{json .Config.Cmd}}' '["run"]'
 assert_inspect "health command" '{{json .Config.Healthcheck.Test}}' '["CMD","/usr/local/bin/vrisingctl","health"]'

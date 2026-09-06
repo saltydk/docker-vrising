@@ -37,6 +37,9 @@ jobs:
       - name: Test with race detector
         run: go test -race ./...
 
+      - name: Test root bootstrap and permission recovery
+        run: sudo -E env "PATH=$PATH" make root-test
+
       - name: Run container fixture acceptance
         run: sudo -E make container-test
 

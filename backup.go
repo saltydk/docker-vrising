@@ -381,7 +381,7 @@ func validatePrivateBackupDirectory(fd int, label string) error {
 	if err := unix.Fstat(fd, &stat); err != nil {
 		return fmt.Errorf("inspect %s: %w", label, err)
 	}
-	if stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Uid != uint32(os.Geteuid()) || stat.Mode&0o7777 != 0o700 {
+	if stat.Mode&unix.S_IFMT != unix.S_IFDIR || os.Geteuid() != 0 && (stat.Uid != uint32(os.Geteuid()) || stat.Mode&0o7777 != 0o700) {
 		return fmt.Errorf("%s must be runtime-owned mode 0700", label)
 	}
 	return nil

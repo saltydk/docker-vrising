@@ -114,6 +114,7 @@ type State struct {
 
 type Store struct {
 	StateDir            string
+	DataDir             string
 	syncDirectory       func(int) error
 	beforeWrite         func(string) error
 	recoveryHook        func(string, string) error
@@ -133,8 +134,37 @@ func (s *Store) OpenLifetimeLock() (io.Closer, error) {
 		return nil, err
 	}
 	defer unix.Close(stateDir)
+	stateLock, err := openLifetimeLockAt(stateDir, "update.lock")
+	if err != nil {
+		return nil, err
+	}
+	if s.DataDir == "" {
+		return stateLock, nil
+	}
+	dataDir, err := openDirectoryPath(s.DataDir, false)
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("open persistent-data lock directory: %w", err), stateLock.Close())
+	}
+	defer unix.Close(dataDir)
+	dataLock, err := openLifetimeLockAt(dataDir, ".docker-vrising.lock")
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("acquire persistent-data lifetime lock: %w", err), stateLock.Close())
+	}
+	return lifetimeLocks{stateLock, dataLock}, nil
+}
 
-	lock, err := unix.Openat(stateDir, "update.lock", unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
+type lifetimeLocks []*os.File
+
+func (locks lifetimeLocks) Close() error {
+	var err error
+	for _, lock := range locks {
+		err = errors.Join(err, lock.Close())
+	}
+	return err
+}
+
+func openLifetimeLockAt(directory int, name string) (*os.File, error) {
+	lock, err := unix.Openat(directory, name, unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open lifetime lock: %w", err)
 	}
@@ -154,7 +184,7 @@ func (s *Store) OpenLifetimeLock() (io.Closer, error) {
 		}
 		return nil, fmt.Errorf("acquire lifetime lock: %w", err)
 	}
-	return os.NewFile(uintptr(lock), "update.lock"), nil
+	return os.NewFile(uintptr(lock), name), nil
 }
 
 func (s *Store) Load() (State, error) {
@@ -581,9 +611,9 @@ func canonicalTransactionArtifactPaths(candidateID string, index int) (string, s
 }
 
 func (s *Store) validateProtectedArtifactParent(relativePath string) error {
-	// The runtime UID is the transaction trust boundary. Recovery assumes no
-	// untrusted process can write as that UID, so every artifact ancestor must
-	// remain private (0700) and owned by the runtime before name-based cleanup.
+	// Non-root recovery requires runtime-owned private ancestors. Root can use
+	// legacy ownership/modes directly; no-follow traversal and artifact hashes
+	// remain mandatory for both identities.
 	parts, err := relativePathParts(relativePath)
 	if err != nil {
 		return err
@@ -608,7 +638,7 @@ func (s *Store) validateProtectedArtifactParent(relativePath string) error {
 			unix.Close(next)
 			return err
 		}
-		if stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Uid != uint32(os.Geteuid()) || stat.Mode&0o7777 != 0o700 {
+		if stat.Mode&unix.S_IFMT != unix.S_IFDIR || os.Geteuid() != 0 && (stat.Uid != uint32(os.Geteuid()) || stat.Mode&0o7777 != 0o700) {
 			unix.Close(next)
 			return fmt.Errorf("transaction artifact namespace must be runtime-owned mode 0700")
 		}
@@ -776,7 +806,7 @@ func (s *Store) openStateDirectory(create bool) (int, error) {
 		unix.Close(stateDir)
 		return -1, fmt.Errorf("stat state directory: %w", err)
 	}
-	if stat.Mode&unix.S_IFMT != unix.S_IFDIR || stat.Uid != uint32(os.Geteuid()) || stat.Mode&0o7777 != 0o700 {
+	if stat.Mode&unix.S_IFMT != unix.S_IFDIR || os.Geteuid() != 0 && (stat.Uid != uint32(os.Geteuid()) || stat.Mode&0o7777 != 0o700) {
 		unix.Close(stateDir)
 		return -1, fmt.Errorf("state directory must be runtime-owned mode 0700")
 	}

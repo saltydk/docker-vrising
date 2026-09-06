@@ -28,6 +28,29 @@ as root did not prevent the configuration-recovery defect in the local case.
 
 ## Corrected behavior
 
+### Follow-up: pending transactions retained the previous runtime owner
+
+The first published correction still failed on existing non-root-owned pending
+transactions. Its root-adoption test used a completed transaction; its interrupted
+transaction test ran under root throughout. Neither combined a pending transaction
+with an identity change. Root then hit an application policy error rather than an
+operating-system access failure:
+
+```text
+validate transaction artifacts: transaction artifact namespace must be runtime-owned mode 0700
+```
+
+`TestRootRecoveryAdoptsPendingNonRootTransaction` reproduced this exact failure
+twice before the follow-up correction. Root now bypasses UID/mode policy checks
+across state, artifacts, cache, and backups, while retaining path and integrity
+validation. Non-root runtimes keep their protections, with recursive repair
+performed as root under the lifetime lock before privileges are dropped. Existing
+ownership markers no longer skip repairs. Non-root Docker user overrides are
+rejected; `PUID`/`PGID` remains the supported opt-in interface.
+
+The following describes the earlier correction and its original test evidence;
+the follow-up acceptance results must be recorded separately, not inferred from it.
+
 - Without explicit `PUID`/`PGID`, retain the container identity: root with the
   supplied image and Compose. Mount ownership no longer changes the process UID.
 - Explicit ownership migration and privilege dropping remain opt-in. Health
@@ -50,6 +73,7 @@ go test -run 'TestResolveIdentityRetainsContainerIdentityByDefault|TestDefaultRo
 make check
 go test -race ./...
 sudo -E make container-test
+sudo -E env "PATH=$PATH" make root-test
 ```
 
 The configuration regressions apply an actual managed-file transaction, rewrite
@@ -75,6 +99,40 @@ and passed deep verification with the previously non-root-owned prefix.
 Only one game container ran at a time, and source saves were not changed.
 
 ## Affected deployments
+
+### Follow-up acceptance
+
+The root-bootstrap follow-up passed unit tests, vet, race tests, privileged
+root/non-root regressions, image-contract validation, and container fixtures.
+The fixtures now include non-root Docker-user rejection, pending recovery with
+legacy owners and permissive modes, and explicit-ID transitions. Separate lock
+tests cover competing instances with either a shared server mount or shared
+saves and different server mounts.
+
+Root permission-policy tests cover private namespaces and both installed and
+staged managed-file modes. Non-root subprocess tests retain permission-policy
+rejection; integrity and unsafe-path tests remain required under both identities.
+
+Real fresh installation, offline restart, and transitions through UID/GID 1000,
+1001, and default root passed against this immutable local candidate:
+
+```text
+sha256:4920b88d23a39ac745c6d35b363520246f9311dba59837b18a0e39c1739aed31
+```
+
+Each identity reached readiness with both mods, passed deep verification and
+controller/game UID checks, and stopped cleanly before its replacement started.
+The acceptance helper now pins the input image tag to its image ID before any
+container is created, so later local builds cannot change the tested image or
+the reported identity.
+
+Migration acceptance also passed against that same image ID using a disposable
+copy of an existing `world1` save. It verified loading the existing save,
+default-root preservation of settings, and the same 1000 → 1001 → root runtime
+transitions. Source settings/saves snapshots were unchanged. All acceptance
+containers and disposable copies were removed after clean shutdown.
+
+### Deployment recovery
 
 Keep a looping deployment stopped and preserve its settings, saves, mod
 configuration, and complete controller state (including recovery artifacts)

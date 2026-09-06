@@ -174,6 +174,12 @@ func TestStoreRejectsPermissiveStateDirectory(t *testing.T) {
 	}
 	store := &Store{StateDir: stateDir}
 
+	if os.Geteuid() == 0 {
+		if err := store.Save(State{SchemaVersion: schemaVersion}); err != nil {
+			t.Fatalf("root rejected usable state directory: %v", err)
+		}
+		return
+	}
 	if err := store.Save(State{SchemaVersion: schemaVersion}); err == nil {
 		t.Fatal("Save() accepted a StateDir not protected as mode 0700")
 	}
@@ -906,6 +912,13 @@ func TestRecoverRejectsPermissiveTransactionArtifactNamespace(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if os.Geteuid() == 0 {
+		if err := store.RecoverInterruptedTransaction(); err != nil {
+			t.Fatalf("root rejected usable artifact directory: %v", err)
+		}
+		assertTransactionCleared(t, &store)
+		return
+	}
 	if err := store.RecoverInterruptedTransaction(); err == nil {
 		t.Fatal("recovery accepted a transaction artifact namespace not protected as mode 0700")
 	}

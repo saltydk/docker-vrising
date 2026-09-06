@@ -112,7 +112,7 @@ func verifyInstalledManagedFiles(ctx context.Context, serverDir string, manifest
 		if !exists {
 			return fmt.Errorf("live managed file %s is missing", managed.RelativePath)
 		}
-		if snapshot.SHA256 != managed.SHA256 || snapshot.Mode.Perm() != managed.Mode.Perm() {
+		if snapshot.SHA256 != managed.SHA256 || os.Geteuid() != 0 && snapshot.Mode.Perm() != managed.Mode.Perm() {
 			return fmt.Errorf("live managed file %s does not match its manifest", managed.RelativePath)
 		}
 	}
@@ -293,7 +293,7 @@ func (m *ModManager) Apply(ctx context.Context, staged StagedGeneration) error {
 			if err != nil {
 				return fmt.Errorf("read staged managed file %s: %w", relativePath, err)
 			}
-			if hashBytes(data) != next.SHA256 || mode.Perm() != next.Mode.Perm() {
+			if hashBytes(data) != next.SHA256 || os.Geteuid() != 0 && mode.Perm() != next.Mode.Perm() {
 				return fmt.Errorf("staged managed file %s no longer matches its manifest", relativePath)
 			}
 			if err := publishServerFile(
@@ -890,7 +890,7 @@ func (m *ModManager) verifyStagedOverlay(generationRoot int, manifest ManagedMan
 		if err != nil {
 			return fmt.Errorf("read staged managed file %s: %w", file.RelativePath, err)
 		}
-		if hashBytes(data) != file.SHA256 || mode.Perm() != file.Mode.Perm() {
+		if hashBytes(data) != file.SHA256 || os.Geteuid() != 0 && mode.Perm() != file.Mode.Perm() {
 			return fmt.Errorf("staged managed file %s does not match its manifest", file.RelativePath)
 		}
 	}

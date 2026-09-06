@@ -1,4 +1,4 @@
-.PHONY: fmt-check test vet build image image-check container-test live-acceptance-test live-acceptance check
+.PHONY: fmt-check test root-test vet build image image-check container-test live-acceptance-test live-acceptance check
 
 override LIVE_ACCEPTANCE_MODE := $(value MODE)
 override LIVE_ACCEPTANCE_IMAGE := $(value IMAGE)
@@ -12,6 +12,10 @@ fmt-check:
 
 test:
 	go test ./...
+
+root-test:
+	@test "$$(id -u):$$(id -g)" = 0:0
+	go test -count=1 -run 'TestRoot|TestManagedFileModePolicy|TestPrepareOwnership|TestDefaultRoot|TestResolveIdentity|TestDropPrivileges' ./...
 
 vet:
 	go vet ./...

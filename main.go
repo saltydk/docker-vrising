@@ -49,6 +49,10 @@ func dispatch(args []string, output io.Writer) int {
 }
 
 func runCommand(output io.Writer, cfg Config) int {
+	if os.Geteuid() != 0 || os.Getegid() != 0 {
+		fmt.Fprintln(output, "startup requires root (UID/GID 0:0); remove Docker user/--user overrides and use PUID/PGID to select the runtime identity")
+		return exitPreflight
+	}
 	if cfg.ServerDir == "" && cfg.DataDir == "" && cfg.StateDir == "" {
 		loaded, warnings, err := LoadConfig(EnvironmentMap(os.Environ()))
 		for _, warning := range warnings {
@@ -62,15 +66,6 @@ func runCommand(output io.Writer, cfg Config) int {
 	}
 
 	identity, err := ResolveIdentity(cfg)
-	if err == nil {
-		err = PrepareOwnership(cfg, identity)
-	}
-	if err == nil && cfg.PUID != nil {
-		err = DropPrivileges(identity)
-	}
-	if err == nil {
-		err = identity.VerifyWritable(cfg)
-	}
 	if err != nil {
 		fmt.Fprintln(output, err)
 		return exitPreflight

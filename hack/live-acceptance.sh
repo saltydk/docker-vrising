@@ -315,6 +315,7 @@ create_network() {
 start_container() {
 	local network=$1
 	local publish_ports=$2
+	shift 2
 	local cid_file=$temp_root/container.cid
 	local command_status captured_id=
 	local -a arguments=(
@@ -337,7 +338,7 @@ start_container() {
 			--publish 127.0.0.1::25575/tcp
 		)
 	fi
-	arguments+=("$image")
+	arguments+=("$@" "$image")
 
 	rm -f -- "$cid_file"
 	begin_creation_handoff
@@ -670,7 +671,41 @@ run_fresh() {
 		|| fail "offline restart changed the package lock bytes"
 	assert_managed_dlls
 	stop_cleanly
+
+	run_identity_transitions
 	print_evidence
+}
+
+run_identity_transitions() {
+	# Exercise the production binary and real Wine/game processes across runtime
+	# identity changes on this same disposable installation, one container at a time.
+	local runtime_id server_pid active_id
+	active_id=$(jq -er '.Active.ID' "$server_dir/.docker-vrising/state.json")
+	for runtime_id in 1000 1001 0; do
+		printf 'live acceptance: runtime identity transition to %s:%s\n' "$runtime_id" "$runtime_id"
+		if [[ $runtime_id == 0 ]]; then
+			start_container none false --env UPDATE_GAME=false --env UPDATE_MODS=false
+		else
+			start_container none false --env UPDATE_GAME=false --env UPDATE_MODS=false \
+				--env PUID="$runtime_id" --env PGID="$runtime_id"
+		fi
+		wait_healthy
+		assert_live_installation
+		assert_managed_dlls
+		server_pid=$(jq -er '.Runtime.Server.PID' "$server_dir/.docker-vrising/state.json")
+		docker exec "$created_container_id" sh -c '
+			for pid in $(cat /proc/1/task/1/children) "$1"; do
+				awk -v expected="$2" '\''
+					/^Uid:/ { if ($2 != expected || $3 != expected) exit 1; uid=1 }
+					/^Gid:/ { if ($2 != expected || $3 != expected) exit 1; gid=1 }
+					END { if (!uid || !gid) exit 1 }
+				'\'' "/proc/$pid/status" || exit 1
+			done
+		' sh "$server_pid" "$runtime_id" || fail "controller/game identity differs from $runtime_id:$runtime_id"
+		stop_cleanly
+		[[ $(jq -er '.Active.ID' "$server_dir/.docker-vrising/state.json") == "$active_id" ]] \
+			|| fail 'identity transition changed the active generation'
+	done
 }
 
 run_migrate() {
@@ -710,6 +745,7 @@ run_migrate() {
 
 	snapshot_protected_tree "$data_dir" "$copy_after" settings
 	assert_snapshot_preserved "$settings_before" "$copy_after"
+	run_identity_transitions
 	snapshot_protected_tree "$source_data_dir" "$source_final"
 	assert_snapshot_equal "$source_before" "$source_final" "a source Settings/Saves entry changed during acceptance"
 	assert_sources_quiescent
@@ -754,6 +790,8 @@ if [[ $mode == migrate ]]; then
 fi
 
 docker image inspect "$image" >/dev/null 2>&1 || fail "image is unavailable: $image"
+# Pin once so rebuilding a local tag cannot change later restart cases or evidence.
+image=$(docker image inspect --format '{{.Id}}' "$image") || fail "cannot pin acceptance image"
 [[ $(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image") == linux/amd64 ]] \
 	|| fail "image must be linux/amd64"
 

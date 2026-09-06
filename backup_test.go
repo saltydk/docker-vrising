@@ -598,7 +598,14 @@ func TestBackupRequiresPrivateRuntimeStateDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := manager.Create(t.Context(), BackupRequest{}); err == nil || !strings.Contains(err.Error(), "runtime-owned mode 0700") {
+	_, err := manager.Create(t.Context(), BackupRequest{})
+	if os.Geteuid() == 0 {
+		if err != nil {
+			t.Fatalf("root rejected usable backup directory: %v", err)
+		}
+		return
+	}
+	if err == nil || !strings.Contains(err.Error(), "runtime-owned mode 0700") {
 		t.Fatalf("Create() error = %v, want private runtime state rejection", err)
 	}
 	if _, err := os.Stat(manager.BackupDir); !os.IsNotExist(err) {

@@ -1,24 +1,19 @@
 package main
 
 import (
-	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
 
-const (
-	ownershipMarkerName = "ownership.json"
-	maxRuntimeID        = uint64(1<<32 - 2)
-)
+const maxRuntimeID = uint64(1<<32 - 2)
 
 type RuntimeIdentity struct {
 	UID  int
@@ -26,20 +21,16 @@ type RuntimeIdentity struct {
 	Home string
 }
 
-type ownershipMarker struct {
-	UID int `json:"uid"`
-	GID int `json:"gid"`
-}
-
 type ownershipHooks struct {
-	afterEntryInspect  func(string, int, string, unix.Stat_t) error
-	afterEntryOpen     func(string, int, string, int, unix.Stat_t) error
-	barrierOpened      func(string, int, unix.Stat_t) error
-	beforeChown        func(string, string, int) error
-	entryDevice        func(string, string, uint64) uint64
-	syncInode          func(string, string, int) error
-	syncFilesystem     func(string, int) error
-	beforeMarkerRename func() error
+	afterEntryInspect func(string, int, string, unix.Stat_t) error
+	afterEntryOpen    func(string, int, string, int, unix.Stat_t) error
+	barrierOpened     func(string, int, unix.Stat_t) error
+	beforeChown       func(string, string, int) error
+	entryDevice       func(string, string, uint64) uint64
+	syncInode         func(string, string, int) error
+	syncFilesystem    func(string, int) error
+	progress          *ownershipProgress
+	stateName         string
 }
 
 func (h ownershipHooks) observedDevice(mount, name string, device uint64) uint64 {
@@ -123,9 +114,9 @@ func ResolveIdentity(cfg Config) (RuntimeIdentity, error) {
 	explicit := cfg.PUID != nil || cfg.PGID != nil
 	switch {
 	case cfg.PUID == nil && cfg.PGID == nil:
-		identity.UID = os.Geteuid()
-		identity.GID = os.Getegid()
-		log.Printf("runtime: retaining container UID/GID %d:%d", identity.UID, identity.GID)
+		identity.UID = 0
+		identity.GID = 0
+		log.Printf("runtime: default UID/GID 0:0")
 	case cfg.PUID == nil || cfg.PGID == nil:
 		return RuntimeIdentity{}, fmt.Errorf("PUID and PGID must be supplied together")
 	case *cfg.PUID <= 0:
@@ -173,7 +164,7 @@ func prepareOwnership(cfg Config, identity RuntimeIdentity, hooks ownershipHooks
 	serverBarrier, persistentBarrier := -1, -1
 	if explicit {
 		if os.Geteuid() != 0 {
-			return fmt.Errorf("explicit ownership migration requires root")
+			return fmt.Errorf("explicit ownership repair requires root")
 		}
 		serverBarrier, err = openOwnershipBarrier(serverFD, server, "server", hooks)
 		if err != nil {
@@ -201,20 +192,9 @@ func prepareOwnership(cfg Config, identity RuntimeIdentity, hooks ownershipHooks
 		}
 		return verifyPathIdentity(cfg.StateDir, stateStat)
 	}
-	complete, err := ownershipMigrationComplete(stateDir, identity)
-	if err != nil {
-		return err
-	}
-	if complete {
-		if err := preparePrivateDirectories(stateDir, stateName, uint64(server.Dev), identity, hooks); err != nil {
-			return err
-		}
-		return verifyPathIdentity(cfg.StateDir, stateStat)
-	}
-	if err := invalidateOwnershipMarker(stateDir); err != nil {
-		return fmt.Errorf("invalidate ownership migration marker: %w", err)
-	}
-	log.Printf("ownership migration: changing server and persistent-data mounts to UID/GID %d:%d", identity.UID, identity.GID)
+	hooks.stateName = stateName
+	hooks.progress = &ownershipProgress{lastLog: time.Now()}
+	log.Printf("ownership repair: inspecting server and persistent-data mounts for UID/GID %d:%d", identity.UID, identity.GID)
 	stateReservation := &reservedDirectory{name: stateName, fd: stateDir, stat: stateStat}
 	serverTree, err := lchownTree(serverFD, server, cfg.ServerDir, "server", identity, hooks, stateReservation)
 	if err != nil {
@@ -239,9 +219,10 @@ func prepareOwnership(cfg Config, identity RuntimeIdentity, hooks ownershipHooks
 	if err := syncHeldFilesystem(persistentBarrier, persistent, cfg.DataDir, "persistent-data", hooks); err != nil {
 		return fmt.Errorf("sync persistent-data mount ownership migration: %w", err)
 	}
-	if err := writeOwnershipMarker(stateDir, cfg.StateDir, stateStat, identity, hooks); err != nil {
-		return fmt.Errorf("record ownership migration: %w", err)
+	if err := verifyPathIdentity(cfg.StateDir, stateStat); err != nil {
+		return err
 	}
+	hooks.progress.report("complete")
 	return nil
 }
 
@@ -272,13 +253,6 @@ func syncHeldFilesystem(directory int, stat unix.Stat_t, path, mount string, hoo
 		return err
 	}
 	return verifyPathIdentity(path, stat)
-}
-
-func invalidateOwnershipMarker(stateDir int) error {
-	if err := unix.Unlinkat(stateDir, ownershipMarkerName, 0); err != nil && !errors.Is(err, unix.ENOENT) {
-		return err
-	}
-	return unix.Fsync(stateDir)
 }
 
 func DropPrivileges(identity RuntimeIdentity) error {
@@ -346,8 +320,8 @@ func validateConfiguredIdentity(cfg Config, identity RuntimeIdentity) (bool, err
 		if err := validateRuntimeIdentity(identity, false); err != nil {
 			return false, err
 		}
-		if identity.UID != os.Geteuid() || identity.GID != os.Getegid() {
-			return false, fmt.Errorf("runtime identity does not match container identity")
+		if identity.UID != 0 || identity.GID != 0 {
+			return false, fmt.Errorf("default runtime identity must be 0:0")
 		}
 		return false, nil
 	}
@@ -405,13 +379,7 @@ func lchownTree(rootPathFD int, rootStat unix.Stat_t, rootPath, mount string, id
 		return nil, err
 	}
 	defer unix.Close(root)
-	if err := hooks.changingOwnership(mount, ".", root); err != nil {
-		return nil, err
-	}
-	if err := unix.Fchown(root, identity.UID, identity.GID); err != nil {
-		return nil, err
-	}
-	if err := hooks.sync(mount, ".", root); err != nil {
+	if err := repairOwnershipMetadata(root, mount, ".", rootStat, identity, hooks, false); err != nil {
 		return nil, err
 	}
 	tree := ownershipTreeSnapshot{".": rootStat}
@@ -468,7 +436,7 @@ func lchownDirectory(root int, mount, relativeDir string, rootDevice uint64, ide
 		err = migrateHeldEntry(root, entry, mount, name, relativePath, rootDevice, before, identity, hooks, tree)
 		unix.Close(entry)
 		if err != nil {
-			return err
+			return fmt.Errorf("repair %s/%s: %w", mount, relativePath, err)
 		}
 	}
 	if reserved != nil && !reservedFound {
@@ -642,27 +610,16 @@ func migrateHeldEntry(parent, entry int, mount, name, relativePath string, rootD
 	case unix.S_IFDIR:
 		return migrateHeldDirectory(parent, entry, mount, name, relativePath, rootDevice, stat, identity, hooks, tree)
 	case unix.S_IFREG:
-		return migrateHeldRegular(parent, mount, name, stat, identity, hooks)
-	case unix.S_IFLNK:
-		if err := unix.Fchownat(entry, "", identity.UID, identity.GID, unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW); err != nil {
-			return err
-		}
-		if err := verifyNameIdentity(parent, name, stat); err != nil {
-			return err
-		}
-		return hooks.sync(mount, filepath.Join(name, ".."), parent)
+		return migrateHeldRegular(parent, mount, name, relativePath, stat, identity, hooks)
 	default:
-		if err := unix.Fchownat(entry, "", identity.UID, identity.GID, unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		if err := repairOwnershipMetadata(entry, mount, relativePath, stat, identity, hooks, true); err != nil {
 			return err
 		}
-		if err := verifyNameIdentity(parent, name, stat); err != nil {
-			return err
-		}
-		return hooks.sync(mount, filepath.Join(name, ".."), parent)
+		return verifyNameIdentity(parent, name, stat)
 	}
 }
 
-func migrateHeldRegular(parent int, mount, name string, stat unix.Stat_t, identity RuntimeIdentity, hooks ownershipHooks) error {
+func migrateHeldRegular(parent int, mount, name, relativePath string, stat unix.Stat_t, identity RuntimeIdentity, hooks ownershipHooks) error {
 	file, err := unix.Openat(parent, name, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return err
@@ -678,10 +635,7 @@ func migrateHeldRegular(parent int, mount, name string, stat unix.Stat_t, identi
 	if err := hooks.openedEntry(mount, parent, name, file, opened); err != nil {
 		return err
 	}
-	if err := unix.Fchown(file, identity.UID, identity.GID); err != nil {
-		return err
-	}
-	if err := hooks.sync(mount, name, file); err != nil {
+	if err := repairOwnershipMetadata(file, mount, relativePath, opened, identity, hooks, false); err != nil {
 		return err
 	}
 	return verifyNameIdentity(parent, name, stat)
@@ -696,10 +650,7 @@ func migrateHeldDirectory(parent, entry int, mount, name, relativePath string, r
 	if err := hooks.openedEntry(mount, parent, name, directory, stat); err != nil {
 		return err
 	}
-	if err := unix.Fchown(directory, identity.UID, identity.GID); err != nil {
-		return err
-	}
-	if err := hooks.sync(mount, name, directory); err != nil {
+	if err := repairOwnershipMetadata(directory, mount, relativePath, stat, identity, hooks, false); err != nil {
 		return err
 	}
 	if err := verifyNameIdentity(parent, name, stat); err != nil {
@@ -715,10 +666,7 @@ func migrateReservedDirectory(parent int, mount, relativePath string, rootDevice
 	if err := verifyNameIdentity(parent, reserved.name, reserved.stat); err != nil {
 		return fmt.Errorf("reserved StateDir changed before migration: %w", err)
 	}
-	if err := unix.Fchown(reserved.fd, identity.UID, identity.GID); err != nil {
-		return err
-	}
-	if err := hooks.sync(mount, reserved.name, reserved.fd); err != nil {
+	if err := repairOwnershipMetadata(reserved.fd, mount, relativePath, reserved.stat, identity, hooks, false); err != nil {
 		return err
 	}
 	if err := verifyNameIdentity(parent, reserved.name, reserved.stat); err != nil {
@@ -867,105 +815,9 @@ func preparePrivateDirectoryFD(directory int, mount, name string, rootDevice uin
 	if err := requireOwnershipDevice(mount, name, rootDevice, stat, hooks); err != nil {
 		return err
 	}
-	if int(stat.Uid) != identity.UID || int(stat.Gid) != identity.GID {
-		if err := unix.Fchown(directory, identity.UID, identity.GID); err != nil {
-			return err
-		}
-	}
-	if err := unix.Fchmod(directory, 0o700); err != nil {
-		return err
-	}
-	return unix.Fsync(directory)
-}
-
-func ownershipMigrationComplete(root int, identity RuntimeIdentity) (bool, error) {
-	var rootStat unix.Stat_t
-	if err := unix.Fstat(root, &rootStat); err != nil {
-		return false, err
-	}
-	if rootStat.Mode&unix.S_IFMT != unix.S_IFDIR || rootStat.Mode&0o7777 != 0o700 || int(rootStat.Uid) != identity.UID || int(rootStat.Gid) != identity.GID {
-		return false, nil
-	}
-	fd, err := unix.Openat(root, ownershipMarkerName, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
-	if errors.Is(err, unix.ENOENT) {
-		return false, nil
-	}
-	if err != nil {
-		return false, nil
-	}
-	file := os.NewFile(uintptr(fd), ownershipMarkerName)
-	defer file.Close()
-	var stat unix.Stat_t
-	if err := unix.Fstat(fd, &stat); err != nil {
-		return false, err
-	}
-	if stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Mode&0o7777 != 0o600 || int(stat.Uid) != identity.UID || int(stat.Gid) != identity.GID {
-		return false, nil
-	}
-	data, err := io.ReadAll(file)
-	if err != nil {
-		return false, err
-	}
-	var marker ownershipMarker
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&marker); err != nil {
-		return false, nil
-	}
-	if err := decoder.Decode(new(any)); err != io.EOF {
-		return false, nil
-	}
-	return marker.UID == identity.UID && marker.GID == identity.GID, nil
-}
-
-func writeOwnershipMarker(root int, statePath string, stateStat unix.Stat_t, identity RuntimeIdentity, hooks ownershipHooks) error {
-	data, err := json.Marshal(ownershipMarker{UID: identity.UID, GID: identity.GID})
-	if err != nil {
-		return err
-	}
-	temporaryName, fd, err := createTemporaryFileAt(root, ownershipMarkerName, 0o600)
-	if err != nil {
-		return err
-	}
-	defer unix.Unlinkat(root, temporaryName, 0)
-	file := os.NewFile(uintptr(fd), temporaryName)
-	if _, err := file.Write(data); err != nil {
-		file.Close()
-		return err
-	}
-	if err := unix.Fchown(fd, identity.UID, identity.GID); err != nil {
-		file.Close()
-		return err
-	}
-	if err := unix.Fchmod(fd, 0o600); err != nil {
-		file.Close()
-		return err
-	}
-	if err := file.Sync(); err != nil {
-		file.Close()
-		return err
-	}
-	if err := file.Close(); err != nil {
-		return err
-	}
-	if err := verifyPathIdentity(statePath, stateStat); err != nil {
-		return fmt.Errorf("verify StateDir before ownership marker publication: %w", err)
-	}
-	if hooks.beforeMarkerRename != nil {
-		if err := hooks.beforeMarkerRename(); err != nil {
-			return err
-		}
-	}
-	if err := unix.Renameat(root, temporaryName, root, ownershipMarkerName); err != nil {
-		return err
-	}
-	if err := unix.Fsync(root); err != nil {
-		return err
-	}
-	if err := verifyPathIdentity(statePath, stateStat); err != nil {
-		return fmt.Errorf("verify StateDir after ownership marker publication: %w", err)
-	}
-	return nil
+	// This path also runs without a recursive repair for the default root identity.
+	hooks.stateName = name
+	return repairOwnershipMetadata(directory, mount, name, stat, identity, hooks, false)
 }
 
 func probeWritableMount(path string) (returnErr error) {
@@ -1011,6 +863,78 @@ func probeWritableMount(path string) (returnErr error) {
 	removed = true
 	if err := unix.Fsync(root); err != nil {
 		return err
+	}
+	return nil
+}
+
+type ownershipProgress struct {
+	inspected, chowned, chmodded uint64
+	lastLog                      time.Time
+}
+
+func (p *ownershipProgress) report(status string) {
+	log.Printf("ownership repair %s: inspected=%d chowned=%d chmodded=%d", status, p.inspected, p.chowned, p.chmodded)
+	p.lastLog = time.Now()
+}
+
+func ownershipMode(mount, name string, stat unix.Stat_t, hooks ownershipHooks) uint32 {
+	mode := stat.Mode & 0o7777
+	switch stat.Mode & unix.S_IFMT {
+	case unix.S_IFDIR:
+		if mount == "server" && hooks.stateName != "" && (name == hooks.stateName || strings.HasPrefix(name, hooks.stateName+"/")) {
+			return 0o700
+		}
+		return mode | 0o700
+	case unix.S_IFREG:
+		return mode | 0o600
+	default:
+		return mode
+	}
+}
+
+// The descriptor is held throughout repair; O_PATH entries are never followed.
+func repairOwnershipMetadata(fd int, mount, name string, stat unix.Stat_t, identity RuntimeIdentity, hooks ownershipHooks, pathOnly bool) error {
+	if hooks.progress != nil {
+		hooks.progress.inspected++
+		if time.Since(hooks.progress.lastLog) >= 5*time.Second {
+			hooks.progress.report("progress")
+		}
+	}
+	mode := ownershipMode(mount, name, stat, hooks)
+	changed := false
+	if int(stat.Uid) != identity.UID || int(stat.Gid) != identity.GID {
+		if err := hooks.changingOwnership(mount, name, fd); err != nil {
+			return err
+		}
+		var err error
+		if pathOnly {
+			err = unix.Fchownat(fd, "", identity.UID, identity.GID, unix.AT_EMPTY_PATH|unix.AT_SYMLINK_NOFOLLOW)
+		} else {
+			err = unix.Fchown(fd, identity.UID, identity.GID)
+		}
+		if err != nil {
+			return fmt.Errorf("chown %s/%s to %d:%d: %w", mount, name, identity.UID, identity.GID, err)
+		}
+		changed = true
+		if hooks.progress != nil {
+			hooks.progress.chowned++
+		}
+		// chown can clear set-ID bits; compare the resulting mode before restoring them.
+		if err := unix.Fstat(fd, &stat); err != nil {
+			return err
+		}
+	}
+	if !pathOnly && stat.Mode&0o7777 != mode {
+		if err := unix.Fchmod(fd, mode); err != nil {
+			return fmt.Errorf("chmod %s/%s to %04o: %w", mount, name, mode, err)
+		}
+		changed = true
+		if hooks.progress != nil {
+			hooks.progress.chmodded++
+		}
+	}
+	if changed && !pathOnly {
+		return hooks.sync(mount, name, fd)
 	}
 	return nil
 }

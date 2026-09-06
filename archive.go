@@ -273,10 +273,10 @@ func validateArchiveCacheRoot(fd int) error {
 	if stat.Mode&unix.S_IFMT != unix.S_IFDIR {
 		return fmt.Errorf("archive cache is not a directory")
 	}
-	if stat.Uid != uint32(os.Geteuid()) {
+	if os.Geteuid() != 0 && stat.Uid != uint32(os.Geteuid()) {
 		return fmt.Errorf("archive cache is not owned by runtime user")
 	}
-	if stat.Mode&0o7777 != 0o700 {
+	if os.Geteuid() != 0 && stat.Mode&0o7777 != 0o700 {
 		return fmt.Errorf("archive cache mode is %04o, want 0700", stat.Mode&0o7777)
 	}
 	return nil

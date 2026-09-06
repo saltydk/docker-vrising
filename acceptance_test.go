@@ -228,6 +228,12 @@ func TestValidateLiveInstallationRejectsBrokenRelationshipsAndManagedFiles(t *te
 			fixture := newLiveInstallationFixture(t)
 			test.mutate(t, fixture)
 
+			if test.name == "live managed file mode differs" && os.Geteuid() == 0 {
+				if err := ValidateLiveInstallation(t.Context(), fixture.config); err != nil {
+					t.Fatalf("root rejected managed-file permissions: %v", err)
+				}
+				return
+			}
 			if err := ValidateLiveInstallation(t.Context(), fixture.config); err == nil {
 				t.Fatalf("ValidateLiveInstallation() accepted %s", test.name)
 			}

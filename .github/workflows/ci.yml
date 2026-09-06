@@ -31,6 +31,9 @@ jobs:
       - name: Test with race detector
         run: go test -race ./...
 
+      - name: Test root bootstrap and permission recovery
+        run: sudo -E env "PATH=$PATH" make root-test
+
       - name: Check image contract
         run: sudo -E make image-check
 

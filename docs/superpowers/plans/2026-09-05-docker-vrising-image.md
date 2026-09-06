@@ -1,5 +1,9 @@
 # Docker V Rising Image Implementation Plan
 
+Historical plan: its mount-owner inference and one-time ownership migration
+were superseded on 2026-09-06. Use the current root-bootstrap and permission-repair
+contract in the [README](../../../README.md); do not reintroduce those behaviors.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build and verify a drop-in Docker Hub image that updates the V Rising dedicated server and installs the newest compatible KindredCommands and Satisvampory dependency graphs safely on every restart.

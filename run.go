@@ -75,6 +75,7 @@ type Application struct {
 
 	stateStore      applicationStateStore
 	validateMounts  func(Config) error
+	prepareRuntime  func() error
 	pruneServerLogs func(string, int, time.Time) error
 	now             func() time.Time
 }
@@ -93,7 +94,7 @@ func (e *runError) Unwrap() error {
 }
 
 func newApplication(cfg Config, identity RuntimeIdentity) *Application {
-	store := &Store{StateDir: cfg.StateDir}
+	store := &Store{StateDir: cfg.StateDir, DataDir: cfg.DataDir}
 	client := &http.Client{Timeout: 30 * time.Second}
 	mods := &ModManager{
 		ServerDir:      cfg.ServerDir,
@@ -107,7 +108,18 @@ func newApplication(cfg Config, identity RuntimeIdentity) *Application {
 	return &Application{
 		Config:   cfg,
 		Identity: identity,
-		Store:    store,
+		prepareRuntime: func() error {
+			if err := PrepareOwnership(cfg, identity); err != nil {
+				return fmt.Errorf("repair runtime permissions: %w", err)
+			}
+			if cfg.PUID != nil {
+				if err := DropPrivileges(identity); err != nil {
+					return err
+				}
+			}
+			return identity.VerifyWritable(cfg)
+		},
+		Store: store,
 		Resolver: &Thunderstore{
 			Client: client,
 		},
@@ -164,6 +176,13 @@ func (a *Application) Run(ctx context.Context) (returnErr error) {
 		}
 	}()
 
+	if a.prepareRuntime != nil {
+		a.progressf("startup: preparing permissions for runtime UID/GID %d:%d", a.Identity.UID, a.Identity.GID)
+		if err := a.prepareRuntime(); err != nil {
+			return exitFailure(exitPreflight, err)
+		}
+		a.progressf("startup: runtime permissions ready")
+	}
 	a.progressf("startup: recovering interrupted state")
 	if err := store.RecoverInterruptedTransaction(); err != nil {
 		var pending *PendingPromotionError

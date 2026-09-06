@@ -127,7 +127,7 @@ Defaults require no additional environment values.
 | `BACKUP_RETENTION` | `3` | Retain this many newest completed pre-Steam-upgrade archives; minimum `1`. |
 | `STARTUP_TIMEOUT` | `30m` | Positive Go-duration deadline for game and mod readiness. |
 | `SHUTDOWN_TIMEOUT` | `120s` | Positive Go-duration graceful-stop wait before one Wine shutdown escalation. |
-| `PUID` / `PGID` | unset | Optional paired positive numeric IDs for a one-time ownership migration and runtime identity. |
+| `PUID` / `PGID` | unset | Optional paired positive numeric runtime IDs; root repairs both mounts before dropping privileges on every startup. |
 | `LOGDAYS` | `30` | Days to retain image-created server logs; integer `1` through `365000`. |
 | `BRANCH` | unset (`public`) | Optional Steam beta branch passed to SteamCMD. |
 | `TZ` | unset | Process timezone, passed through when set. |
@@ -137,12 +137,25 @@ Defaults require no additional environment values.
 Boolean controls accept only the literal lowercase values `true` and `false`.
 Invalid booleans, versions, durations, retention values, log retention, or
 ownership IDs fail during preflight before update mutation. `PUID` and `PGID`
-must be supplied together. Without them, the controller retains the container's
-configured identity: root with the supplied image and Compose. Mount ownership
-does not select the runtime UID/GID. Only explicit `PUID`/`PGID` settings request
-an ownership migration and privilege drop. Private runtime directories are
-prepared for the selected identity; game/save trees are not recursively chowned
-by default and are never made world-writable.
+must be supplied together. The container must start as root (`0:0`); non-root
+Docker `user:` / `--user` overrides are rejected before mount mutation. Use
+`PUID`/`PGID` to select a non-root runtime instead. Without them, the runtime
+stays root regardless of mount ownership.
+
+Startup acquires lifetime locks before preparing permissions: `update.lock`
+inside private state and `.docker-vrising.lock` in persistent data. Sharing either
+mount prevents a second runtime, even with a different other mount. Default-root
+preparation is limited to private `.docker-vrising` directories and leaves
+game/save ownership and permissions unchanged. Root does not reject accessible
+state, cache, backups, managed files, or recovery artifacts because their UID/GID or mode differs
+from preferred values. Safe-path and integrity checks still apply.
+
+With explicit IDs, startup inspects and repairs both mounted trees before
+dropping privileges. It corrects owner access and private-directory modes while
+preserving file contents, executable bits, and existing group/other access outside
+private state. It never follows symlink targets. Legacy `ownership.json` markers
+are ignored; they cannot suppress repairs after permission drift. Unchanged
+entries are inspected but not rewritten. Health and verification remain read-only.
 
 The supported legacy aliases have no image-defined default:
 

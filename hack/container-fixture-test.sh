@@ -458,6 +458,13 @@ if [[ ${CONTAINER_FIXTURE_TEST_MODE-} == docker-cleanup ]]; then
 fi
 
 assert_zero_suite_resources
+echo 'bootstrap: non-root Docker user override is rejected before startup'
+set +e
+override_output=$(docker run --rm --name "$suite_token-user-override" "${probe_mounts[@]}" --user 1000:1000 "$fixture_image" 2>&1)
+override_status=$?
+set -e
+[[ $override_status -eq 10 && $override_output == *'remove Docker user/--user'* ]] \
+  || fail "non-root Docker user override was not rejected: $override_output"
 generate_tls_fixture
 validate_tls_fixture
 run_strict_fake_probes
@@ -551,6 +558,9 @@ docker kill --signal KILL "$controller_name" >/dev/null
 docker wait "$controller_name" >/dev/null
 docker rm -fv "$controller_name" >/dev/null
 assert_sentinels
+echo 'recovery: pending artifacts have legacy non-root owners and permissive modes'
+chown -R 1000:1000 "$server_dir/.docker-vrising"
+find "$server_dir/.docker-vrising" -type d -exec chmod 0755 {} +
 start_controller "$network_name" --env MODS_ENABLED=false --env UPDATE_GAME=false
 wait_healthy
 jq -e '.Transaction == null and .Candidate == null and .Active.Status == "active" and .Failed.Status == "failed" and .Active.ID != .Failed.ID and .Active.LockDigest != .Failed.LockDigest' "$state_file" >/dev/null \
@@ -590,6 +600,28 @@ assert_current_run_reaped "$term_token"
 assert_identity_unchanged "$baseline_identity" 'TERM shutdown'
 assert_sentinels
 docker rm -fv "$controller_name" >/dev/null
+
+echo 'permissions: explicit IDs, changed IDs, then default root on the same installation'
+for runtime_id in 1000 1001; do
+  # Fixture process evidence lives in a separate harness-owned mount.
+  chown -R "$runtime_id:$runtime_id" "$record_dir"
+  start_controller "$network_name" --env PUID="$runtime_id" --env PGID="$runtime_id" \
+    --env UPDATE_GAME=false --env UPDATE_MODS=false
+  wait_healthy
+  timeout 5 docker exec "$controller_name" vrisingctl health >/dev/null || fail 'explicit-ID health command failed'
+  timeout 10 docker exec "$controller_name" vrisingctl verify >/dev/null || fail 'explicit-ID verification failed'
+  [[ $(stat -c '%u:%g' "$data_dir/Saves/v1/fixture-save.dat") == "$runtime_id:$runtime_id" ]] \
+    || fail 'explicit-ID repair missed save ownership'
+  assert_sentinels
+  stop_controller
+done
+start_controller "$network_name" --env UPDATE_GAME=false --env UPDATE_MODS=false
+wait_healthy
+timeout 10 docker exec "$controller_name" vrisingctl verify >/dev/null || fail 'default-root verification failed'
+[[ $(stat -c '%u:%g' "$data_dir/Saves/v1/fixture-save.dat") == '1001:1001' ]] \
+  || fail 'default-root startup changed save ownership'
+assert_sentinels
+stop_controller
 
 assert_production_isolation
 docker rm -fv "$sidecar_name" >/dev/null

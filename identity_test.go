@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -21,7 +22,7 @@ const (
 	testRuntimeGID = 42421
 )
 
-func TestResolveIdentityRetainsContainerIdentityByDefault(t *testing.T) {
+func TestResolveIdentityDefaultsToRoot(t *testing.T) {
 	requireRoot(t)
 	cfg := newIdentityTestConfig(t)
 	chownTestPath(t, cfg.ServerDir, testRuntimeUID, testRuntimeGID)
@@ -31,7 +32,7 @@ func TestResolveIdentityRetainsContainerIdentityByDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if identity.UID != os.Geteuid() || identity.GID != os.Getegid() {
+	if identity.UID != 0 || identity.GID != 0 {
 		t.Fatalf("identity = %d:%d, want container identity %d:%d", identity.UID, identity.GID, os.Geteuid(), os.Getegid())
 	}
 	if identity.Home != filepath.Join(cfg.StateDir, "home") {
@@ -62,13 +63,26 @@ func TestDefaultRootAdoptsPrivatePrefixWithoutChowningGameData(t *testing.T) {
 	requireRoot(t)
 	cfg := newIdentityTestConfig(t)
 	gameFile := filepath.Join(cfg.ServerDir, "operator-file")
+	saveFile := filepath.Join(cfg.DataDir, "operator-save")
 	prefix := filepath.Join(cfg.StateDir, "wineprefix")
 	writeTestFile(t, gameFile, "preserve")
+	writeIdentityTestFile(t, saveFile)
 	if err := os.MkdirAll(prefix, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{cfg.ServerDir, cfg.DataDir, cfg.StateDir, prefix, gameFile} {
+	for _, path := range []string{cfg.ServerDir, cfg.DataDir, cfg.StateDir, prefix, gameFile, saveFile} {
 		chownTestPath(t, path, testRuntimeUID, testRuntimeGID)
+	}
+	before := make(map[string]unix.Stat_t)
+	for _, path := range []string{gameFile, saveFile} {
+		if err := os.Chmod(path, 0o044); err != nil {
+			t.Fatal(err)
+		}
+		var stat unix.Stat_t
+		if err := unix.Lstat(path, &stat); err != nil {
+			t.Fatal(err)
+		}
+		before[path] = stat
 	}
 	identity, err := ResolveIdentity(cfg)
 	if err != nil {
@@ -81,6 +95,15 @@ func TestDefaultRootAdoptsPrivatePrefixWithoutChowningGameData(t *testing.T) {
 	assertPathOwner(t, cfg.ServerDir, testRuntimeUID, testRuntimeGID)
 	assertPathOwner(t, cfg.DataDir, testRuntimeUID, testRuntimeGID)
 	assertPathOwner(t, gameFile, testRuntimeUID, testRuntimeGID)
+	for path, want := range before {
+		var got unix.Stat_t
+		if err := unix.Lstat(path, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Mode != want.Mode || got.Uid != want.Uid || got.Gid != want.Gid || got.Ctim != want.Ctim || got.Mtim != want.Mtim {
+			t.Errorf("default root preparation changed %s metadata", path)
+		}
+	}
 }
 
 func TestResolveIdentityUsesExplicitPUIDAndPGID(t *testing.T) {
@@ -134,7 +157,7 @@ func TestPrepareOwnershipRejectsIDsOutsideKernelRangeBeforeMutation(t *testing.T
 
 func TestValidateConfiguredIdentityRejectsKernelSentinel(t *testing.T) {
 	sentinel := ^uint32(0)
-	valid := RuntimeIdentity{UID: os.Geteuid(), GID: os.Getegid(), Home: "/state/home"}
+	valid := RuntimeIdentity{UID: 0, GID: 0, Home: "/state/home"}
 	if _, err := validateConfiguredIdentity(Config{StateDir: "/state"}, valid); err != nil {
 		t.Fatalf("validateConfiguredIdentity rejected container identity: %v", err)
 	}
@@ -200,12 +223,12 @@ func TestResolveIdentityReportsContainerIdentity(t *testing.T) {
 	if identity.UID != 0 || identity.GID != 0 {
 		t.Fatalf("identity = %d:%d, want retained root", identity.UID, identity.GID)
 	}
-	if got := strings.Count(output.String(), "retaining container UID/GID 0:0"); got != 1 {
+	if got := strings.Count(output.String(), "default UID/GID 0:0"); got != 1 {
 		t.Fatalf("runtime identity notice count = %d, output %q", got, output.String())
 	}
 }
 
-func TestPrepareOwnershipRunsOnlyWhenIdentityChanges(t *testing.T) {
+func TestPrepareOwnershipRepairsDriftDespiteLegacyMarker(t *testing.T) {
 	requireRoot(t)
 	cfg := newIdentityTestConfig(t)
 	nested := filepath.Join(cfg.DataDir, "nested.txt")
@@ -221,11 +244,15 @@ func TestPrepareOwnershipRunsOnlyWhenIdentityChanges(t *testing.T) {
 	}
 	assertPathOwner(t, nested, testRuntimeUID, testRuntimeGID)
 
+	writeMatchingOwnershipMarker(t, filepath.Join(cfg.StateDir, "ownership.json"), first.UID, first.GID)
 	chownTestPath(t, nested, 0, 0)
+	if err := os.Chmod(nested, 0o044); err != nil {
+		t.Fatal(err)
+	}
 	if err := PrepareOwnership(cfg, first); err != nil {
 		t.Fatal(err)
 	}
-	assertPathOwner(t, nested, 0, 0)
+	assertPathOwnerAndMode(t, nested, first.UID, first.GID, 0o644)
 
 	secondUID, secondGID := testRuntimeUID+1, testRuntimeGID+1
 	cfg.PUID, cfg.PGID = intPointer(secondUID), intPointer(secondGID)
@@ -239,7 +266,7 @@ func TestPrepareOwnershipRunsOnlyWhenIdentityChanges(t *testing.T) {
 	assertPathOwner(t, nested, secondUID, secondGID)
 }
 
-func TestPrepareOwnershipLogsExplicitMigrationOnlyWhenRequired(t *testing.T) {
+func TestPrepareOwnershipLogsEachRepairSummary(t *testing.T) {
 	requireRoot(t)
 	cfg := newIdentityTestConfig(t)
 	cfg.PUID, cfg.PGID = intPointer(testRuntimeUID), intPointer(testRuntimeGID)
@@ -266,7 +293,7 @@ func TestPrepareOwnershipLogsExplicitMigrationOnlyWhenRequired(t *testing.T) {
 	if err := PrepareOwnership(cfg, identity); err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Count(output.String(), "ownership migration"); got != 1 {
+	if got := strings.Count(output.String(), "ownership repair complete:"); got != 2 {
 		t.Fatalf("ownership migration log count = %d, output %q", got, output.String())
 	}
 }
@@ -293,7 +320,118 @@ func TestPrepareOwnershipUsesLchownForSymlinks(t *testing.T) {
 	assertPathOwner(t, external, 0, 0)
 }
 
-func TestPrepareOwnershipRecordsCompletedMigration(t *testing.T) {
+func TestPrepareOwnershipRepairsModesAndIsMetadataIdempotent(t *testing.T) {
+	requireRoot(t)
+	cfg := newIdentityTestConfig(t)
+	cfg.PUID, cfg.PGID = intPointer(testRuntimeUID), intPointer(testRuntimeGID)
+	identity, err := ResolveIdentity(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	private := filepath.Join(cfg.StateDir, "cache", "nested")
+	game := filepath.Join(cfg.ServerDir, "game")
+	saves := filepath.Join(cfg.DataDir, "saves")
+	for _, path := range []string{private, game, saves} {
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, path := range []string{game, saves} {
+		if err := os.Chmod(path, 0o055); err != nil {
+			t.Fatal(err)
+		}
+	}
+	files := []string{filepath.Join(private, "cached"), filepath.Join(game, "executable"), filepath.Join(saves, "save")}
+	for _, path := range files {
+		writeIdentityTestFile(t, path)
+		if err := os.Chmod(path, 0o155); err != nil {
+			t.Fatal(err)
+		}
+	}
+	outside := filepath.Join(identityTestBase(t), "wine-target")
+	if err := os.Mkdir(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outsideFile := filepath.Join(outside, "untouched")
+	writeIdentityTestFile(t, outsideFile)
+	link := filepath.Join(private, "z:")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := PrepareOwnership(cfg, identity); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{cfg.StateDir, filepath.Dir(private), private} {
+		assertPrivateDirectory(t, path, identity)
+	}
+	for _, path := range []string{game, saves} {
+		assertPathOwnerAndMode(t, path, identity.UID, identity.GID, 0o755)
+	}
+	for _, path := range files {
+		assertPathOwnerAndMode(t, path, identity.UID, identity.GID, 0o755)
+	}
+	assertPathOwnerAndMode(t, outside, 0, 0, 0o755)
+	assertPathOwnerAndMode(t, outsideFile, 0, 0, 0o600)
+	before := make(map[string]unix.Stat_t)
+	for _, root := range []string{cfg.ServerDir, cfg.DataDir} {
+		if err := filepath.WalkDir(root, func(path string, _ os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			var stat unix.Stat_t
+			if err := unix.Lstat(path, &stat); err != nil {
+				return err
+			}
+			before[path] = stat
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	hooks := ownershipHooks{beforeChown: func(_, _ string, _ int) error {
+		return errors.New("idempotent repair attempted chown")
+	}}
+	if err := prepareOwnership(cfg, identity, hooks); err != nil {
+		t.Fatal(err)
+	}
+	for path, want := range before {
+		var got unix.Stat_t
+		if err := unix.Lstat(path, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Ctim != want.Ctim || got.Mtim != want.Mtim || got.Mode != want.Mode || got.Uid != want.Uid || got.Gid != want.Gid {
+			t.Errorf("%s metadata changed on second repair", path)
+		}
+	}
+}
+
+func TestOwnershipRepairReportsPeriodicProgress(t *testing.T) {
+	requireRoot(t)
+	path := filepath.Join(identityTestBase(t), "progress")
+	writeIdentityTestFile(t, path)
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fd)
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&output)
+	t.Cleanup(func() { log.SetOutput(previous) })
+	progress := &ownershipProgress{lastLog: time.Now().Add(-6 * time.Second)}
+	if err := repairOwnershipMetadata(fd, "server", "progress", stat, RuntimeIdentity{}, ownershipHooks{progress: progress}, false); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "ownership repair progress: inspected=1 chowned=0 chmodded=0") {
+		t.Fatalf("missing progress counts: %s", output.String())
+	}
+}
+
+func TestPrepareOwnershipPreparesPrivateDirectories(t *testing.T) {
 	requireRoot(t)
 	cfg := newIdentityTestConfig(t)
 	if err := os.Mkdir(cfg.StateDir, 0o755); err != nil {
@@ -323,67 +461,10 @@ func TestPrepareOwnershipRecordsCompletedMigration(t *testing.T) {
 	} {
 		assertPrivateDirectory(t, directory, identity)
 	}
-	markerPath := filepath.Join(cfg.StateDir, "ownership.json")
-	data, err := os.ReadFile(markerPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var marker struct {
-		UID int `json:"uid"`
-		GID int `json:"gid"`
-	}
-	if err := json.Unmarshal(data, &marker); err != nil {
-		t.Fatal(err)
-	}
-	if marker.UID != identity.UID || marker.GID != identity.GID {
-		t.Fatalf("marker = %d:%d, want %d:%d", marker.UID, marker.GID, identity.UID, identity.GID)
-	}
-	assertPathOwnerAndMode(t, markerPath, identity.UID, identity.GID, 0o600)
-	assertNoOwnershipTemporaries(t, cfg.StateDir)
+
 }
 
-func TestPrepareOwnershipRetriesMissingOrIncompleteMarker(t *testing.T) {
-	requireRoot(t)
-	cfg := newIdentityTestConfig(t)
-	nested := filepath.Join(cfg.DataDir, "nested.txt")
-	writeIdentityTestFile(t, nested)
-	cfg.PUID, cfg.PGID = intPointer(testRuntimeUID), intPointer(testRuntimeGID)
-	identity, err := ResolveIdentity(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := PrepareOwnership(cfg, identity); err != nil {
-		t.Fatal(err)
-	}
-
-	markerPath := filepath.Join(cfg.StateDir, "ownership.json")
-	for _, rewrite := range []struct {
-		name string
-		do   func()
-	}{
-		{name: "missing", do: func() {
-			if err := os.Remove(markerPath); err != nil {
-				t.Fatal(err)
-			}
-		}},
-		{name: "incomplete", do: func() {
-			if err := os.WriteFile(markerPath, []byte(fmt.Sprintf(`{"uid":%d}`, identity.UID)), 0o600); err != nil {
-				t.Fatal(err)
-			}
-		}},
-	} {
-		t.Run(rewrite.name, func(t *testing.T) {
-			chownTestPath(t, nested, 0, 0)
-			rewrite.do()
-			if err := PrepareOwnership(cfg, identity); err != nil {
-				t.Fatal(err)
-			}
-			assertPathOwner(t, nested, identity.UID, identity.GID)
-		})
-	}
-}
-
-func TestPrepareOwnershipRejectsMarkerOutsidePrivateStateDirectory(t *testing.T) {
+func TestPrepareOwnershipRepairsInsecureStateDirectory(t *testing.T) {
 	requireRoot(t)
 	cfg := newIdentityTestConfig(t)
 	nested := filepath.Join(cfg.DataDir, "nested.txt")
@@ -408,45 +489,6 @@ func TestPrepareOwnershipRejectsMarkerOutsidePrivateStateDirectory(t *testing.T)
 	}
 	assertPathOwner(t, nested, identity.UID, identity.GID)
 	assertPrivateDirectory(t, cfg.StateDir, identity)
-}
-
-func TestPrepareOwnershipInvalidatesMarkerBeforePersistentFailure(t *testing.T) {
-	requireRoot(t)
-	cfg := newIdentityTestConfig(t)
-	if err := os.Mkdir(cfg.StateDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	markerPath := filepath.Join(cfg.StateDir, ownershipMarkerName)
-	marker := []byte(fmt.Sprintf(`{"uid":%d,"gid":%d}`, testRuntimeUID, testRuntimeGID))
-	if err := os.WriteFile(markerPath, marker, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	chownTestPath(t, markerPath, testRuntimeUID, testRuntimeGID)
-	nested := filepath.Join(cfg.DataDir, "persistent.txt")
-	writeIdentityTestFile(t, nested)
-	cfg.PUID, cfg.PGID = intPointer(testRuntimeUID), intPointer(testRuntimeGID)
-	identity, err := ResolveIdentity(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	injected := errors.New("injected persistent-data walk failure")
-	hooks := ownershipHooks{afterEntryInspect: func(mount string, _ int, name string, _ unix.Stat_t) error {
-		if mount == "persistent-data" && name == "persistent.txt" {
-			return injected
-		}
-		return nil
-	}}
-
-	if err := prepareOwnership(cfg, identity, hooks); !errors.Is(err, injected) {
-		t.Fatalf("prepareOwnership() error = %v, want injected failure", err)
-	}
-	if _, err := os.Lstat(markerPath); !os.IsNotExist(err) {
-		t.Errorf("ownership marker after partial migration error = %v, want not exist", err)
-	}
-	if err := PrepareOwnership(cfg, identity); err != nil {
-		t.Fatal(err)
-	}
-	assertPathOwner(t, nested, identity.UID, identity.GID)
 }
 
 func TestPrepareOwnershipRejectsRegularReplacedByDirectory(t *testing.T) {
@@ -511,7 +553,7 @@ func TestPrepareOwnershipRejectsDirectoryReplacementAfterOpen(t *testing.T) {
 	assertOwnershipMarkerAbsent(t, cfg.StateDir)
 }
 
-func TestPrepareOwnershipRejectsStateDirectoryReplacementDuringPublication(t *testing.T) {
+func TestPrepareOwnershipRejectsStateDirectoryReplacementDuringSync(t *testing.T) {
 	requireRoot(t)
 	cfg := newIdentityTestConfig(t)
 	cfg.PUID, cfg.PGID = intPointer(testRuntimeUID), intPointer(testRuntimeGID)
@@ -520,7 +562,10 @@ func TestPrepareOwnershipRejectsStateDirectoryReplacementDuringPublication(t *te
 		t.Fatal(err)
 	}
 	displaced := cfg.StateDir + ".displaced"
-	hooks := ownershipHooks{beforeMarkerRename: func() error {
+	hooks := ownershipHooks{syncFilesystem: func(mount string, fd int) error {
+		if mount != "persistent-data" {
+			return unix.Syncfs(fd)
+		}
 		if err := os.Rename(cfg.StateDir, displaced); err != nil {
 			return err
 		}
@@ -531,7 +576,7 @@ func TestPrepareOwnershipRejectsStateDirectoryReplacementDuringPublication(t *te
 	}}
 
 	if err := prepareOwnership(cfg, identity, hooks); err == nil {
-		t.Fatal("prepareOwnership accepted StateDir replacement during marker publication")
+		t.Fatal("prepareOwnership accepted StateDir replacement during final sync")
 	}
 	assertOwnershipMarkerAbsent(t, cfg.StateDir)
 }
@@ -542,7 +587,7 @@ func TestPrepareOwnershipReservesHeldStateDirectoryDuringServerWalk(t *testing.T
 	if err := os.Mkdir(cfg.StateDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	initialMarker := filepath.Join(cfg.StateDir, ownershipMarkerName)
+	initialMarker := filepath.Join(cfg.StateDir, "ownership.json")
 	writeMatchingOwnershipMarker(t, initialMarker, testRuntimeUID, testRuntimeGID)
 	trigger := filepath.Join(cfg.ServerDir, "!state-swap-trigger")
 	writeIdentityTestFile(t, trigger)
@@ -566,7 +611,7 @@ func TestPrepareOwnershipReservesHeldStateDirectoryDuringServerWalk(t *testing.T
 			if err := os.Mkdir(cfg.StateDir, 0o700); err != nil {
 				return err
 			}
-			writeMatchingOwnershipMarker(t, filepath.Join(cfg.StateDir, ownershipMarkerName), identity.UID, identity.GID)
+			writeMatchingOwnershipMarker(t, filepath.Join(cfg.StateDir, "ownership.json"), identity.UID, identity.GID)
 			return os.WriteFile(replacementContent, []byte("replacement"), 0o600)
 		}
 		if mount == "persistent-data" && name == "persistent.txt" {
@@ -613,7 +658,7 @@ func TestPrepareOwnershipRejectsInsertionAfterDirectorySnapshot(t *testing.T) {
 	assertOwnershipMarkerAbsent(t, cfg.StateDir)
 }
 
-func TestPrepareOwnershipVerifiesCompletedSubtreesBeforePublication(t *testing.T) {
+func TestPrepareOwnershipVerifiesCompletedSubtrees(t *testing.T) {
 	requireRoot(t)
 	cfg := newIdentityTestConfig(t)
 	earlier := filepath.Join(cfg.ServerDir, "a")
@@ -648,7 +693,7 @@ func TestPrepareOwnershipVerifiesCompletedSubtreesBeforePublication(t *testing.T
 	assertPathOwner(t, late, identity.UID, identity.GID)
 }
 
-func TestPrepareOwnershipDoesNotPublishAfterFilesystemSyncFailure(t *testing.T) {
+func TestPrepareOwnershipPropagatesFilesystemSyncFailure(t *testing.T) {
 	requireRoot(t)
 	for _, targetMount := range []string{"server", "persistent-data"} {
 		t.Run(targetMount, func(t *testing.T) {
@@ -691,7 +736,7 @@ func TestPrepareOwnershipDoesNotPublishAfterFilesystemSyncFailure(t *testing.T) 
 	}
 }
 
-func TestPrepareOwnershipHoldsBarrierDescriptorsFromBeforeFirstChownThroughPublication(t *testing.T) {
+func TestPrepareOwnershipHoldsBarrierDescriptorsThroughSync(t *testing.T) {
 	requireRoot(t)
 	cfg := newIdentityTestConfig(t)
 	writeIdentityTestFile(t, filepath.Join(cfg.ServerDir, "server.txt"))
@@ -707,7 +752,6 @@ func TestPrepareOwnershipHoldsBarrierDescriptorsFromBeforeFirstChownThroughPubli
 		synced   bool
 	}
 	barriers := make(map[string]barrierIdentity)
-	publicationObserved := false
 	hooks := ownershipHooks{
 		barrierOpened: func(mount string, fd int, stat unix.Stat_t) error {
 			barriers[mount] = barrierIdentity{fd: fd, dev: uint64(stat.Dev), ino: stat.Ino}
@@ -735,26 +779,15 @@ func TestPrepareOwnershipHoldsBarrierDescriptorsFromBeforeFirstChownThroughPubli
 			barriers[mount] = barrier
 			return unix.Syncfs(fd)
 		},
-		beforeMarkerRename: func() error {
-			for mount, barrier := range barriers {
-				var stat unix.Stat_t
-				if err := unix.Fstat(barrier.fd, &stat); err != nil {
-					return fmt.Errorf("barrier descriptor for %s closed before publication: %w", mount, err)
-				}
-				if uint64(stat.Dev) != barrier.dev || stat.Ino != barrier.ino || !barrier.synced {
-					return fmt.Errorf("barrier descriptor for %s was not retained and synced", mount)
-				}
-			}
-			publicationObserved = true
-			return nil
-		},
 	}
 
 	if err := prepareOwnership(cfg, identity, hooks); err != nil {
 		t.Fatal(err)
 	}
-	if !publicationObserved {
-		t.Fatal("marker publication did not observe retained barrier descriptors")
+	for mount, barrier := range barriers {
+		if !barrier.synced {
+			t.Fatalf("%s barrier was not synced", mount)
+		}
 	}
 }
 
@@ -792,7 +825,7 @@ func TestPrepareOwnershipRejectsDescendantFilesystemCrossing(t *testing.T) {
 	assertPathOwner(t, nested, identity.UID, identity.GID)
 }
 
-func TestPrepareOwnershipDoesNotPublishAfterRegularFileSyncFailure(t *testing.T) {
+func TestPrepareOwnershipPropagatesRegularFileSyncFailure(t *testing.T) {
 	requireRoot(t)
 	cfg := newIdentityTestConfig(t)
 	entry := filepath.Join(cfg.ServerDir, "durability.txt")
@@ -821,7 +854,7 @@ func TestPrepareOwnershipDoesNotPublishAfterRegularFileSyncFailure(t *testing.T)
 	assertPathOwner(t, entry, identity.UID, identity.GID)
 }
 
-func TestPrepareOwnershipDoesNotRecordFailedPrivateSetup(t *testing.T) {
+func TestPrepareOwnershipRejectsSymlinkedPrivateDirectory(t *testing.T) {
 	requireRoot(t)
 	cfg := newIdentityTestConfig(t)
 	if err := os.Mkdir(cfg.StateDir, 0o700); err != nil {
@@ -1075,22 +1108,9 @@ func assertNoIdentityProbes(t *testing.T, directory string) {
 	}
 }
 
-func assertNoOwnershipTemporaries(t *testing.T, directory string) {
-	t.Helper()
-	entries, err := os.ReadDir(directory)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, entry := range entries {
-		if strings.HasPrefix(entry.Name(), ".ownership.json.tmp-") {
-			t.Fatalf("ownership marker temporary %q remains", entry.Name())
-		}
-	}
-}
-
 func assertOwnershipMarkerAbsent(t *testing.T, stateDir string) {
 	t.Helper()
-	if _, err := os.Lstat(filepath.Join(stateDir, ownershipMarkerName)); !os.IsNotExist(err) {
+	if _, err := os.Lstat(filepath.Join(stateDir, "ownership.json")); !os.IsNotExist(err) {
 		t.Fatalf("ownership marker error = %v, want not exist", err)
 	}
 }

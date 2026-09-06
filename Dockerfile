@@ -104,6 +104,8 @@ LABEL org.opencontainers.image.source="https://github.com/saltydk/docker-vrising
 
 COPY --from=build /out/vrisingctl /usr/local/bin/vrisingctl
 
+USER 0:0
+
 VOLUME ["/mnt/vrising/server", "/mnt/vrising/persistentdata"]
 EXPOSE 9876/udp 9877/udp 25575/tcp
 
