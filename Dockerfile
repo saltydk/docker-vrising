@@ -42,7 +42,7 @@ RUN test "$TARGETOS/$TARGETARCH" = "linux/amd64" && \
     CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" \
     go build -trimpath -buildvcs=false -ldflags="-s -w" -o /out/fixture-sidecar /fixture-sidecar/main.go
 
-FROM ubuntu:22.04@sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc AS production
+FROM ubuntu:26.04@sha256:2260313b31c8c011cd2eebe728008efac1b3982be73eb71348ea2648d2c0e09b AS production
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG WINE_VERSION=11.0.0.0~jammy-1
