@@ -39,7 +39,7 @@ assert_inspect "volumes" '{{json .Config.Volumes}}' '{"/mnt/vrising/persistentda
 assert_inspect "ports" '{{json .Config.ExposedPorts}}' '{"25575/tcp":{},"9876/udp":{},"9877/udp":{}}'
 
 docker run --rm --entrypoint sh "$image" -c \
-	'test -x /usr/local/bin/vrisingctl && test -x /usr/bin/tini && command -v steamcmd && command -v wine64 && command -v Xvfb' \
+	'test -x /usr/local/bin/vrisingctl && test -x /usr/bin/tini && command -v steamcmd && command -v wine64 && command -v Xvfb && test "$LANG" = en_US.UTF-8 && test "$LC_ALL" = en_US.UTF-8 && locale -a | grep -Fxiq en_US.utf8' \
 	>/dev/null || fail "required executable probe failed"
 
 temp_dir=$(mktemp -d)

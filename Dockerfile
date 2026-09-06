@@ -69,15 +69,21 @@ RUN dpkg --add-architecture i386 && \
     apt-get install --yes --no-install-recommends \
       ca-certificates \
       gnupg \
+      locales \
       tini \
       tzdata \
       winbind \
       xvfb && \
+    locale-gen en_US.UTF-8 && \
+    update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 && \
     ln -s /usr/games/steamcmd /usr/local/bin/steamcmd && \
     if ! command -v wine64 >/dev/null 2>&1; then ln -s /opt/wine-stable/bin/wine /usr/local/bin/wine64; fi && \
     apt-get purge --yes curl software-properties-common && \
     apt-get autoremove --yes && \
     rm -rf /var/lib/apt/lists/* /var/cache/debconf/*-old
+
+ENV LANG=en_US.UTF-8 \
+    LC_ALL=en_US.UTF-8
 
 ARG VERSION
 ARG REVISION
