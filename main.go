@@ -89,6 +89,16 @@ func runCommand(output io.Writer, cfg Config) int {
 }
 
 func configureApplicationOutput(app *Application, output io.Writer) {
+	app.Output = output
+	if steam, ok := app.Steam.(*SteamClient); ok {
+		switch runner := steam.Runner.(type) {
+		case execCommandRunner:
+			runner.Output = output
+			steam.Runner = runner
+		case *execCommandRunner:
+			runner.Output = output
+		}
+	}
 	supervisor, ok := app.Supervisor.(*Supervisor)
 	if !ok {
 		return

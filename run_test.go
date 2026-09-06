@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -13,6 +14,48 @@ import (
 
 	"golang.org/x/sys/unix"
 )
+
+func TestExecCommandRunnerStreamsAndCapturesOutput(t *testing.T) {
+	var streamed bytes.Buffer
+	runner := execCommandRunner{Output: &streamed}
+	result, err := runner.Run(t.Context(), CommandSpec{
+		Path:         "/bin/sh",
+		Args:         []string{"-c", "printf 'steam stdout\\n'; printf 'steam stderr\\n' >&2"},
+		StreamOutput: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(result.Stdout); got != "steam stdout\n" {
+		t.Fatalf("captured stdout = %q", got)
+	}
+	if got := string(result.Stderr); got != "steam stderr\n" {
+		t.Fatalf("captured stderr = %q", got)
+	}
+	for _, want := range []string{"steam stdout", "steam stderr"} {
+		if !strings.Contains(streamed.String(), want) {
+			t.Fatalf("streamed output %q does not contain %q", streamed.String(), want)
+		}
+	}
+}
+
+func TestExecCommandRunnerCapturesWithoutStreamingWhenDisabled(t *testing.T) {
+	var streamed bytes.Buffer
+	runner := execCommandRunner{Output: &streamed}
+	result, err := runner.Run(t.Context(), CommandSpec{
+		Path: "/bin/sh",
+		Args: []string{"-c", "printf 'metadata output\\n'"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(result.Stdout); got != "metadata output\n" {
+		t.Fatalf("captured stdout = %q", got)
+	}
+	if streamed.Len() != 0 {
+		t.Fatalf("metadata output was unexpectedly streamed: %q", streamed.String())
+	}
+}
 
 type runRecorder struct {
 	events []string
@@ -425,6 +468,29 @@ func TestRunFirstInstallSuccess(t *testing.T) {
 		t.Fatalf("launch package lock = %#v, staged lock = %#v", got, fixture.mods.stageLock)
 	}
 	fixture.archives.assertClosed(t)
+}
+
+func TestRunReportsStartupProgress(t *testing.T) {
+	fixture := newRunFixture(t)
+	var output bytes.Buffer
+	fixture.app.Output = &output
+
+	if err := fixture.app.Run(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"startup: validating runtime mounts",
+		"mods: resolving KindredCommands=latest Satisvampory=latest",
+		"mods: fetching odjit-KindredCommands-2.5.8",
+		"steam: querying remote build metadata",
+		"steam: installing build 200",
+		"mods: applying generation candidate",
+		"server: launching build 200 with generation candidate",
+	} {
+		if !strings.Contains(output.String(), want) {
+			t.Fatalf("progress output %q does not contain %q", output.String(), want)
+		}
+	}
 }
 
 func TestRunRejectsRecordedLiveProcessBeforeMutation(t *testing.T) {

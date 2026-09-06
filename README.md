@@ -271,8 +271,10 @@ if that process dies or runtime state is incoherent. A known-good degraded
 fallback remains healthy and records its reason in `state.json` and container
 logs. RCON is not part of health.
 
-The controller mirrors the current logs to container stdout with `[server]`
-and `[bepinex]` source prefixes. Files remain at:
+The controller logs each startup phase, streams SteamCMD download/validation
+progress during an install, and mirrors the current game logs to container
+stdout with `[server]` and `[bepinex]` source prefixes. Follow it with
+`docker logs --follow v-rising`. Files remain at:
 
 - `/mnt/vrising/persistentdata/logs/VRisingServer-<UTC timestamp>-<sequence>.log`
 - `/mnt/vrising/server/BepInEx/LogOutput.log`

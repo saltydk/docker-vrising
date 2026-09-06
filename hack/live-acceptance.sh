@@ -25,6 +25,7 @@ network_created=false
 created_network_id=
 creation_handoff=false
 deferred_signal=0
+log_follower_pid=
 
 usage() {
 	printf 'usage: %s fresh IMAGE\n' "$0" >&2
@@ -161,6 +162,7 @@ network_identity_matches() {
 cleanup_created_resources() {
 	local failed=0
 
+	stop_log_follower
 	if [[ $container_created == true ]]; then
 		if container_identity_matches && docker rm -fv "$created_container_id" >/dev/null 2>&1; then
 			container_created=false
@@ -178,6 +180,20 @@ cleanup_created_resources() {
 		fi
 	fi
 	return "$failed"
+}
+
+start_log_follower() {
+	[[ -z $log_follower_pid ]] || fail "container log follower is already active"
+	printf 'live acceptance: streaming container logs for %s\n' "$created_container_id"
+	docker logs --follow "$created_container_id" &
+	log_follower_pid=$!
+}
+
+stop_log_follower() {
+	[[ -n $log_follower_pid ]] || return 0
+	kill "$log_follower_pid" >/dev/null 2>&1 || true
+	wait "$log_follower_pid" >/dev/null 2>&1 || true
+	log_follower_pid=
 }
 
 remove_temp_root() {
@@ -308,10 +324,12 @@ start_container() {
 	assert_container_owned
 	assert_bind_mounts
 	docker start "$created_container_id" >/dev/null || fail "could not start acceptance container"
+	start_log_follower
 }
 
 remove_container() {
 	assert_container_owned
+	stop_log_follower
 	docker rm -fv "$created_container_id" >/dev/null || fail "could not remove acceptance container"
 	container_created=false
 	created_container_id=

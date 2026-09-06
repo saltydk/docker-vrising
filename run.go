@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -70,6 +71,7 @@ type Application struct {
 	Steam      steamLifecycle
 	Supervisor serverSupervisor
 	Proc       ProcInspector
+	Output     io.Writer
 
 	stateStore      applicationStateStore
 	validateMounts  func(Config) error
@@ -120,7 +122,7 @@ func newApplication(cfg Config, identity RuntimeIdentity) *Application {
 			BackupDir: filepath.Join(cfg.StateDir, "backups"),
 		},
 		Steam: &SteamClient{
-			Runner:    execCommandRunner{},
+			Runner:    execCommandRunner{Output: os.Stdout},
 			SteamCMD:  "steamcmd",
 			ServerDir: cfg.ServerDir,
 			HomeDir:   identity.Home,
@@ -131,7 +133,8 @@ func newApplication(cfg Config, identity RuntimeIdentity) *Application {
 			Readiness: readiness,
 			Processes: ExecProcessFactory{Stdout: os.Stdout, Stderr: os.Stderr},
 		},
-		Proc: procFSInspector{},
+		Proc:   procFSInspector{},
+		Output: os.Stdout,
 	}
 }
 
@@ -139,6 +142,7 @@ func (a *Application) Run(ctx context.Context) (returnErr error) {
 	if err := a.dependenciesReady(); err != nil {
 		return exitFailure(exitPreflight, err)
 	}
+	a.progressf("startup: validating runtime mounts")
 	validateMounts := a.validateMounts
 	if validateMounts == nil {
 		validateMounts = validateRunMounts
@@ -152,6 +156,7 @@ func (a *Application) Run(ctx context.Context) (returnErr error) {
 	if err != nil {
 		return exitFailure(exitPreflight, fmt.Errorf("acquire lifetime lock: %w", err))
 	}
+	a.progressf("startup: acquired lifetime lock")
 	defer func() {
 		if err := lifetimeLock.Close(); err != nil {
 			closeErr := exitFailure(exitPreflight, fmt.Errorf("release lifetime lock: %w", err))
@@ -159,6 +164,7 @@ func (a *Application) Run(ctx context.Context) (returnErr error) {
 		}
 	}()
 
+	a.progressf("startup: recovering interrupted state")
 	if err := store.RecoverInterruptedTransaction(); err != nil {
 		var pending *PendingPromotionError
 		if !errors.As(err, &pending) || a.Mods == nil {
@@ -185,6 +191,7 @@ func (a *Application) Run(ctx context.Context) (returnErr error) {
 	if err != nil {
 		return exitFailure(exitPreflight, err)
 	}
+	a.progressf("steam: inspecting installed server build")
 	installed, installedErr := a.Steam.InstalledBuild()
 	active := StagedGeneration{}
 	activeErr := errors.New("active generation is unavailable")
@@ -249,6 +256,7 @@ func (a *Application) Run(ctx context.Context) (returnErr error) {
 	}
 
 	if a.Config.ModsEnabled {
+		a.progressf("mods: applying generation %s", selected.Record.ID)
 		if err := a.Mods.Apply(ctx, selected); err != nil {
 			if candidate {
 				return a.rollbackCandidate(ctx, fmt.Errorf("apply candidate mods: %w", err))
@@ -256,6 +264,7 @@ func (a *Application) Run(ctx context.Context) (returnErr error) {
 			return exitFailure(exitModUpdate, fmt.Errorf("reapply active mods: %w", err))
 		}
 		guardedStage = nil
+		a.progressf("mods: generation %s applied", selected.Record.ID)
 	}
 	if err := a.clearDegradedRuntime(store); err != nil {
 		if candidate {
@@ -372,6 +381,11 @@ func (a *Application) loadActiveGeneration(ctx context.Context, store applicatio
 }
 
 func (a *Application) stageCandidate(ctx context.Context, state State, active StagedGeneration) (StagedGeneration, error) {
+	a.progressf(
+		"mods: resolving KindredCommands=%s Satisvampory=%s",
+		a.Config.KindredVersion,
+		a.Config.SatisvamporyVersion,
+	)
 	graph, err := a.Resolver.Resolve(ctx, []RootSelection{
 		{Namespace: "odjit", Name: "KindredCommands", Version: a.Config.KindredVersion},
 		{Namespace: "Team_GreenEye", Name: "Satisvampory", Version: a.Config.SatisvamporyVersion},
@@ -389,6 +403,7 @@ func (a *Application) stageCandidate(ctx context.Context, state State, active St
 	}
 	archives := make(map[PackageRef]*ValidatedArchive, len(graph.Packages))
 	for _, pkg := range graph.Packages {
+		a.progressf("mods: fetching %s", pkg.FullName)
 		if _, duplicate := archives[pkg.Ref]; duplicate {
 			return StagedGeneration{}, errors.Join(
 				fmt.Errorf("resolved package graph contains duplicate %s/%s/%s", pkg.Ref.Namespace, pkg.Ref.Name, pkg.Ref.Version),
@@ -415,6 +430,7 @@ func (a *Application) stageCandidate(ctx context.Context, state State, active St
 		lock.Packages = append(lock.Packages, archives[pkg.Ref].LockedPackage())
 	}
 	lock.Digest = PackageLockDigest(lock)
+	a.progressf("mods: staging package set %s", lock.Digest)
 	if state.Failed != nil && state.Failed.LockDigest == lock.Digest {
 		return StagedGeneration{}, errors.Join(
 			fmt.Errorf("package lock %s was previously marked failed", lock.Digest),
@@ -435,6 +451,7 @@ func (a *Application) stageCandidate(ctx context.Context, state State, active St
 	if closeErr != nil {
 		return staged, closeErr
 	}
+	a.progressf("mods: staged generation %s", staged.Record.ID)
 	return staged, nil
 }
 
@@ -447,6 +464,7 @@ func (a *Application) prepareSteam(
 	active StagedGeneration,
 ) (SteamBuild, bool, error) {
 	if !a.Config.UpdateGame {
+		a.progressf("steam: updates disabled; validating installed build")
 		if installedErr != nil {
 			return SteamBuild{}, false, exitFailure(exitSteam, fmt.Errorf("validate installed Steam build: %w", installedErr))
 		}
@@ -457,6 +475,7 @@ func (a *Application) prepareSteam(
 		return validated, false, nil
 	}
 
+	a.progressf("steam: querying remote build metadata")
 	target, err := a.Steam.RemoteBuild(ctx)
 	if err != nil {
 		cause := fmt.Errorf("query remote Steam build: %w", err)
@@ -467,6 +486,7 @@ func (a *Application) prepareSteam(
 		return installed, true, nil
 	}
 	if installedErr == nil && installed == target {
+		a.progressf("steam: build %s is current", installed.BuildID)
 		validated, err := a.Steam.ValidateInstalled(installed)
 		if err != nil {
 			return SteamBuild{}, false, exitFailure(exitSteam, err)
@@ -475,6 +495,7 @@ func (a *Application) prepareSteam(
 	}
 
 	if installedErr == nil && installed.BuildID != "" {
+		a.progressf("backup: snapshotting build %s before %s", installed.BuildID, target.BuildID)
 		_, err := a.Backups.Create(ctx, BackupRequest{
 			InstalledBuild: installed.BuildID,
 			TargetBuild:    target.BuildID,
@@ -493,8 +514,10 @@ func (a *Application) prepareSteam(
 		}
 	}
 
+	a.progressf("steam: installing build %s", target.BuildID)
 	updated, err := a.Steam.Update(ctx, target)
 	if err == nil {
+		a.progressf("steam: validated build %s", updated.BuildID)
 		return updated, false, nil
 	}
 	var preMutation *SteamPreMutationError
@@ -575,6 +598,7 @@ func (a *Application) launch(ctx context.Context, selected StagedGeneration, ste
 	if pruneServerLogs == nil {
 		pruneServerLogs = PruneServerLogs
 	}
+	a.progressf("server: pruning owned logs")
 	if err := pruneServerLogs(a.Config.DataDir, a.Config.LogDays, a.clock()()); err != nil {
 		if candidate {
 			return a.rollbackCandidate(ctx, fmt.Errorf("prune server logs: %w", err))
@@ -591,6 +615,11 @@ func (a *Application) launch(ctx context.Context, selected StagedGeneration, ste
 			return err
 		}
 	}
+	generation := selected.Record.ID
+	if generation == "" {
+		generation = "mods-disabled"
+	}
+	a.progressf("server: launching build %s with generation %s", steam.BuildID, generation)
 	result, err := a.Supervisor.Run(ctx, LaunchRequest{
 		Config:      a.Config,
 		Identity:    a.Identity,
@@ -619,7 +648,15 @@ func (a *Application) launch(ctx context.Context, selected StagedGeneration, ste
 	if result.ExitCode != 0 {
 		return exitFailure(result.ExitCode, fmt.Errorf("server exited with status %d", result.ExitCode))
 	}
+	a.progressf("server: stopped cleanly")
 	return nil
+}
+
+func (a *Application) progressf(format string, args ...any) {
+	if a.Output == nil {
+		return
+	}
+	_, _ = fmt.Fprintf(a.Output, format+"\n", args...)
 }
 
 func (a *Application) rollbackCandidate(ctx context.Context, cause error) error {
@@ -686,16 +723,23 @@ func exitFailure(code int, err error) error {
 	return &runError{Code: code, Err: err}
 }
 
-type execCommandRunner struct{}
+type execCommandRunner struct {
+	Output io.Writer
+}
 
-func (execCommandRunner) Run(ctx context.Context, spec CommandSpec) (CommandResult, error) {
+func (r execCommandRunner) Run(ctx context.Context, spec CommandSpec) (CommandResult, error) {
 	command := exec.CommandContext(ctx, spec.Path, spec.Args...)
 	command.Env = slices.Clone(spec.Env)
 	command.Dir = spec.Dir
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
-	command.Stdout = &stdout
-	command.Stderr = &stderr
+	stream := io.Writer(io.Discard)
+	if spec.StreamOutput && r.Output != nil {
+		stream = r.Output
+	}
+	shared := &synchronizedWriter{writer: stream}
+	command.Stdout = io.MultiWriter(&stdout, shared)
+	command.Stderr = io.MultiWriter(&stderr, shared)
 	err := command.Run()
 	result := CommandResult{Stdout: stdout.Bytes(), Stderr: stderr.Bytes()}
 	if err == nil {
@@ -707,4 +751,15 @@ func (execCommandRunner) Run(ctx context.Context, spec CommandSpec) (CommandResu
 		return result, nil
 	}
 	return result, err
+}
+
+type synchronizedWriter struct {
+	mu     sync.Mutex
+	writer io.Writer
+}
+
+func (w *synchronizedWriter) Write(data []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.writer.Write(data)
 }

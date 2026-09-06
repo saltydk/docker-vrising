@@ -374,6 +374,8 @@ grep -Fq "network rm $fake_network_id " "$signal_state/calls" \
 	|| fail 'signal cleanup did not remove its created network'
 
 verify_state=$(run_cleanup_case verify-failure 1)
+grep -Fq "logs --follow $fake_container_id " "$verify_state/calls" \
+	|| fail 'acceptance did not stream the current container logs'
 grep -Eq '^exec .* vrisingctl verify' "$verify_state/calls" \
 	|| fail 'healthy acceptance did not invoke the deep live-state verifier'
 grep -Fq "rm -fv $fake_container_id " "$verify_state/calls" \
