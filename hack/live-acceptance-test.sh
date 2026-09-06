@@ -262,11 +262,12 @@ run_handoff_boundary_case() {
 	LIVE_SCRIPT="$live_script" BOUNDARY="$boundary" /bin/bash -c '
 		set -eTuo pipefail
 		source "$LIVE_SCRIPT"
+		trap handle_term TERM
 		case $BOUNDARY in
 			begin)
 				creation_handoff=false
 				deferred_signal=0
-				trap '\''if [[ $BASH_COMMAND == "creation_handoff=true" ]]; then trap - DEBUG; kill -TERM $$; fi'\'' DEBUG
+				trap '\''if [[ $BASH_COMMAND == "deferred_signal=0" ]]; then trap - DEBUG; kill -TERM $$; fi'\'' DEBUG
 				begin_creation_handoff
 				;;
 			finish)
