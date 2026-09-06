@@ -12,7 +12,8 @@ fail() {
 [[ ${HOME-} == /mnt/vrising/server/.docker-vrising/home ]] || fail 'unexpected HOME'
 [[ ${WINEPREFIX-} == /mnt/vrising/server/.docker-vrising/wineprefix ]] || fail 'unexpected WINEPREFIX'
 [[ ${DISPLAY-} == :99 ]] || fail 'unexpected DISPLAY'
-[[ ${WINEDLLOVERRIDES-} == winhttp=n,b || ${WINEDLLOVERRIDES-} == winhttp=b ]] || fail 'unexpected WINEDLLOVERRIDES'
+[[ ${WINEDLLOVERRIDES-} == 'winhttp=n,b' || ${WINEDLLOVERRIDES-} == 'winhttp=b' ]] \
+  || fail 'unexpected WINEDLLOVERRIDES'
 if (( $# != 1 )) || [[ $1 != -k ]]; then
   fail 'unexpected argv'
 fi

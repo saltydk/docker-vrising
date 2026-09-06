@@ -17,6 +17,55 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func TestReadinessRecognizesPublishedVCFStartup(t *testing.T) {
+	var evidence readinessEvidence
+	evidence.observe("[Message:VampireCommandFramework] VCF Loaded: 0.10.4", expectedModReadiness("2.5.8", "1.0.85"))
+	if !evidence.vcf {
+		t.Fatal("VCF startup captured from the actual published runtime was not recognized")
+	}
+}
+
+func TestReadinessRejectsCapturedInteropGenerationFailure(t *testing.T) {
+	line := "[Error  :InteropManager] Failed to generate Il2Cpp interop assemblies: System.AggregateException: One or more errors occurred. (Cannot assign a 252 metadata token to a Param.)"
+	if !fatalReadinessLine(line) {
+		t.Fatal("interop generation failure must stop startup before Wine enters its debugger")
+	}
+}
+
+func TestReadinessWatchStreamsAfterReady(t *testing.T) {
+	root := t.TempDir()
+	serverLog, bepInExLog := filepath.Join(root, "server.log"), filepath.Join(root, "bepinex.log")
+	writeLog(t, serverLog, "prior run\n")
+	writeLog(t, bepInExLog, "prior run\n")
+	output := newReadinessOutput()
+	monitor := ReadinessMonitor{ServerLog: serverLog, BepInExLog: bepInExLog, Output: output, PollEvery: time.Millisecond}
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	ready, done := make(chan struct{}), make(chan error, 1)
+	go func() {
+		done <- monitor.watch(ctx, expectedModReadiness("2.5.8", "1.0.85"), func() { close(ready) })
+	}()
+	appendUntilObserved(t, serverLog, output.server, done)
+	appendUntilObserved(t, bepInExLog, output.bepinex, done)
+	appendLog(t, serverLog, readLogFixture(t, "server-ready.log"))
+	appendLog(t, bepInExLog, readLogFixture(t, "bepinex-ready.log"))
+	select {
+	case <-ready:
+	case err := <-done:
+		t.Fatalf("watch ended before readiness: %v", err)
+	case <-ctx.Done():
+		t.Fatal("no readiness notification")
+	}
+	appendLog(t, serverLog, "post-start autosave completed\n")
+	waitForOutput(t, output, "[server] post-start autosave completed", done)
+	appendLog(t, bepInExLog, "failed to load plugin optional runtime resource\n")
+	waitForOutput(t, output, "[bepinex] failed to load plugin optional runtime resource", done)
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("watch cancellation = %v", err)
+	}
+}
+
 func TestReadinessRequiresServerBepInExVCFKindredAndSatisvampory(t *testing.T) {
 	root := t.TempDir()
 	serverLog := filepath.Join(root, "server.log")
@@ -638,7 +687,7 @@ func TestReadinessHandlesTruncationAndRotation(t *testing.T) {
 	waitForOutput(t, output, "current server generation", result)
 	writeLog(t, serverLog, readLogFixture(t, "server-ready.log"))
 	appendLog(t, bepInExLog, "[Message: BepInEx] Chainloader startup complete\n")
-	appendLog(t, bepInExLog, "Plugin gg.deca.VampireCommandFramework version 0.10.4 is loaded!\n")
+	appendLog(t, bepInExLog, "[Message:VampireCommandFramework] VCF Loaded: 0.10.4\n")
 	if err := os.Rename(bepInExLog, bepInExLog+".previous"); err != nil {
 		t.Fatal(err)
 	}
@@ -672,7 +721,7 @@ func TestReadinessDrainsAppendDuringRotationHandoff(t *testing.T) {
 				injectOnce.Do(func() {
 					injectErr = appendLogError(previousBepInExLog,
 						"[Message: BepInEx] Chainloader startup complete\n"+
-							"Plugin gg.deca.VampireCommandFramework version 0.10.4 is loaded!\n")
+							"[Message:VampireCommandFramework] VCF Loaded: 0.10.4\n")
 				})
 			}
 		}},

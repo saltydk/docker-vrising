@@ -1,5 +1,5 @@
 [Message:   BepInEx] Chainloader startup complete
-[Info   :VampireCommandFramework] Plugin gg.deca.VampireCommandFramework version 0.10.4 is loaded!
+[Message:VampireCommandFramework] VCF Loaded: 0.10.4
 [Info   :KindredCommands] Plugin aa.odjit.KindredCommands version 2.5.8 is loaded!
 [Info   :Satisvampory] Satisvampory 1.0.85 (Satisvampory) ready.
 [Fatal  :Doorstop] CoreCLR initialization failed

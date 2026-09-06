@@ -14,9 +14,9 @@ fail() {
 [[ ${DISPLAY-} == :99 ]] || fail 'unexpected DISPLAY'
 
 mods_enabled=${MODS_ENABLED:-true}
-expected_overrides=winhttp=n,b
+expected_overrides='winhttp=n,b'
 [[ $mods_enabled == true || $mods_enabled == false ]] || fail 'invalid MODS_ENABLED'
-[[ $mods_enabled == true ]] || expected_overrides=winhttp=b
+[[ $mods_enabled == true ]] || expected_overrides='winhttp=b'
 [[ ${WINEDLLOVERRIDES-} == "$expected_overrides" ]] || fail 'unexpected WINEDLLOVERRIDES'
 
 (( $# == 5 )) || fail 'unexpected argument count'
@@ -52,7 +52,7 @@ printf '%s\n' '2026-09-05T12:00:00Z [Info] [Server] Startup Completed' >>"$serve
 if [[ $mods_enabled == true ]]; then
   printf '%s\n' \
     '[Message:   BepInEx] Chainloader startup complete' \
-    '[Info   :VampireCommandFramework] Plugin gg.deca.VampireCommandFramework version 0.10.4 is loaded!' \
+    '[Message:VampireCommandFramework] VCF Loaded: 0.10.4' \
     "[Info   :KindredCommands] Plugin aa.odjit.KindredCommands version ${FIXTURE_KINDRED_VERSION:-2.5.8} is loaded!" \
     "[Info   :Satisvampory] Satisvampory ${FIXTURE_SATISVAMPORY_VERSION:-1.0.85} (Satisvampory) ready." \
     >>"$PWD/BepInEx/LogOutput.log"

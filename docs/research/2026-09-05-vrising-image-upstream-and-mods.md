@@ -16,6 +16,32 @@ The replacement also has a fixed deployment-compatibility boundary supplied for 
 
 ## 1. TrueOsiris upstream
 
+### Runtime-baseline addendum (2026-09-06)
+
+After the first production-image acceptance exposed fresh-prefix Wine behavior,
+the runtime audit was expanded to AndrewSav's TrueOsiris-derived image at
+commit [`cc2e8e5e4a2079e2567d954338479ec2a83d2126`](https://github.com/AndrewSav/vrising-docker/commit/cc2e8e5e4a2079e2567d954338479ec2a83d2126).
+That fork is a useful second executable baseline: it installs WineHQ stable
+with recommended packages, retries SteamCMD, copies the tested BepInEx pack
+layout, exports `WINEDLLOVERRIDES=winhttp=n,b`, and explicitly invokes
+`winecfg` before the server. [Dockerfile](https://github.com/AndrewSav/vrising-docker/blob/cc2e8e5e4a2079e2567d954338479ec2a83d2126/Dockerfile) ·
+[entrypoint](https://github.com/AndrewSav/vrising-docker/blob/cc2e8e5e4a2079e2567d954338479ec2a83d2126/entrypoint.sh)
+
+The initial criticism of the fork's pre-Xvfb `winecfg` sequence was not supported
+by a full runtime test. A subsequent test of its actual published image (Wine
+10.0), default entrypoint, `ENABLE_MODS=1`, three mounts, and independently
+verified packages successfully loaded all mods and started the game. The full
+stack remained running for five minutes after readiness and wrote autosaves.
+The earlier Wine 11 approximation also lacked installed mod DLLs after rollback,
+so it cannot establish mod compatibility or superiority of DLL suppression.
+
+The independent Ubuntu image therefore reproduces WineHQ 10.0 and the tested
+`winecfg`, five-second delay, then Xvfb sequence. Forced `mscoree`/`mshtml`
+suppression is not part of the selected runtime. Current VCF startup output is
+`[Message:VampireCommandFramework] VCF Loaded: 0.10.4`; the earlier synthetic
+`is loaded!` fixture was incorrect. See the separate runtime acceptance report
+for the exact image, packages, and limits of the evidence.
+
 ### Snapshot and history
 
 - Research was pinned to `main` commit [`cce267ba7c83eab33b0485cea063d22edfad7ee5`](https://github.com/TrueOsiris/docker-vrising/commit/cce267ba7c83eab33b0485cea063d22edfad7ee5), tree [`2ac715e322075b86f3bb4982af6ae01186c3d313`](https://api.github.com/repos/TrueOsiris/docker-vrising/git/trees/2ac715e322075b86f3bb4982af6ae01186c3d313), with 217 commits visible in the repository history. [Commit history](https://github.com/TrueOsiris/docker-vrising/commits/main/)

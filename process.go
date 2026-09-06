@@ -38,6 +38,7 @@ type ManagedProcess interface {
 }
 
 type ProcessFactory interface {
+	InitializeWine(context.Context, []string) error
 	StartXvfb(context.Context, []string) (ManagedProcess, string, error)
 	StartWine(context.Context, CommandSpec) (ManagedProcess, error)
 	KillWineServer(context.Context, []string) error
@@ -62,6 +63,7 @@ type Supervisor struct {
 	Readiness *ReadinessMonitor
 	Processes ProcessFactory
 	Now       func() time.Time
+	Output    io.Writer
 
 	waitReadiness func(context.Context, ReadinessMonitor, ExpectedReadiness) error
 	signals       <-chan os.Signal
@@ -173,12 +175,16 @@ func (s *Supervisor) Run(ctx context.Context, request LaunchRequest) (result Run
 
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
+	startupCtx, cancelStartup := context.WithTimeout(runCtx, request.Config.StartupTimeout)
+	defer cancelStartup()
+	signalChannel, stopSignals := s.signalChannel()
+	defer stopSignals()
 
 	var xvfb *runningProcess
 	var wine *runningProcess
 	var wineEnv []string
 	var runtimeRecorded bool
-	var readinessDone <-chan error
+	var readinessDone <-chan struct{}
 	defer func() {
 		cancelRun()
 		if readinessDone != nil {
@@ -203,7 +209,44 @@ func (s *Supervisor) Run(ctx context.Context, request LaunchRequest) (result Run
 		}
 	}()
 
-	xvfbProcess, display, startErr := s.Processes.StartXvfb(runCtx, []string{
+	wineEnv = buildWineEnvironment(request, "")
+	if s.Output != nil {
+		fmt.Fprintf(s.Output, "wine: initializing prefix %s with winecfg before Xvfb\n", filepath.Join(request.Config.StateDir, "wineprefix"))
+	}
+	initCtx, cancelInit := context.WithCancel(startupCtx)
+	defer cancelInit()
+	initDone := make(chan error, 1)
+	go func() { initDone <- s.Processes.InitializeWine(initCtx, wineEnv) }()
+	initProgress := time.NewTicker(30 * time.Second)
+	defer initProgress.Stop()
+	initialized := false
+	for !initialized {
+		select {
+		case err := <-initDone:
+			cancelInit()
+			if err != nil {
+				return RunResult{}, fmt.Errorf("initialize Wine: %w", err)
+			}
+			initialized = true
+		case received := <-signalChannel:
+			cancelInit()
+			<-initDone
+			return RunResult{}, fmt.Errorf("Wine initialization interrupted by %s", received)
+		case <-initCtx.Done():
+			cancelInit()
+			<-initDone
+			return RunResult{}, fmt.Errorf("initialize Wine: %w", initCtx.Err())
+		case <-initProgress.C:
+			if s.Output != nil {
+				fmt.Fprintln(s.Output, "wine: still waiting for prefix initialization")
+			}
+		}
+	}
+	initProgress.Stop()
+	if s.Output != nil {
+		fmt.Fprintln(s.Output, "wine: prefix initialized; starting Xvfb and dedicated server")
+	}
+	xvfbProcess, display, startErr := s.Processes.StartXvfb(startupCtx, []string{
 		"-displayfd", strconv.Itoa(xvfbDisplayFD),
 		"-screen", "0", "1024x768x24",
 		"-nolisten", "tcp",
@@ -270,24 +313,26 @@ func (s *Supervisor) Run(ctx context.Context, request LaunchRequest) (result Run
 	monitor.ServerLog = serverLog
 	monitor.BepInExLog = filepath.Join(request.Config.ServerDir, "BepInEx", "LogOutput.log")
 	waitReadiness := s.waitReadiness
-	if waitReadiness == nil {
-		waitReadiness = func(ctx context.Context, monitor ReadinessMonitor, expected ExpectedReadiness) error {
-			return monitor.Wait(ctx, expected)
-		}
-	}
-	readinessCtx, cancelReadiness := context.WithTimeout(runCtx, request.Config.StartupTimeout)
-	defer cancelReadiness()
+	startupDeadline := startupCtx.Done()
 	readinessResults := make(chan error, 1)
+	monitoringErrors := make(chan error, 1)
+	monitorDone := make(chan struct{})
 	go func() {
-		readinessResults <- waitReadiness(readinessCtx, monitor, expected)
+		defer close(monitorDone)
+		if waitReadiness != nil {
+			readinessResults <- waitReadiness(startupCtx, monitor, expected)
+			return
+		}
+		monitoringErrors <- monitor.watch(runCtx, expected, func() { readinessResults <- nil })
 	}()
-	readinessDone = readinessResults
-
-	signalChannel, stopSignals := s.signalChannel()
-	defer stopSignals()
+	readinessDone = monitorDone
 
 	for {
 		select {
+		case <-startupDeadline:
+			return result, fmt.Errorf("wait for server readiness: %w", startupCtx.Err())
+		case err := <-monitoringErrors:
+			return result, fmt.Errorf("monitor server logs: %w", err)
 		case <-xvfb.done:
 			cancelRun()
 			returnErr = s.stopWine(ctx, wine, syscall.SIGTERM, request.Config.ShutdownTimeout, wineEnv)
@@ -298,7 +343,6 @@ func (s *Supervisor) Run(ctx context.Context, request LaunchRequest) (result Run
 			result.ExitCode = wine.result.exitCode
 			return result, wineExitError(wine, xvfb)
 		case readinessErr := <-readinessResults:
-			readinessDone = nil
 			if readinessErr != nil {
 				cancelRun()
 				returnErr = s.stopWine(ctx, wine, syscall.SIGTERM, request.Config.ShutdownTimeout, wineEnv)
@@ -355,6 +399,11 @@ func (s *Supervisor) Run(ctx context.Context, request LaunchRequest) (result Run
 				return result, errors.Join(fmt.Errorf("save ready runtime state: %w", err), returnErr)
 			}
 			result.Ready = true
+			startupDeadline = nil
+			cancelStartup()
+			if s.Output != nil {
+				fmt.Fprintln(s.Output, "server: ready; continuing game and mod log streaming")
+			}
 			readinessResults = nil
 		case received := <-signalChannel:
 			if received != syscall.SIGTERM && received != os.Interrupt {
@@ -363,6 +412,9 @@ func (s *Supervisor) Run(ctx context.Context, request LaunchRequest) (result Run
 			cancelRun()
 			returnErr = s.stopWine(ctx, wine, received, request.Config.ShutdownTimeout, wineEnv)
 			result.ExitCode = wine.result.exitCode
+			if signal, ok := received.(syscall.Signal); ok && result.ExitCode == 128+int(signal) {
+				result.ExitCode = 0
+			}
 			return result, errors.Join(returnErr, processExitError("Wine", wine.result))
 		case <-ctx.Done():
 			cancelRun()
@@ -431,6 +483,8 @@ func buildWineEnvironment(request LaunchRequest, display string) []string {
 	env = setEnvironmentValue(env, "WINEPREFIX", filepath.Join(request.Config.StateDir, "wineprefix"))
 	if display != "" {
 		env = setEnvironmentValue(env, "DISPLAY", ":"+strings.TrimPrefix(strings.TrimSpace(display), ":"))
+	} else {
+		env = slices.DeleteFunc(env, func(entry string) bool { return strings.HasPrefix(entry, "DISPLAY=") })
 	}
 	overrides, _ := environmentValue(env, "WINEDLLOVERRIDES")
 	override := "winhttp=b"
@@ -605,9 +659,45 @@ func wrapError(action string, err error) error {
 type ExecProcessFactory struct {
 	XvfbPath       string
 	WinePath       string
+	WineConfigPath string
 	WineServerPath string
 	Stdout         io.Writer
 	Stderr         io.Writer
+}
+
+// InitializeWine follows the upstream headless winecfg + delay sequence.
+// Starting Xvfb first can expose interactive installer windows on a fresh prefix.
+func (f ExecProcessFactory) InitializeWine(ctx context.Context, env []string) (returnErr error) {
+	defer func() {
+		if returnErr != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+			defer cancel()
+			returnErr = errors.Join(returnErr, f.KillWineServer(cleanupCtx, env))
+		}
+	}()
+	path := f.WineConfigPath
+	if path == "" {
+		path = "winecfg"
+	}
+	command := exec.CommandContext(ctx, path)
+	command.Env = slices.Clone(env)
+	command.Dir = "/"
+	command.Stdout = f.output()
+	command.Stderr = f.errorOutput()
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	command.Cancel = func() error { return syscall.Kill(-command.Process.Pid, syscall.SIGKILL) }
+	command.WaitDelay = 2 * time.Second
+	if err := command.Run(); err != nil {
+		return fmt.Errorf("execute winecfg: %w", err)
+	}
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (f ExecProcessFactory) StartXvfb(ctx context.Context, args []string) (ManagedProcess, string, error) {
@@ -773,6 +863,9 @@ func (p *execManagedProcess) Wait() (int, error) {
 		return -1, err
 	}
 	exitCode := p.command.ProcessState.ExitCode()
+	if status, ok := p.command.ProcessState.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+		exitCode = 128 + int(status.Signal())
+	}
 	var exitError *exec.ExitError
 	if errors.As(err, &exitError) {
 		return exitCode, nil

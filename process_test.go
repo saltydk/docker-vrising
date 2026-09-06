@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -121,6 +122,7 @@ type fakeProcessFactory struct {
 	startXvfbErr    error
 	startWineErr    error
 	killWineHook    func()
+	initializeWine  func(context.Context, []string) error
 }
 
 func newFakeProcessFactory() *fakeProcessFactory {
@@ -142,6 +144,101 @@ func (f *fakeProcessFactory) StartXvfb(_ context.Context, args []string) (Manage
 	f.startOrder = append(f.startOrder, "xvfb")
 	f.xvfbArgs = slices.Clone(args)
 	return f.xvfb, f.display, f.startXvfbErr
+}
+
+func (f *fakeProcessFactory) InitializeWine(ctx context.Context, env []string) error {
+	f.mu.Lock()
+	f.startOrder = append(f.startOrder, "winecfg")
+	f.mu.Unlock()
+	if f.initializeWine != nil {
+		return f.initializeWine(ctx, env)
+	}
+	return ctx.Err()
+}
+
+func TestSupervisorCancelsWineInitializationOnTERM(t *testing.T) {
+	request, store := testLaunchRequest(t, true)
+	request.Config.BaseEnv = append(request.Config.BaseEnv, "DISPLAY=:existing")
+	factory := newFakeProcessFactory()
+	started := make(chan struct{})
+	factory.initializeWine = func(ctx context.Context, env []string) error {
+		if _, present := envValue(env, "DISPLAY"); present {
+			t.Error("winecfg inherited DISPLAY")
+		}
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	supervisor := testSupervisor(store, factory)
+	signals := make(chan os.Signal, 1)
+	supervisor.signals = signals
+	done := make(chan error, 1)
+	go func() { _, err := supervisor.Run(t.Context(), request); done <- err }()
+	<-started
+	signals <- syscall.SIGTERM
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("initialization cancellation was not reported")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Wine initialization ignored TERM")
+	}
+	order, _, _, _ := factory.snapshot()
+	if !slices.Equal(order, []string{"winecfg"}) {
+		t.Fatalf("started processes after cancelled bootstrap: %v", order)
+	}
+}
+
+func TestExecManagedProcessReportsSignalExitStatus(t *testing.T) {
+	command := exec.Command("sh", "-c", "kill -TERM $$")
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	code, err := (&execManagedProcess{command: command}).Wait()
+	if err != nil || code != 143 {
+		t.Fatalf("Wait() = %d, %v; want 143", code, err)
+	}
+}
+
+func TestSupervisorAcceptsRequestedSignalExit(t *testing.T) {
+	request, store := testLaunchRequest(t, true)
+	factory := newFakeProcessFactory()
+	factory.wine.exitOn[syscall.SIGTERM] = 143
+	supervisor := testSupervisor(store, factory)
+	signals := make(chan os.Signal, 1)
+	supervisor.signals = signals
+	outcome := runSupervisor(t, supervisor, request, factory)
+	waitForReadyState(t, factory)
+	signals <- syscall.SIGTERM
+	got := receiveOutcome(t, outcome)
+	if got.err != nil || got.result.ExitCode != 0 {
+		t.Fatalf("requested TERM = %#v, %v", got.result, got.err)
+	}
+}
+
+func TestSupervisorUsesOneStartupDeadline(t *testing.T) {
+	request, store := testLaunchRequest(t, true)
+	factory := newFakeProcessFactory()
+	var initializationDeadline time.Time
+	factory.initializeWine = func(ctx context.Context, _ []string) error {
+		initializationDeadline, _ = ctx.Deadline()
+		return nil
+	}
+	supervisor := testSupervisor(store, factory)
+	supervisor.waitReadiness = func(ctx context.Context, _ ReadinessMonitor, _ ExpectedReadiness) error {
+		deadline, ok := ctx.Deadline()
+		if !ok || deadline != initializationDeadline {
+			return fmt.Errorf("readiness extended the startup deadline: %v != %v", deadline, initializationDeadline)
+		}
+		return nil
+	}
+	outcome := runSupervisor(t, supervisor, request, factory)
+	waitForReadyState(t, factory)
+	factory.wine.finish(0, nil)
+	if got := receiveOutcome(t, outcome); got.err != nil {
+		t.Fatal(got.err)
+	}
 }
 
 func (f *fakeProcessFactory) StartWine(_ context.Context, spec CommandSpec) (ManagedProcess, error) {
@@ -333,7 +430,7 @@ func TestSupervisorStartsXvfbBeforeWine(t *testing.T) {
 	}
 
 	order, xvfbArgs, _, _ := factory.snapshot()
-	if !slices.Equal(order, []string{"xvfb", "wine"}) {
+	if !slices.Equal(order, []string{"winecfg", "xvfb", "wine"}) {
 		t.Fatalf("start order = %v", order)
 	}
 	if !slices.Contains(xvfbArgs, "-displayfd") {
@@ -431,6 +528,46 @@ func TestSupervisorForcesBuiltinWinHTTPWhenModsDisabled(t *testing.T) {
 	debug, _ := envValue(specs[0].Env, "WINEDEBUG")
 	if debug != "-all" {
 		t.Fatalf("WINEDEBUG = %q", debug)
+	}
+}
+
+func TestBuildWineEnvironmentPreservesUserRuntimeOverrides(t *testing.T) {
+	request, _ := testLaunchRequest(t, true)
+	request.Config.BaseEnv = []string{
+		"PATH=/usr/bin",
+		"WINEDLLOVERRIDES=foo,mscoree,winhttp=n;bar=b;mshtml=n,b",
+	}
+
+	env := buildWineEnvironment(request, "77")
+	overrides, ok := envValue(env, "WINEDLLOVERRIDES")
+	if !ok {
+		t.Fatal("WINEDLLOVERRIDES is missing")
+	}
+	if overrides != "foo,mscoree=n;bar=b;mshtml=n,b;winhttp=n,b" {
+		t.Fatalf("WINEDLLOVERRIDES = %q", overrides)
+	}
+}
+
+func TestSupervisorLogsWineInitialization(t *testing.T) {
+	request, store := testLaunchRequest(t, true)
+	factory := newFakeProcessFactory()
+	supervisor := testSupervisor(store, factory)
+	var output bytes.Buffer
+	supervisor.Output = &output
+
+	outcome := runSupervisor(t, supervisor, request, factory)
+	waitForReadyState(t, factory)
+	factory.wine.finish(0, nil)
+	if got := receiveOutcome(t, outcome); got.err != nil {
+		t.Fatalf("Run() error = %v", got.err)
+	}
+
+	want := fmt.Sprintf(
+		"wine: initializing prefix %s with winecfg before Xvfb\nwine: prefix initialized; starting Xvfb and dedicated server\nserver: ready; continuing game and mod log streaming\n",
+		filepath.Join(request.Config.StateDir, "wineprefix"),
+	)
+	if output.String() != want {
+		t.Fatalf("output = %q, want %q", output.String(), want)
 	}
 }
 
@@ -1129,7 +1266,7 @@ func TestSupervisorRemovesStaleBepInExLogWithoutFollowingLinks(t *testing.T) {
 			t.Fatalf("outside log changed: content=%q err=%v", content, readErr)
 		}
 		order, _, _, _ := factory.snapshot()
-		if !slices.Equal(order, []string{"xvfb"}) {
+		if !slices.Equal(order, []string{"winecfg", "xvfb"}) {
 			t.Fatalf("start order = %v, Wine must not start", order)
 		}
 		_, xvfbWaits, _ := factory.xvfb.snapshot()

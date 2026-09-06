@@ -106,6 +106,7 @@ func configureApplicationOutput(app *Application, output io.Writer) {
 	if supervisor.Readiness != nil {
 		supervisor.Readiness.Output = output
 	}
+	supervisor.Output = output
 	if processes, ok := supervisor.Processes.(ExecProcessFactory); ok {
 		processes.Stdout = output
 		processes.Stderr = output

@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+fail() { echo "fake winecfg: $*" >&2; exit 64; }
+[[ $# == 0 ]] || fail 'unexpected argv'
+[[ $PWD == / ]] || fail 'unexpected cwd'
+[[ ${DISPLAY+x} != x ]] || fail 'DISPLAY must be absent before prefix initialization'
+[[ ${HOME-} == /mnt/vrising/server/.docker-vrising/home ]] || fail 'unexpected HOME'
+[[ ${WINEPREFIX-} == /mnt/vrising/server/.docker-vrising/wineprefix ]] || fail 'unexpected WINEPREFIX'
+[[ ${FIXTURE_RECORD_DIR-} == /fixture/records ]] || fail 'unexpected record directory'
+[[ ${FIXTURE_RUN_TOKEN-} =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]] || fail 'invalid run token'
+mkdir -p "$FIXTURE_RECORD_DIR/runs/$FIXTURE_RUN_TOKEN"
+printf 'winecfg\n' >"$FIXTURE_RECORD_DIR/runs/$FIXTURE_RUN_TOKEN/winecfg.started"

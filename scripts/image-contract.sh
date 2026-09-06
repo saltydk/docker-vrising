@@ -39,8 +39,46 @@ assert_inspect "volumes" '{{json .Config.Volumes}}' '{"/mnt/vrising/persistentda
 assert_inspect "ports" '{{json .Config.ExposedPorts}}' '{"25575/tcp":{},"9876/udp":{},"9877/udp":{}}'
 
 docker run --rm --entrypoint sh "$image" -c \
-	'test -x /usr/local/bin/vrisingctl && test -x /usr/bin/tini && command -v steamcmd && command -v wine64 && command -v Xvfb && test "$LANG" = en_US.UTF-8 && test "$LC_ALL" = en_US.UTF-8 && locale -a | grep -Fxiq en_US.utf8' \
+	'test -x /usr/local/bin/vrisingctl && test -x /usr/bin/tini && command -v steamcmd && command -v wine64 && command -v wineboot && command -v wineserver && command -v Xvfb && test "$LANG" = en_US.UTF-8 && test "$LC_ALL" = en_US.UTF-8 && locale -a | grep -Fxiq en_US.utf8' \
 	>/dev/null || fail "required executable probe failed"
+
+docker run --rm --entrypoint bash "$image" -c '
+	set -euo pipefail
+	export HOME=/tmp/vrising-wine-home
+	export WINEPREFIX=/tmp/vrising-wine-prefix
+	export WINEDLLOVERRIDES="winhttp=n,b"
+	mkdir -p "$HOME"
+	unset DISPLAY
+	timeout --signal=TERM --kill-after=5 60 winecfg >/tmp/winecfg.log 2>&1
+	sleep 5
+	Xvfb :99 -screen 0 1024x768x24 -nolisten tcp >/tmp/xvfb.log 2>&1 &
+	xvfb_pid=$!
+	cleanup() {
+		env DISPLAY=:99 wineserver -k >/dev/null 2>&1 || true
+		kill "$xvfb_pid" >/dev/null 2>&1 || true
+		wait "$xvfb_pid" >/dev/null 2>&1 || true
+	}
+	trap cleanup EXIT
+	for _ in {1..50}; do
+		[[ -S /tmp/.X11-unix/X99 ]] && break
+		sleep 0.1
+	done
+	[[ -S /tmp/.X11-unix/X99 ]]
+	for _ in {1..300}; do
+		[[ -f "$WINEPREFIX/system.reg" ]] && break
+		sleep 0.1
+	done
+	[[ -f "$WINEPREFIX/system.reg" ]]
+	for process in /proc/[0-9]*/comm; do
+		[[ -r $process ]] || continue
+		[[ $(<"$process") == control.exe ]] || continue
+		arguments=${process%/comm}/cmdline
+		[[ -r $arguments ]] || continue
+		command=$(tr "\0" " " <"$arguments")
+		[[ $command != *" appwiz.cpl install_mono"* ]]
+		[[ $command != *" appwiz.cpl install_gecko"* ]]
+	done
+' >/dev/null || fail "fresh Wine prefix did not initialize non-interactively"
 
 temp_dir=$(mktemp -d)
 readonly temp_dir

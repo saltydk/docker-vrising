@@ -45,10 +45,11 @@ RUN test "$TARGETOS/$TARGETARCH" = "linux/amd64" && \
 FROM ubuntu:22.04@sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc AS production
 
 ARG DEBIAN_FRONTEND=noninteractive
+ARG WINE_VERSION=10.0.0.0~jammy-1
 
 RUN dpkg --add-architecture i386 && \
     apt-get update && \
-    apt-get install --yes --no-install-recommends \
+    apt-get install --yes \
       ca-certificates \
       curl \
       gnupg \
@@ -64,22 +65,28 @@ RUN dpkg --add-architecture i386 && \
     printf '%s\n' 'steam steam/question select I AGREE' 'steam steam/license note' | debconf-set-selections && \
     apt-get update && \
     apt-get install --yes --install-recommends \
-      steamcmd \
-      winehq-stable && \
-    apt-get install --yes --no-install-recommends \
+      winehq-stable=${WINE_VERSION} \
+      wine-stable=${WINE_VERSION} \
+      wine-stable-amd64=${WINE_VERSION} \
+      wine-stable-i386:i386=${WINE_VERSION} && \
+    apt-get install --yes \
       ca-certificates \
+      gdebi-core \
       gnupg \
+      libgl1-mesa-glx:i386 \
       locales \
+      steam \
+      steamcmd \
       tini \
       tzdata \
       winbind \
+      winetricks \
       xvfb && \
     locale-gen en_US.UTF-8 && \
     update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 && \
     ln -s /usr/games/steamcmd /usr/local/bin/steamcmd && \
     if ! command -v wine64 >/dev/null 2>&1; then ln -s /opt/wine-stable/bin/wine /usr/local/bin/wine64; fi && \
-    apt-get purge --yes curl software-properties-common && \
-    apt-get autoremove --yes && \
+    apt-get clean && \
     rm -rf /var/lib/apt/lists/* /var/cache/debconf/*-old
 
 ENV LANG=en_US.UTF-8 \

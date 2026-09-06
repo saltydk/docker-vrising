@@ -376,6 +376,7 @@ func newRunFixture(t *testing.T) *runFixture {
 	serverDir := filepath.Join(root, "server")
 	dataDir := filepath.Join(root, "data")
 	stateDir := filepath.Join(serverDir, ".state")
+	writeTestServerSettings(t, serverDir)
 	for _, dir := range []string{serverDir, dataDir, stateDir} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			t.Fatal(err)

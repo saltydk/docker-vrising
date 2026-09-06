@@ -250,6 +250,7 @@ wait_healthy() {
 
 assert_run_started() {
   local run_dir=$record_dir/runs/$1
+  [[ -s $run_dir/winecfg.started ]] || fail "Wine initialization evidence missing for $1"
   [[ -s $run_dir/wine.pid && -s $run_dir/wine.argv && -s $run_dir/wine.env ]] || fail "Wine evidence missing for $1"
   [[ -s $run_dir/xvfb.pid && -s $run_dir/xvfb.argv && -s $run_dir/xvfb.env ]] || fail "Xvfb evidence missing for $1"
 }
@@ -571,7 +572,8 @@ assert_run_started "$current_run_token"
 [[ $(tree_digest "$server_dir/.docker-vrising/cache") == "$cache_before" ]] || fail 'unmodded start changed package cache'
 [[ $(tree_digest "$server_dir/.docker-vrising/generations") == "$generations_before" ]] || fail 'unmodded start changed generations'
 [[ $(sha256sum "$server_dir/BepInEx/config/BepInEx.cfg" | cut -d ' ' -f1) == "$config_before" ]] || fail 'unmodded start changed BepInEx configuration'
-grep -Fxq 'WINEDLLOVERRIDES=winhttp=b' "$record_dir/runs/$current_run_token/wine.env" || fail 'unmodded Wine environment is wrong'
+grep -Fxq 'WINEDLLOVERRIDES=winhttp=b' "$record_dir/runs/$current_run_token/wine.env" \
+  || fail 'unmodded Wine environment is wrong'
 assert_identity_unchanged "$baseline_identity" 'unmodded launch'
 assert_sentinels
 

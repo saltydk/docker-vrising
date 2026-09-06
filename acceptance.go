@@ -70,19 +70,7 @@ func ValidateLiveInstallation(ctx context.Context, cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("validate live active generation: %w", err)
 	}
-	for _, managed := range active.Manifest.Files {
-		snapshot, exists, err := snapshotFileBelow(cfg.ServerDir, managed.RelativePath)
-		if err != nil {
-			return fmt.Errorf("open live managed file %s without following links: %w", managed.RelativePath, err)
-		}
-		if !exists {
-			return fmt.Errorf("live managed file %s is missing", managed.RelativePath)
-		}
-		if snapshot.SHA256 != managed.SHA256 || snapshot.Mode.Perm() != managed.Mode.Perm() {
-			return fmt.Errorf("live managed file %s does not match its manifest", managed.RelativePath)
-		}
-	}
-	return nil
+	return verifyInstalledManagedFiles(ctx, cfg.ServerDir, active.Manifest)
 }
 
 func validateLivePackageLock(lock PackageLock) error {

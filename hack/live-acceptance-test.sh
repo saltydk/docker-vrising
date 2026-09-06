@@ -521,4 +521,38 @@ set -e
 [[ $nosleep_status -eq 1 && $nosleep_output == *'required command is unavailable: sleep'* ]] \
 	|| fail "missing sleep was not rejected during prerequisite checks: $nosleep_output"
 
+(
+	# The loaded-save record is captured from real Wine server output.
+	# shellcheck source=hack/live-acceptance.sh
+	source "$live_script"
+	temp_root=$sandbox/save-evidence
+	source_data_dir=$temp_root/source
+	mkdir -p "$source_data_dir/Settings" "$source_data_dir/Saves/v4/world1"
+	printf '{"SaveName":"world1"}\n' >"$source_data_dir/Settings/ServerHostSettings.json"
+	printf 'original-save\n' >"$source_data_dir/Saves/v4/world1/AutoSave_0.save.gz"
+	created_container_id=fixture
+	loaded_name=AutoSave_0.save.gz
+	docker() {
+		printf '[server] CreateAndHostServer - SaveDirectory:Z:\\mnt\\vrising\\persistentdata\\Saves\\v4\\world1, Loaded Save:%s\n' "$loaded_name"
+	}
+	assert_loaded_existing_save
+	loaded_name='<None>'
+	if (assert_loaded_existing_save) >/dev/null 2>&1; then
+		fail 'a newly created world passed migration acceptance'
+	fi
+	loaded_name=AutoSave_99.save.gz
+	if (assert_loaded_existing_save) >/dev/null 2>&1; then
+		fail 'a save absent from the source passed migration acceptance'
+	fi
+	snapshot_protected_tree "$source_data_dir" "$temp_root/before" settings
+	printf 'game-written-save\n' >"$source_data_dir/Saves/v4/world1/AutoSave_0.save.gz"
+	snapshot_protected_tree "$source_data_dir" "$temp_root/after" settings
+	assert_snapshot_preserved "$temp_root/before" "$temp_root/after"
+	printf '{"SaveName":"wrong-world"}\n' >"$source_data_dir/Settings/ServerHostSettings.json"
+	snapshot_protected_tree "$source_data_dir" "$temp_root/after" settings
+	if (assert_snapshot_preserved "$temp_root/before" "$temp_root/after") >/dev/null 2>&1; then
+		fail 'modified existing settings passed migration acceptance'
+	fi
+)
+
 printf 'live acceptance helper tests: PASS\n'

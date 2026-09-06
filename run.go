@@ -236,6 +236,9 @@ func (a *Application) Run(ctx context.Context) (returnErr error) {
 			if activeErr != nil {
 				return exitFailure(exitModUpdate, fmt.Errorf("UPDATE_MODS=false requires a valid active generation: %w", activeErr))
 			}
+			if err := verifyInstalledManagedFiles(ctx, a.Config.ServerDir, active.Manifest); err != nil {
+				return exitFailure(exitModUpdate, fmt.Errorf("validate frozen mod installation: %w", err))
+			}
 			if err := a.validateKnownGoodSteam(state, installed, installedErr); err != nil {
 				return exitFailure(exitSteam, fmt.Errorf("UPDATE_MODS=false requires a valid recorded Steam runtime: %w", err))
 			}
@@ -255,13 +258,10 @@ func (a *Application) Run(ctx context.Context) (returnErr error) {
 		return a.launch(ctx, active, installed, false)
 	}
 
-	if a.Config.ModsEnabled {
+	if a.Config.ModsEnabled && candidate {
 		a.progressf("mods: applying generation %s", selected.Record.ID)
 		if err := a.Mods.Apply(ctx, selected); err != nil {
-			if candidate {
-				return a.rollbackCandidate(ctx, fmt.Errorf("apply candidate mods: %w", err))
-			}
-			return exitFailure(exitModUpdate, fmt.Errorf("reapply active mods: %w", err))
+			return a.rollbackCandidate(ctx, fmt.Errorf("apply candidate mods: %w", err))
 		}
 		guardedStage = nil
 		a.progressf("mods: generation %s applied", selected.Record.ID)
@@ -479,7 +479,7 @@ func (a *Application) prepareSteam(
 	target, err := a.Steam.RemoteBuild(ctx)
 	if err != nil {
 		cause := fmt.Errorf("query remote Steam build: %w", err)
-		fallbackErr := a.recordFallback(store, state, installed, installedErr, active, cause)
+		fallbackErr := a.recordFallback(ctx, store, state, installed, installedErr, active, cause)
 		if fallbackErr != nil {
 			return SteamBuild{}, false, exitFailure(exitSteam, errors.Join(cause, fallbackErr))
 		}
@@ -506,7 +506,7 @@ func (a *Application) prepareSteam(
 		}
 		if err != nil {
 			cause := fmt.Errorf("back up current server: %w", err)
-			fallbackErr := a.recordFallback(store, state, installed, installedErr, active, cause)
+			fallbackErr := a.recordFallback(ctx, store, state, installed, installedErr, active, cause)
 			if fallbackErr != nil {
 				return SteamBuild{}, false, exitFailure(exitBackup, errors.Join(cause, fallbackErr))
 			}
@@ -523,7 +523,7 @@ func (a *Application) prepareSteam(
 	var preMutation *SteamPreMutationError
 	if errors.As(err, &preMutation) {
 		cause := fmt.Errorf("update Steam before mutation: %w", err)
-		fallbackErr := a.recordFallback(store, state, installed, installedErr, active, cause)
+		fallbackErr := a.recordFallback(ctx, store, state, installed, installedErr, active, cause)
 		if fallbackErr != nil {
 			return SteamBuild{}, false, exitFailure(exitSteam, errors.Join(cause, fallbackErr))
 		}
@@ -542,13 +542,14 @@ func (a *Application) fallbackOrFailure(
 	code int,
 	cause error,
 ) error {
-	if err := a.recordFallback(store, state, installed, installedErr, active, cause); err != nil {
+	if err := a.recordFallback(ctx, store, state, installed, installedErr, active, cause); err != nil {
 		return exitFailure(code, errors.Join(cause, err))
 	}
 	return a.launch(ctx, active, installed, false)
 }
 
 func (a *Application) recordFallback(
+	ctx context.Context,
 	store applicationStateStore,
 	state State,
 	installed SteamBuild,
@@ -558,6 +559,9 @@ func (a *Application) recordFallback(
 ) error {
 	if active.Record.ID == "" {
 		return errors.New("known-good active generation is unavailable")
+	}
+	if err := verifyInstalledManagedFiles(ctx, a.Config.ServerDir, active.Manifest); err != nil {
+		return fmt.Errorf("validate known-good mod installation: %w", err)
 	}
 	if err := a.validateKnownGoodSteam(state, installed, installedErr); err != nil {
 		return err
@@ -594,6 +598,13 @@ func (a *Application) validateKnownGoodSteam(state State, installed SteamBuild, 
 }
 
 func (a *Application) launch(ctx context.Context, selected StagedGeneration, steam SteamBuild, candidate bool) error {
+	a.progressf("settings: preserving existing overrides and seeding missing defaults")
+	if err := seedServerSettings(a.Config.ServerDir, a.Config.DataDir); err != nil {
+		if candidate {
+			return a.rollbackCandidate(ctx, err)
+		}
+		return exitFailure(exitPreflight, err)
+	}
 	pruneServerLogs := a.pruneServerLogs
 	if pruneServerLogs == nil {
 		pruneServerLogs = PruneServerLogs

@@ -323,6 +323,9 @@ start_container() {
 		--name "$container_name"
 		--label "$suite_label"
 		--network "$network"
+		--env TZ=Europe/Copenhagen
+		--env SERVERNAME=Salty
+		--env WINEDEBUG=fixme-all
 		--mount "type=bind,src=$server_dir,dst=/mnt/vrising/server"
 		--mount "type=bind,src=$data_dir,dst=/mnt/vrising/persistentdata"
 	)
@@ -542,6 +545,7 @@ assert_runtime_state() {
 snapshot_protected_tree() {
 	local root=$1
 	local output=$2
+	local selection=${3:-all}
 	local unsorted=$output.unsorted
 	local paths=$output.paths
 	local -a protected_roots=()
@@ -549,6 +553,7 @@ snapshot_protected_tree() {
 
 	: >"$unsorted"
 	for protected in Settings Saves; do
+		[[ $selection != settings || $protected == Settings ]] || continue
 		if [[ -e $root/$protected || -L $root/$protected ]]; then
 			protected_roots+=("$root/$protected")
 		fi
@@ -580,6 +585,27 @@ snapshot_protected_tree() {
 
 	sort -z "$unsorted" >"$output"
 	rm -- "$unsorted"
+}
+
+assert_loaded_existing_save() {
+	local output record directory saved_file relative expected_world
+	output=$(docker logs "$created_container_id" 2>&1) || fail "cannot inspect save-load evidence"
+	record=$(awk '/CreateAndHostServer - SaveDirectory:/ {line=$0; sub(/^.*SaveDirectory:/, "", line); sub(/\r$/, "", line); print line; exit}' <<<"$output")
+	[[ $record == *', Loaded Save:'* ]] || fail "server did not report a loaded save"
+	directory=${record%%, Loaded Save:*}
+	saved_file=${record#*, Loaded Save:}
+	[[ -n $saved_file && $saved_file != '<None>' && $saved_file != */* && $saved_file != *\\* ]] \
+		|| fail "server created a new world instead of loading the existing save"
+	directory=${directory//\\//}
+	[[ $directory == Z:/mnt/vrising/persistentdata/Saves/* ]] || fail "save loaded outside persistent data"
+	relative=${directory#Z:/mnt/vrising/persistentdata/}
+	[[ $relative != *'/../'* && -f $source_data_dir/$relative/$saved_file ]] \
+		|| fail "loaded save did not exist in the source world"
+	expected_world=
+	if [[ -f $source_data_dir/Settings/ServerHostSettings.json ]]; then
+		expected_world=$(jq -r '.SaveName // empty' "$source_data_dir/Settings/ServerHostSettings.json")
+	fi
+	[[ -z $expected_world || ${directory##*/} == "$expected_world" ]] || fail "server loaded the wrong configured world"
 }
 
 assert_snapshot_equal() {
@@ -653,6 +679,7 @@ run_migrate() {
 	local source_final=$temp_root/source-protected.final
 	local copy_before=$temp_root/copy-protected.before
 	local copy_after=$temp_root/copy-protected.after
+	local settings_before=$temp_root/copy-settings.before
 
 	[[ -d $source_data_dir/Saves ]] || fail "migration source has no Saves directory"
 	[[ -n $(find "$source_data_dir/Saves" -type f -print -quit) ]] \
@@ -663,6 +690,7 @@ run_migrate() {
 	rsync -a --numeric-ids -- "$source_data_dir/" "$data_dir/"
 	snapshot_protected_tree "$data_dir" "$copy_before"
 	assert_snapshot_equal "$source_before" "$copy_before" "rsync did not preserve every source Settings/Saves entry"
+	snapshot_protected_tree "$data_dir" "$settings_before" settings
 	snapshot_protected_tree "$source_data_dir" "$source_after_copy"
 	assert_snapshot_equal "$source_before" "$source_after_copy" "a source Settings/Saves entry changed while it was copied"
 	assert_sources_quiescent
@@ -677,10 +705,11 @@ run_migrate() {
 	assert_runtime_state false
 	assert_udp_ports
 	assert_rcon_if_enabled
+	assert_loaded_existing_save
 	stop_cleanly
 
-	snapshot_protected_tree "$data_dir" "$copy_after"
-	assert_snapshot_preserved "$copy_before" "$copy_after"
+	snapshot_protected_tree "$data_dir" "$copy_after" settings
+	assert_snapshot_preserved "$settings_before" "$copy_after"
 	snapshot_protected_tree "$source_data_dir" "$source_final"
 	assert_snapshot_equal "$source_before" "$source_final" "a source Settings/Saves entry changed during acceptance"
 	assert_sources_quiescent

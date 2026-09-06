@@ -16,6 +16,7 @@ import (
 func TestApplicationNormalRestartClearsCachedDegradedState(t *testing.T) {
 	root := t.TempDir()
 	serverDir := filepath.Join(root, "server")
+	writeTestServerSettings(t, serverDir)
 	dataDir := filepath.Join(root, "data")
 	stateDir := filepath.Join(serverDir, ".docker-vrising")
 	for _, dir := range []string{serverDir, dataDir} {
@@ -127,6 +128,7 @@ func TestApplicationNormalRestartClearsCachedDegradedState(t *testing.T) {
 
 func TestApplicationPromotesWithConcreteSupervisorWhileWineIsAlive(t *testing.T) {
 	manager := newTestModManager(t)
+	writeTestServerSettings(t, manager.ServerDir)
 	staged := stageTestGeneration(t, manager, managedArchiveContents{bepInEx: defaultBepInExEntries("live")})
 	if err := manager.Apply(t.Context(), staged); err != nil {
 		t.Fatal(err)
@@ -209,6 +211,7 @@ func TestApplicationPromotesWithConcreteSupervisorWhileWineIsAlive(t *testing.T)
 
 func TestApplicationRecoversPendingConcretePromotionBeforeLaunch(t *testing.T) {
 	manager := newTestModManager(t)
+	writeTestServerSettings(t, manager.ServerDir)
 	first := stageTestGeneration(t, manager, managedArchiveContents{bepInEx: defaultBepInExEntries("first")})
 	applyAndPromote(t, manager, first)
 	second := stageTestGeneration(t, manager, managedArchiveContents{bepInEx: defaultBepInExEntries("second")})
@@ -273,6 +276,7 @@ func TestApplicationRecoversPendingConcretePromotionBeforeLaunch(t *testing.T) {
 
 func TestApplicationPromotionFailurePreservesConcreteForwardRecovery(t *testing.T) {
 	manager := newTestModManager(t)
+	writeTestServerSettings(t, manager.ServerDir)
 	staged := stageTestGeneration(t, manager, managedArchiveContents{bepInEx: defaultBepInExEntries("recovery")})
 	if err := manager.Apply(t.Context(), staged); err != nil {
 		t.Fatal(err)
@@ -337,6 +341,23 @@ func TestApplicationPromotionFailurePreservesConcreteForwardRecovery(t *testing.
 }
 
 func TestApplicationStrictKnownGoodUsesConcreteValidators(t *testing.T) {
+	t.Run("frozen mods do not create a transaction", func(t *testing.T) {
+		manager, staged, _, app := concreteKnownGoodApplication(t, true)
+		if err := app.Run(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		state, err := manager.Store.Load()
+		if err != nil || state.Transaction != nil || state.Candidate != nil || state.Active.ID != staged.Record.ID {
+			t.Fatalf("frozen startup mutated the active transaction state: %#v, %v", state, err)
+		}
+	})
+
+	t.Run("corrupt live managed file", func(t *testing.T) {
+		manager, _, _, app := concreteKnownGoodApplication(t, true)
+		writeTestFile(t, filepath.Join(manager.ServerDir, "winhttp.dll"), "corrupt")
+		assertRunExitCode(t, app.Run(t.Context()), exitModUpdate)
+	})
+
 	t.Run("corrupt active overlay", func(t *testing.T) {
 		manager, staged, steam, app := concreteKnownGoodApplication(t, true)
 		writeTestFile(t, filepath.Join(staged.Dir, "winhttp.dll"), "corrupt")
@@ -362,6 +383,7 @@ func TestApplicationStrictKnownGoodUsesConcreteValidators(t *testing.T) {
 func concreteKnownGoodApplication(t *testing.T, executable bool) (*ModManager, StagedGeneration, *SteamClient, *Application) {
 	t.Helper()
 	manager := newTestModManager(t)
+	writeTestServerSettings(t, manager.ServerDir)
 	staged := stageTestGeneration(t, manager, managedArchiveContents{bepInEx: defaultBepInExEntries("active")})
 	applyAndPromote(t, manager, staged)
 	state, err := manager.Store.Load()

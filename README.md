@@ -95,6 +95,10 @@ IL2CPP initialization. It can remain in Docker's `starting` health state for
 up to the default 30-minute startup deadline. Large existing worlds can use
 most of that window; do not treat `starting` as a failure before the deadline.
 
+Local full-stack tests observed roughly 8–11 GiB of container memory use.
+Run live acceptance sequentially and leave memory headroom for the host and
+other services; concurrent modded servers exhausted the 23 GiB test host.
+
 There is no fixed disk quota in the image. Size the server bind for the Steam
 installation, Wine prefix, validated package cache, active and previous managed
 generations, and retained backups. Before each package download and each
@@ -188,6 +192,13 @@ Use these controls deliberately and remove them after recovery:
   transitive dependencies remain the exact versions declared by those pinned
   manifests; do not pin or upgrade dependencies separately.
 
+The runtime uses WineHQ 10.0 and initializes its prefix with `winecfg` before
+starting Xvfb, following the tested AndrewSav startup sequence. The controller
+sets `WINEDLLOVERRIDES=winhttp=n,b` automatically when mods are enabled and
+`winhttp=b` when they are disabled; no Compose entry is needed. Unrelated
+user-provided DLL overrides are preserved. Wine updates are image changes and require runtime acceptance;
+they are not installed during container restart.
+
 For example, to isolate a mod failure while preserving all mod state:
 
 ```yaml
@@ -278,6 +289,9 @@ stdout with `[server]` and `[bepinex]` source prefixes. Follow it with
 
 - `/mnt/vrising/persistentdata/logs/VRisingServer-<UTC timestamp>-<sequence>.log`
 - `/mnt/vrising/server/BepInEx/LogOutput.log`
+
+Log forwarding continues after readiness. During startup, a status line every
+30 seconds identifies which game or mod readiness markers are still missing.
 
 `LOGDAYS` removes only image-created V Rising server logs in the supported
 server-log locations. It does not recursively traverse persistent data and

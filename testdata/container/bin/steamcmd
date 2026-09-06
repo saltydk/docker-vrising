@@ -43,6 +43,9 @@ if [[ $mode == remote ]]; then
 fi
 
 mkdir -p /mnt/vrising/server/steamapps
+mkdir -p /mnt/vrising/server/VRisingServer_Data/StreamingAssets/Settings
+printf '{}\n' >/mnt/vrising/server/VRisingServer_Data/StreamingAssets/Settings/ServerHostSettings.json
+printf '{}\n' >/mnt/vrising/server/VRisingServer_Data/StreamingAssets/Settings/ServerGameSettings.json
 : >/mnt/vrising/server/VRisingServer.exe
 printf '1604030\n' >/mnt/vrising/server/steam_appid.txt
 cat >/mnt/vrising/server/steamapps/appmanifest_1829350.acf <<'EOF'

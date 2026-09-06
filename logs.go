@@ -91,6 +91,11 @@ type logInode struct {
 }
 
 func (m ReadinessMonitor) Wait(ctx context.Context, expected ExpectedReadiness) error {
+	return m.watch(ctx, expected, nil)
+}
+
+// watch keeps the same log cursors after readiness when onReady is provided.
+func (m ReadinessMonitor) watch(ctx context.Context, expected ExpectedReadiness, onReady func()) error {
 	if m.ServerLog == "" {
 		return fmt.Errorf("server log path is required")
 	}
@@ -152,9 +157,12 @@ func (m ReadinessMonitor) Wait(ctx context.Context, expected ExpectedReadiness) 
 	var evidence readinessEvidence
 	var round uint64
 	quietRounds := 0
+	announced := false
+	started := time.Now()
+	nextProgress := started.Add(30 * time.Second)
 	for {
 		round++
-		ready, more, pending, activity, err := observeReadinessRound(ctx, followers, events, round, output, &evidence, expected)
+		ready, more, pending, activity, err := observeReadinessRound(ctx, followers, events, round, output, &evidence, expected, !announced)
 		if err != nil {
 			return err
 		}
@@ -163,8 +171,18 @@ func (m ReadinessMonitor) Wait(ctx context.Context, expected ExpectedReadiness) 
 		} else {
 			quietRounds = 0
 		}
-		if quietRounds == 2 {
-			return nil
+		if quietRounds == 2 && !announced {
+			if onReady == nil {
+				return nil
+			}
+			onReady()
+			announced = true
+		}
+		if !announced && time.Now().After(nextProgress) {
+			fmt.Fprintf(output, "startup: waiting %s; server=%t chainloader=%t vcf=%t kindred=%t satisvampory=%t mods_required=%t\n",
+				time.Since(started).Round(time.Second), evidence.serverStartup, evidence.chainloader, evidence.vcf,
+				evidence.kindred, evidence.satisvampory, expected.RequireMods)
+			nextProgress = time.Now().Add(30 * time.Second)
 		}
 		if more && !pending {
 			continue
@@ -194,6 +212,7 @@ func observeReadinessRound(
 	output io.Writer,
 	evidence *readinessEvidence,
 	expected ExpectedReadiness,
+	checkStartup bool,
 ) (bool, bool, bool, bool, error) {
 	for _, follower := range followers {
 		select {
@@ -229,7 +248,7 @@ func observeReadinessRound(
 	}
 	for _, batch := range batches {
 		for _, line := range batch.lines {
-			if fatalReadinessLine(line) {
+			if checkStartup && fatalReadinessLine(line) {
 				return false, false, false, false, fmt.Errorf("fatal startup output: %s", shortLogReason(line))
 			}
 		}
@@ -648,7 +667,7 @@ func (e *readinessEvidence) observe(line string, expected ExpectedReadiness) {
 		(strings.Contains(lower, "startup complete") || strings.Contains(lower, "startup finished")) {
 		e.chainloader = true
 	}
-	if strings.Contains(lower, "vampirecommandframework") && strings.Contains(lower, "is loaded!") {
+	if strings.Contains(lower, "vampirecommandframework") && strings.Contains(line, "VCF Loaded: ") {
 		e.vcf = true
 	}
 	if expected.KindredVersion != "" && strings.Contains(line,
@@ -687,6 +706,7 @@ func fatalReadinessLine(line string) bool {
 		"failed loading plugin",
 		"could not load plugin",
 		"failed to initialize bepinex",
+		"failed to generate il2cpp interop assemblies",
 		"bepinex initialization failed",
 		"failed to load coreclr",
 		"failed to start coreclr",
