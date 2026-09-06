@@ -10,6 +10,8 @@ record_dir=/fixture/records
 expected_home=/mnt/vrising/server/.docker-vrising/home
 [[ $PWD == "$expected_home" ]] || fail "unexpected cwd: $PWD"
 [[ ${HOME-} == "$expected_home" ]] || fail "unexpected HOME: ${HOME-}"
+[[ ${LANG-} == en_US.UTF-8 ]] || fail "unexpected LANG: ${LANG-}"
+[[ ${LC_ALL-} == en_US.UTF-8 ]] || fail "unexpected LC_ALL: ${LC_ALL-}"
 [[ -d $record_dir ]] || fail 'record directory is unavailable'
 
 mode=
@@ -30,7 +32,7 @@ else
 fi
 
 {
-  printf 'mode=%s cwd=%q HOME=%q argv=' "$mode" "$PWD" "$HOME"
+  printf 'mode=%s cwd=%q HOME=%q LANG=%q LC_ALL=%q argv=' "$mode" "$PWD" "$HOME" "$LANG" "$LC_ALL"
   printf '%q ' "$@"
   printf '\n'
 } >>"$record_dir/steamcmd.accepted"

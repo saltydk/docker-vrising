@@ -179,7 +179,7 @@ func (s *SteamClient) remoteBuildCommand() CommandSpec {
 			"+app_info_print", steamAppID,
 			"+quit",
 		},
-		Env: []string{"HOME=" + s.HomeDir},
+		Env: steamCommandEnvironment(s.HomeDir),
 		Dir: s.HomeDir,
 	}
 }
@@ -198,9 +198,17 @@ func (s *SteamClient) updateCommand(branch string) CommandSpec {
 	return CommandSpec{
 		Path:         s.SteamCMD,
 		Args:         args,
-		Env:          []string{"HOME=" + s.HomeDir},
+		Env:          steamCommandEnvironment(s.HomeDir),
 		Dir:          s.HomeDir,
 		StreamOutput: true,
+	}
+}
+
+func steamCommandEnvironment(home string) []string {
+	return []string{
+		"HOME=" + home,
+		"LANG=en_US.UTF-8",
+		"LC_ALL=en_US.UTF-8",
 	}
 }
 

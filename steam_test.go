@@ -839,7 +839,7 @@ func remoteSteamSpec(client *SteamClient) CommandSpec {
 			"+app_info_print", "1829350",
 			"+quit",
 		},
-		Env: []string{"HOME=" + client.HomeDir},
+		Env: steamCommandEnvironment(client.HomeDir),
 		Dir: client.HomeDir,
 	}
 }
@@ -854,7 +854,7 @@ func publicUpdateSteamSpec(client *SteamClient) CommandSpec {
 			"+app_update", "1829350",
 			"validate", "+quit",
 		},
-		Env:          []string{"HOME=" + client.HomeDir},
+		Env:          steamCommandEnvironment(client.HomeDir),
 		Dir:          client.HomeDir,
 		StreamOutput: true,
 	}
@@ -871,7 +871,7 @@ func betaUpdateSteamSpec(client *SteamClient, branch string) CommandSpec {
 			"-beta", branch,
 			"validate", "+quit",
 		},
-		Env:          []string{"HOME=" + client.HomeDir},
+		Env:          steamCommandEnvironment(client.HomeDir),
 		Dir:          client.HomeDir,
 		StreamOutput: true,
 	}
