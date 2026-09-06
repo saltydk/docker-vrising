@@ -1,9 +1,11 @@
 .PHONY: fmt-check test vet build image image-check container-test live-acceptance-test live-acceptance check
 
-export LIVE_ACCEPTANCE_MODE := $(value MODE)
-export LIVE_ACCEPTANCE_IMAGE := $(value IMAGE)
-export LIVE_ACCEPTANCE_SOURCE_SERVER_DIR := $(value SOURCE_SERVER_DIR)
-export LIVE_ACCEPTANCE_SOURCE_DATA_DIR := $(value SOURCE_DATA_DIR)
+override LIVE_ACCEPTANCE_MODE := $(value MODE)
+override LIVE_ACCEPTANCE_IMAGE := $(value IMAGE)
+override LIVE_ACCEPTANCE_SOURCE_SERVER_DIR := $(value SOURCE_SERVER_DIR)
+override LIVE_ACCEPTANCE_SOURCE_DATA_DIR := $(value SOURCE_DATA_DIR)
+export LIVE_ACCEPTANCE_MODE LIVE_ACCEPTANCE_IMAGE
+export LIVE_ACCEPTANCE_SOURCE_SERVER_DIR LIVE_ACCEPTANCE_SOURCE_DATA_DIR
 
 fmt-check:
 	@test -z "$$(gofmt -l .)"

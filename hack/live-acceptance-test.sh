@@ -37,6 +37,8 @@ set -euo pipefail
 
 state=${FAKE_DOCKER_STATE:?}
 scenario=${FAKE_DOCKER_SCENARIO:?}
+container_id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+network_id=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 mkdir -p "$state"
 printf '%q ' "$@" >>"$state/calls"
 printf '\n' >>"$state/calls"
@@ -96,10 +98,16 @@ case ${1-} in
 			create)
 				label=$(argument_after --label "$@")
 				name=${!#}
-				printf '%s\n' fake-network-id >"$state/network-id"
+				printf '%s\n' "$network_id" >"$state/network-id"
 				printf '%s\n' "$name" >"$state/network-name"
 				printf '%s\n' "$label" >"$state/network-label"
-				printf '%s\n' fake-network-id
+				printf '%s\n' "$network_id"
+				if [[ $scenario == network-create-term ]]; then
+					kill -TERM "$PPID"
+				fi
+				if [[ $scenario == network-create-id-failure ]]; then
+					exit 125
+				fi
 				;;
 			inspect)
 				format=$(argument_after --format "$@")
@@ -124,6 +132,41 @@ case ${1-} in
 				;;
 		esac
 		;;
+	create)
+		cidfile=$(argument_after --cidfile "$@")
+		name=$(argument_after --name "$@")
+		label=$(argument_after --label "$@")
+		mapfile -t mounts < <(
+			while (( $# > 0 )); do
+				if [[ $1 == --mount && $# -gt 1 ]]; then
+					printf '%s\n' "$2"
+					shift
+				fi
+				shift
+			done
+		)
+		if [[ $scenario == network-only ]]; then
+			exit 125
+		fi
+		printf '%s\n' "$container_id" >"$cidfile"
+		printf '%s\n' "$container_id" >"$state/container-id"
+		printf '%s\n' "$name" >"$state/container-name"
+		printf '%s\n' "$label" >"$state/container-label"
+		printf '%s\n' "${mounts[@]}" >"$state/container-mounts"
+		if [[ $scenario == container-create-term ]]; then
+			kill -TERM "$PPID"
+		fi
+		if [[ $scenario == container-create-id-failure ]]; then
+			exit 125
+		fi
+		printf '%s\n' "$container_id"
+		;;
+	start)
+		if [[ $scenario == create-start-failure ]]; then
+			exit 125
+		fi
+		printf '%s\n' "${!#}"
+		;;
 	run)
 		if [[ $scenario == network-only ]]; then
 			exit 125
@@ -139,11 +182,11 @@ case ${1-} in
 				shift
 			done
 		)
-		printf '%s\n' fake-container-id >"$state/container-id"
+		printf '%s\n' "$container_id" >"$state/container-id"
 		printf '%s\n' "$name" >"$state/container-name"
 		printf '%s\n' "$label" >"$state/container-label"
 		printf '%s\n' "${mounts[@]}" >"$state/container-mounts"
-		printf '%s\n' fake-container-id
+		printf '%s\n' "$container_id"
 		;;
 	inspect)
 		format=$(argument_after --format "$@")
@@ -208,6 +251,9 @@ exit 0
 FAKE_SLEEP
 chmod 0755 "$fake_bin/sleep"
 
+fake_container_id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+fake_network_id=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+
 run_cleanup_case() {
 	local scenario=$1
 	local expected_status=$2
@@ -236,31 +282,69 @@ if grep -Eq '^network rm .*preexisting-network' "$network_collision_state/calls"
 	fail 'collision cleanup removed a pre-existing labeled network'
 fi
 
+start_failure_state=$(run_cleanup_case create-start-failure 1)
+grep -Eq '^create .*--cidfile ' "$start_failure_state/calls" \
+	|| fail 'container was not created with a durable cidfile before start'
+grep -Fq "start $fake_container_id " "$start_failure_state/calls" \
+	|| fail 'created container was not started by its recorded ID'
+grep -Fq "rm -fv $fake_container_id " "$start_failure_state/calls" \
+	|| fail 'start failure did not remove its created container'
+grep -Fq "network rm $fake_network_id " "$start_failure_state/calls" \
+	|| fail 'start failure did not remove its created network'
+
+container_term_state=$(run_cleanup_case container-create-term 143)
+grep -Eq '^create .*--cidfile ' "$container_term_state/calls" \
+	|| fail 'container TERM handoff did not use a durable cidfile'
+grep -Fq "rm -fv $fake_container_id " "$container_term_state/calls" \
+	|| fail 'TERM during container create handoff leaked its recorded container'
+grep -Fq "network rm $fake_network_id " "$container_term_state/calls" \
+	|| fail 'TERM during container create handoff leaked its recorded network'
+
+network_term_state=$(run_cleanup_case network-create-term 143)
+if grep -Eq '^create ' "$network_term_state/calls"; then
+	fail 'TERM during network create handoff continued to container creation'
+fi
+grep -Fq "network rm $fake_network_id " "$network_term_state/calls" \
+	|| fail 'TERM during network create handoff leaked its recorded network'
+
+container_id_failure_state=$(run_cleanup_case container-create-id-failure 1)
+grep -Fq "rm -fv $fake_container_id " "$container_id_failure_state/calls" \
+	|| fail 'nonzero container create after cidfile write leaked its recorded container'
+grep -Fq "network rm $fake_network_id " "$container_id_failure_state/calls" \
+	|| fail 'nonzero container create after cidfile write leaked its recorded network'
+
+network_id_failure_state=$(run_cleanup_case network-create-id-failure 1)
+if grep -Eq '^create ' "$network_id_failure_state/calls"; then
+	fail 'nonzero network create after ID write continued to container creation'
+fi
+grep -Fq "network rm $fake_network_id " "$network_id_failure_state/calls" \
+	|| fail 'nonzero network create after ID write leaked its recorded network'
+
 network_only_state=$(run_cleanup_case network-only 1)
-grep -Eq '^network rm .*fake-network-id' "$network_only_state/calls" \
+grep -Fq "network rm $fake_network_id " "$network_only_state/calls" \
 	|| fail 'network-only partial creation did not remove its created network'
-if grep -Eq '^rm .*fake-container-id' "$network_only_state/calls"; then
+if grep -Fq "rm -fv $fake_container_id " "$network_only_state/calls"; then
 	fail 'network-only partial creation removed an uncreated container'
 fi
 
 container_partial_state=$(run_cleanup_case bad-mount 1)
-grep -Eq '^rm .*fake-container-id' "$container_partial_state/calls" \
+grep -Fq "rm -fv $fake_container_id " "$container_partial_state/calls" \
 	|| fail 'container partial creation did not remove its created container'
-grep -Eq '^network rm .*fake-network-id' "$container_partial_state/calls" \
+grep -Fq "network rm $fake_network_id " "$container_partial_state/calls" \
 	|| fail 'container partial creation did not remove its created network'
 
 signal_state=$(run_cleanup_case signal 143)
-grep -Eq '^rm .*fake-container-id' "$signal_state/calls" \
+grep -Fq "rm -fv $fake_container_id " "$signal_state/calls" \
 	|| fail 'signal cleanup did not remove its created container'
-grep -Eq '^network rm .*fake-network-id' "$signal_state/calls" \
+grep -Fq "network rm $fake_network_id " "$signal_state/calls" \
 	|| fail 'signal cleanup did not remove its created network'
 
 verify_state=$(run_cleanup_case verify-failure 1)
 grep -Eq '^exec .* vrisingctl verify' "$verify_state/calls" \
 	|| fail 'healthy acceptance did not invoke the deep live-state verifier'
-grep -Eq '^rm .*fake-container-id' "$verify_state/calls" \
+grep -Fq "rm -fv $fake_container_id " "$verify_state/calls" \
 	|| fail 'deep verifier failure did not remove its created container'
-grep -Eq '^network rm .*fake-network-id' "$verify_state/calls" \
+grep -Fq "network rm $fake_network_id " "$verify_state/calls" \
 	|| fail 'deep verifier failure did not remove its created network'
 
 make_bin=$sandbox/make-bin
@@ -298,6 +382,25 @@ PATH="$make_bin:$PATH" ARGV_LOG="$migrate_argv" \
 	make -s -C "$repo_root" live-acceptance MODE=migrate IMAGE='registry.example/vrising:build-2' \
 	SOURCE_SERVER_DIR="$migrate_server" SOURCE_DATA_DIR="$migrate_data"
 assert_argv "$migrate_argv" hack/live-acceptance.sh migrate 'registry.example/vrising:build-2' "$migrate_server" "$migrate_data"
+
+override_marker=$sandbox/internal-override-injection
+internal_malicious="\`touch $override_marker\`"
+override_fresh_argv=$sandbox/override-fresh.argv
+PATH="$make_bin:$PATH" ARGV_LOG="$override_fresh_argv" \
+	make -s -C "$repo_root" live-acceptance MODE=fresh IMAGE='registry.example/vrising:expected' \
+	LIVE_ACCEPTANCE_MODE=migrate LIVE_ACCEPTANCE_IMAGE="$internal_malicious" \
+	LIVE_ACCEPTANCE_SOURCE_SERVER_DIR="$internal_malicious" LIVE_ACCEPTANCE_SOURCE_DATA_DIR="$internal_malicious"
+assert_argv "$override_fresh_argv" hack/live-acceptance.sh fresh 'registry.example/vrising:expected'
+[[ ! -e $override_marker ]] || fail 'internal Make overrides executed shell source during fresh mapping'
+
+override_migrate_argv=$sandbox/override-migrate.argv
+PATH="$make_bin:$PATH" ARGV_LOG="$override_migrate_argv" \
+	make -s -C "$repo_root" live-acceptance MODE=migrate IMAGE='registry.example/vrising:expected-2' \
+	SOURCE_SERVER_DIR="$migrate_server" SOURCE_DATA_DIR="$migrate_data" \
+	LIVE_ACCEPTANCE_MODE=fresh LIVE_ACCEPTANCE_IMAGE="$internal_malicious" \
+	LIVE_ACCEPTANCE_SOURCE_SERVER_DIR="$internal_malicious" LIVE_ACCEPTANCE_SOURCE_DATA_DIR="$internal_malicious"
+assert_argv "$override_migrate_argv" hack/live-acceptance.sh migrate 'registry.example/vrising:expected-2' "$migrate_server" "$migrate_data"
+[[ ! -e $override_marker ]] || fail 'internal Make overrides executed shell source during migrate mapping'
 
 for variable in MODE IMAGE SOURCE_SERVER_DIR SOURCE_DATA_DIR; do
 	marker=$sandbox/injection-$variable

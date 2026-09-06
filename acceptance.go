@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 )
 
 // ValidateLiveInstallation verifies the complete read-only identity chain used
@@ -88,6 +89,13 @@ func validateLivePackageLock(lock PackageLock) error {
 	if err := validateManagedPackageLock(lock); err != nil {
 		return err
 	}
+	expectedDependencies := map[string][]PackageRef{
+		"bepinex":      nil,
+		"vcf":          {bepInExPackageRef(lock)},
+		"kindred":      {bepInExPackageRef(lock), vcfPackageRef(lock)},
+		"hookdots":     {bepInExPackageRef(lock)},
+		"satisvampory": {bepInExPackageRef(lock), hookDOTSPackageRef(lock), vcfPackageRef(lock)},
+	}
 	for _, pkg := range lock.Packages {
 		if !semanticVersion.MatchString(pkg.Ref.Version) {
 			return fmt.Errorf("locked package %s version is not exact", pkg.FullName)
@@ -99,6 +107,10 @@ func validateLivePackageLock(lock PackageLock) error {
 			if index > 0 && comparePackageRefs(pkg.Dependencies[index-1], dependency) >= 0 {
 				return fmt.Errorf("locked package %s dependency references are not strictly canonical", pkg.FullName)
 			}
+		}
+		kind := managedPackageKind(pkg.Ref)
+		if !slices.Equal(pkg.Dependencies, expectedDependencies[kind]) {
+			return fmt.Errorf("locked package %s does not have the exact required direct dependencies", pkg.FullName)
 		}
 	}
 	return nil

@@ -23,6 +23,8 @@ container_created=false
 created_container_id=
 network_created=false
 created_network_id=
+creation_handoff=false
+deferred_signal=0
 
 usage() {
 	printf 'usage: %s fresh IMAGE\n' "$0" >&2
@@ -33,6 +35,47 @@ usage() {
 fail() {
 	printf 'live acceptance: %s\n' "$*" >&2
 	exit 1
+}
+
+handle_int() {
+	if [[ $creation_handoff == true ]]; then
+		deferred_signal=130
+		return
+	fi
+	exit 130
+}
+
+handle_term() {
+	if [[ $creation_handoff == true ]]; then
+		deferred_signal=143
+		return
+	fi
+	exit 143
+}
+
+begin_creation_handoff() {
+	creation_handoff=true
+	deferred_signal=0
+}
+
+finish_creation_handoff() {
+	local pending=$deferred_signal
+
+	creation_handoff=false
+	deferred_signal=0
+	if [[ $pending -ne 0 ]]; then
+		exit "$pending"
+	fi
+}
+
+read_single_docker_id() {
+	local source=$1
+	local -a values=()
+
+	[[ -s $source ]] || return 1
+	mapfile -t values <"$source"
+	[[ ${#values[@]} -eq 1 && ${values[0]} =~ ^[0-9a-f]{64}$ ]] || return 1
+	printf '%s\n' "${values[0]}"
 }
 
 require_command() {
@@ -200,11 +243,36 @@ assert_bind_mounts() {
 	' <<<"$mounts" >/dev/null || fail "container is not running only against the disposable bind copies"
 }
 
+create_network() {
+	local id_file=$temp_root/network.id
+	local command_status captured_id=
+
+	: >"$id_file"
+	begin_creation_handoff
+	set +e
+	docker network create --label "$suite_label" "$network_name" >"$id_file"
+	command_status=$?
+	set -e
+	if captured_id=$(read_single_docker_id "$id_file"); then
+		created_network_id=$captured_id
+		network_created=true
+	fi
+	rm -f -- "$id_file"
+	finish_creation_handoff
+
+	[[ $command_status -eq 0 ]] || fail "could not create acceptance network"
+	[[ $network_created == true ]] || fail "Docker returned an invalid acceptance network ID"
+	network_identity_matches || fail "acceptance network identity does not match its creation"
+}
+
 start_container() {
 	local network=$1
 	local publish_ports=$2
+	local cid_file=$temp_root/container.cid
+	local command_status captured_id=
 	local -a arguments=(
-		run -d
+		create
+		--cidfile "$cid_file"
 		--name "$container_name"
 		--label "$suite_label"
 		--network "$network"
@@ -221,17 +289,29 @@ start_container() {
 	fi
 	arguments+=("$image")
 
-	created_container_id=$(docker "${arguments[@]}") || fail "could not start acceptance container"
-	container_created=true
-	[[ -n $created_container_id && $created_container_id != *$'\n'* ]] \
-		|| fail "Docker returned an invalid acceptance container ID"
+	rm -f -- "$cid_file"
+	begin_creation_handoff
+	set +e
+	docker "${arguments[@]}" >/dev/null
+	command_status=$?
+	set -e
+	if captured_id=$(read_single_docker_id "$cid_file"); then
+		created_container_id=$captured_id
+		container_created=true
+	fi
+	rm -f -- "$cid_file"
+	finish_creation_handoff
+
+	[[ $command_status -eq 0 ]] || fail "could not create acceptance container"
+	[[ $container_created == true ]] || fail "Docker did not record a valid acceptance container ID"
 	assert_container_owned
 	assert_bind_mounts
+	docker start "$created_container_id" >/dev/null || fail "could not start acceptance container"
 }
 
 remove_container() {
 	assert_container_owned
-	docker rm -f "$created_container_id" >/dev/null || fail "could not remove acceptance container"
+	docker rm -fv "$created_container_id" >/dev/null || fail "could not remove acceptance container"
 	container_created=false
 	created_container_id=
 }
@@ -489,11 +569,7 @@ run_fresh() {
 	[[ -z $(find "$server_dir" -mindepth 1 -print -quit) ]] || fail "fresh server bind is not empty"
 	[[ -z $(find "$data_dir" -mindepth 1 -print -quit) ]] || fail "fresh data bind is not empty"
 
-	created_network_id=$(docker network create --label "$suite_label" "$network_name") \
-		|| fail "could not create acceptance network"
-	network_created=true
-	[[ -n $created_network_id && $created_network_id != *$'\n'* ]] \
-		|| fail "Docker returned an invalid acceptance network ID"
+	create_network
 	start_container "$network_name" true
 	wait_healthy
 	assert_live_installation
@@ -542,11 +618,7 @@ run_migrate() {
 	assert_snapshot_equal "$source_before" "$source_after_copy" "a source Settings/Saves entry changed while it was copied"
 	assert_sources_quiescent
 
-	created_network_id=$(docker network create --label "$suite_label" "$network_name") \
-		|| fail "could not create acceptance network"
-	network_created=true
-	[[ -n $created_network_id && $created_network_id != *$'\n'* ]] \
-		|| fail "Docker returned an invalid acceptance network ID"
+	create_network
 	start_container "$network_name" true
 	wait_healthy
 	assert_live_installation
@@ -620,8 +692,8 @@ fi
 
 temp_root=$(mktemp -d "$temp_parent/docker-vrising-live.XXXXXX")
 trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+trap handle_int INT
+trap handle_term TERM
 [[ -d $temp_root && ! -L $temp_root && ${temp_root%/*} == "$temp_parent" ]] \
 	|| fail "mktemp returned an invalid temporary root"
 case ${temp_root##*/} in

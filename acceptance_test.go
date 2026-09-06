@@ -235,6 +235,55 @@ func TestValidateLiveInstallationRejectsBrokenRelationshipsAndManagedFiles(t *te
 	}
 }
 
+func TestValidateLiveInstallationRequiresExactDirectDependencyTopology(t *testing.T) {
+	tests := []struct {
+		name       string
+		packageRef PackageRef
+		remove     PackageRef
+		add        PackageRef
+	}{
+		{name: "VCF requires BepInEx", packageRef: vcfPackage, remove: bepInExPackage},
+		{name: "Kindred requires BepInEx", packageRef: kindredPackage, remove: bepInExPackage},
+		{name: "Kindred requires VCF", packageRef: kindredPackage, remove: vcfPackage},
+		{name: "HookDOTS requires BepInEx", packageRef: hookDOTSPackage, remove: bepInExPackage},
+		{name: "Satisvampory requires BepInEx", packageRef: satisvamporyPackage, remove: bepInExPackage},
+		{name: "Satisvampory requires HookDOTS", packageRef: satisvamporyPackage, remove: hookDOTSPackage},
+		{name: "Satisvampory requires VCF", packageRef: satisvamporyPackage, remove: vcfPackage},
+		{name: "HookDOTS rejects reachable VCF edge", packageRef: hookDOTSPackage, add: vcfPackage},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newLiveInstallationFixture(t)
+			lock := loadLivePackageLock(t, fixture)
+			for index := range lock.Packages {
+				if lock.Packages[index].Ref != test.packageRef {
+					continue
+				}
+				if test.remove != (PackageRef{}) {
+					dependencyIndex := slices.Index(lock.Packages[index].Dependencies, test.remove)
+					if dependencyIndex < 0 {
+						t.Fatalf("fixture dependency %v is missing", test.remove)
+					}
+					lock.Packages[index].Dependencies = slices.Delete(lock.Packages[index].Dependencies, dependencyIndex, dependencyIndex+1)
+				}
+				if test.add != (PackageRef{}) {
+					lock.Packages[index].Dependencies = append(lock.Packages[index].Dependencies, test.add)
+					slices.SortFunc(lock.Packages[index].Dependencies, comparePackageRefs)
+				}
+				lock.Digest = PackageLockDigest(lock)
+				replaceLiveLockMetadata(t, fixture, lock)
+
+				if err := ValidateLiveInstallation(t.Context(), fixture.config); err == nil {
+					t.Fatalf("ValidateLiveInstallation() accepted %s", test.name)
+				}
+				return
+			}
+			t.Fatalf("fixture package %v is missing", test.packageRef)
+		})
+	}
+}
+
 func newLiveInstallationFixture(t *testing.T) *liveInstallationFixture {
 	t.Helper()
 	root := t.TempDir()
