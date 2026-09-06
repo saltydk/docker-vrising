@@ -45,7 +45,7 @@ RUN test "$TARGETOS/$TARGETARCH" = "linux/amd64" && \
 FROM ubuntu:22.04@sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc AS production
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG WINE_VERSION=10.0.0.0~jammy-1
+ARG WINE_VERSION=11.0.0.0~jammy-1
 
 RUN dpkg --add-architecture i386 && \
     apt-get update && \

@@ -192,7 +192,7 @@ Use these controls deliberately and remove them after recovery:
   transitive dependencies remain the exact versions declared by those pinned
   manifests; do not pin or upgrade dependencies separately.
 
-The runtime uses WineHQ 10.0 and initializes its prefix with `winecfg` before
+The runtime uses WineHQ 11.0 and initializes its prefix with `winecfg` before
 starting Xvfb, following the tested AndrewSav startup sequence. The controller
 sets `WINEDLLOVERRIDES=winhttp=n,b` automatically when mods are enabled and
 `winhttp=b` when they are disabled; no Compose entry is needed. Unrelated
