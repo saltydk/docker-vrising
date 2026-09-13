@@ -2,4 +2,4 @@ module github.com/saltydk/docker-vrising
 
 go 1.27.0
 
-require golang.org/x/sys v0.47.0
+require golang.org/x/sys v0.48.0
