@@ -4,7 +4,7 @@ ARG VERSION=dev
 ARG REVISION=unknown
 ARG BUILD_DATE=1970-01-01T00:00:00Z
 
-FROM --platform=$BUILDPLATFORM golang:1.27-bookworm@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195 AS build
 
 ARG VERSION
 ARG REVISION
@@ -26,7 +26,7 @@ RUN test "$TARGETOS/$TARGETARCH" = "linux/amd64" && \
       -ldflags="-s -w -buildid=${REVISION}-${BUILD_DATE} -X main.buildVersion=${VERSION}" \
       -o /out/vrisingctl .
 
-FROM --platform=$BUILDPLATFORM golang:1.27-bookworm@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b AS fixture-build
+FROM --platform=$BUILDPLATFORM golang:1.27-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195 AS fixture-build
 
 ARG TARGETOS
 ARG TARGETARCH
